@@ -1,0 +1,23 @@
+{
+  "name": "@cloudops/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudops/database": "*",
+    "@cloudops/identity": "*",
+    "@cloudops/runtime": "*",
+    "@cloudops/shared": "*",
+    "ws": "^8.18.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.0"
+  }
+}

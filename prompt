@@ -1,0 +1,999 @@
+# TASK: Implement Real AWS Cloud Connection Module for CloudOps
+
+We need to implement the real AWS cloud-account connection flow in CloudOps.
+
+IMPORTANT:
+This is NOT a UI-only task.
+
+Implement the complete backend + security/session layer + frontend connection modal + database integration required for a real AWS connection.
+
+The target UX is the AWS connection modal shown in the provided reference.
+
+The target authentication flow is:
+
+User
+  ↓
+CloudOps AWS Connection Modal
+  ↓
+AWS Region
+AWS Access Key ID
+AWS Secret Access Key
+AWS Session Token (optional)
+Assume Role ARN (optional)
+  ↓
+CloudOps Backend
+  ↓
+Validate AWS credentials
+  ↓
+AWS STS GetCallerIdentity
+  ↓
+Optional STS AssumeRole
+  ↓
+Temporary AWS session
+  ↓
+Persist ONLY safe cloud-account metadata
+  ↓
+Connected AWS Account
+  ↓
+CloudOps Tool Gateway can later use the temporary session
+  ↓
+AWS APIs
+
+DO NOT expose AWS credentials to agents.
+
+DO NOT store AWS secret credentials in PostgreSQL.
+
+DO NOT store AWS credentials in browser storage.
+
+DO NOT log credentials.
+
+============================================================
+0. FIRST: INSPECT THE EXISTING CODEBASE
+============================================================
+
+Before modifying anything, inspect the current implementation.
+
+Relevant areas include:
+
+apps/web/src/app/cloud/connect/page.tsx
+apps/web/src/lib/api.ts
+apps/api/src/server.ts
+apps/api/src/routes/
+apps/api/src/middleware/
+packages/shared/
+packages/adapters/
+database/migrations/
+database/src/
+packages/security/
+packages/tools/
+packages/gateway/
+
+Also inspect the existing architecture/reference documents if useful.
+
+Do NOT blindly create duplicate abstractions.
+
+Reuse existing:
+- tenant model
+- operator authentication
+- database client
+- error model
+- logging
+- security utilities
+- package boundaries
+- API conventions
+- TypeScript types
+
+After inspection, implement the feature.
+
+============================================================
+1. AWS CONNECTION UX
+============================================================
+
+Replace the current large inline AWS configuration experience with
+a modal-based connection flow.
+
+Current page:
+
+/cloud/connect
+
+should show cloud provider cards.
+
+AWS card:
+
+Amazon Web Services
+
+ECS, EKS, RDS, S3, CloudWatch
+
+[ Connect AWS ]
+
+Clicking "Connect AWS" opens:
+
+--------------------------------------------
+
+Connect AWS Account
+
+Temporary In-Memory Session Authentication
+
+[security icon]
+
+Credentials are used strictly in-memory by the backend to establish
+a temporary STS session and are never stored in your browser or
+local storage.
+
+AWS Region
+[ us-east-1 ▼ ]
+
+AWS Access Key ID
+[ ]
+
+AWS Secret Access Key
+[ ••••••••••• ]
+
+AWS Session Token (Optional)
+[ ]
+
+Assume Role ARN (Optional)
+[ ]
+
+                [ Cancel ] [ Connect AWS ]
+
+--------------------------------------------
+
+Use the existing CloudOps visual design system.
+
+The modal should be:
+- centered
+- compact
+- professional
+- accessible
+- keyboard accessible
+- closable
+- responsive
+- visually separated from the page
+- background dimmed while open
+
+Do not copy unrelated branding from the reference screenshot.
+
+============================================================
+2. FORM FIELDS
+============================================================
+
+The AWS connection form must support:
+
+1. AWS Region
+2. AWS Access Key ID
+3. AWS Secret Access Key
+4. AWS Session Token (optional)
+5. Assume Role ARN (optional)
+
+Required:
+- AWS Region
+- AWS Access Key ID
+- AWS Secret Access Key
+
+Optional:
+- AWS Session Token
+- Assume Role ARN
+
+Secret Access Key MUST be rendered as a password/secret field.
+
+Do not persist any of these values to:
+- localStorage
+- sessionStorage
+- IndexedDB
+- cookies
+- URL query parameters
+- browser persistence mechanisms
+
+React state may hold the values only for the duration necessary
+to submit the connection request.
+
+Clear sensitive form state after successful submission where
+practical.
+
+============================================================
+3. API CONTRACT
+============================================================
+
+Implement:
+
+POST /v1/cloud-accounts
+
+Protected by the existing operator authentication mechanism.
+
+Use tenant isolation.
+
+Request body:
+
+{
+  "provider": "aws",
+  "region": "us-east-1",
+  "accessKeyId": "...",
+  "secretAccessKey": "...",
+  "sessionToken": "...",
+  "assumeRoleArn": "..."
+}
+
+Rules:
+
+- provider must be "aws"
+- region must be valid
+- accessKeyId required
+- secretAccessKey required
+- sessionToken optional
+- assumeRoleArn optional
+
+Do NOT return credentials in the response.
+
+Response should contain only safe account metadata.
+
+Example:
+
+{
+  "id": "cld_...",
+  "provider": "aws",
+  "accountId": "123456789012",
+  "region": "us-east-1",
+  "roleArn": "arn:aws:iam::123456789012:role/CloudOpsRole",
+  "status": "CONNECTED"
+}
+
+Only return fields that actually exist in the implementation.
+
+============================================================
+4. AWS SDK
+============================================================
+
+Add the AWS SDK packages required for the implementation.
+
+At minimum investigate/use:
+
+@aws-sdk/client-sts
+
+Add other AWS SDK clients only when actually required.
+
+Do NOT implement fake AWS clients.
+
+Do NOT mock AWS in production code.
+
+Mocks are allowed only in unit tests.
+
+============================================================
+5. INITIAL AWS CREDENTIAL VALIDATION
+============================================================
+
+When POST /v1/cloud-accounts is received:
+
+1. Validate request schema.
+2. Validate operator authentication.
+3. Validate tenant.
+4. Validate AWS credentials.
+5. Create an AWS STS client using the supplied credentials.
+6. Call:
+
+GetCallerIdentity
+
+This proves that the supplied AWS credentials are valid.
+
+Extract:
+
+AWS Account ID
+Caller ARN
+Caller User/Role identity where appropriate
+
+Do not trust an account ID supplied by the frontend.
+
+The account ID must come from AWS.
+
+============================================================
+6. OPTIONAL ASSUME ROLE
+============================================================
+
+If Assume Role ARN is provided:
+
+After validating the supplied credentials with
+GetCallerIdentity:
+
+Call:
+
+STS AssumeRole
+
+using:
+
+RoleArn = supplied Assume Role ARN
+
+RoleSessionName = generated CloudOps session identifier
+
+SessionDuration = short-lived value within AWS limits.
+
+Prefer a short duration appropriate for CloudOps operations.
+
+Do not use unnecessarily long-lived temporary credentials.
+
+If AssumeRole succeeds:
+
+Use the resulting temporary credentials for the CloudOps
+AWS session.
+
+If AssumeRole fails:
+
+Return a safe error.
+
+Do not persist the cloud account as connected.
+
+Do not expose STS credentials to the browser.
+
+============================================================
+7. OPTIONAL SESSION TOKEN
+============================================================
+
+If AWS Session Token is provided, pass it to the AWS SDK credential
+provider.
+
+Support temporary AWS credentials correctly:
+
+Access Key ID
+Secret Access Key
+Session Token
+
+Do not assume every access key is long-lived.
+
+============================================================
+8. TEMPORARY SESSION STORAGE
+============================================================
+
+This is a critical security requirement.
+
+The supplied:
+
+accessKeyId
+secretAccessKey
+sessionToken
+
+must NOT be stored in PostgreSQL.
+
+They must NOT be returned to the frontend.
+
+They must NOT be sent to an agent.
+
+They must NOT be sent through the agent WebSocket.
+
+They must NOT be written to logs.
+
+They must NOT be persisted to disk.
+
+The resulting temporary STS credentials should exist only in the
+backend session/credential layer.
+
+Design this so the Tool Gateway can later retrieve/use the
+temporary AWS session without exposing it to agents.
+
+If the current architecture does not yet have a suitable in-memory
+credential/session manager, create a narrowly scoped abstraction
+for it.
+
+Example conceptual interface:
+
+AwsSessionManager
+
+createSession(...)
+getSession(...)
+invalidateSession(...)
+refreshSessionIfRequired(...)
+deleteSession(...)
+
+Do not over-engineer this.
+
+============================================================
+9. DATABASE
+============================================================
+
+Use the existing cloud_accounts table.
+
+Current schema concept:
+
+cloud_accounts
+
+id
+tenant_id
+provider
+account_id
+role_arn
+region
+status
+created_at
+
+Do NOT add:
+
+access_key_id
+secret_access_key
+session_token
+
+to PostgreSQL.
+
+If schema changes are required for connection/session metadata,
+justify them and keep them non-sensitive.
+
+Persist only safe metadata such as:
+
+cloud account ID
+tenant
+provider
+AWS account ID
+region
+role ARN
+status
+timestamps
+
+============================================================
+10. CONNECTION STATUS
+============================================================
+
+Define/use a truthful cloud-account state.
+
+At minimum support:
+
+CONNECTING
+CONNECTED
+FAILED
+DISCONNECTED
+
+Do not use ACTIVE as a substitute for a verified AWS connection
+if that creates ambiguity.
+
+However, inspect the existing domain model first and preserve
+existing conventions where possible.
+
+A cloud account may only become CONNECTED after successful AWS
+validation.
+
+Do not create a CONNECTED record before AWS authentication succeeds.
+
+============================================================
+11. DUPLICATE ACCOUNTS
+============================================================
+
+Prevent accidental duplicate connections for the same:
+
+tenant
+provider
+AWS account ID
+region
+
+if that matches the existing product requirements.
+
+Do not blindly create multiple identical cloud-account records.
+
+If an existing account is found, return/update according to the
+existing domain conventions.
+
+============================================================
+12. TENANT ISOLATION
+============================================================
+
+Every cloud account operation must be tenant scoped.
+
+An operator from tenant A must never:
+
+- create an account for tenant B
+- read tenant B accounts
+- modify tenant B accounts
+- delete tenant B accounts
+
+Use the existing operator authentication mechanism.
+
+Do not trust tenant IDs supplied freely by the frontend if the
+existing auth layer provides the tenant identity.
+
+============================================================
+13. AWS ROLE ARN VALIDATION
+============================================================
+
+Validate Assume Role ARN before sending it to AWS.
+
+Expected structure:
+
+arn:aws:iam::<12-digit-account-id>:role/<role-name>
+
+Reject malformed values.
+
+Do not allow arbitrary endpoints or user-controlled AWS endpoints.
+
+The implementation must not create an SSRF-style credential flow.
+
+If the AWS SDK client currently allows endpoint override, do not
+expose arbitrary endpoint configuration through this API.
+
+============================================================
+14. EXTERNAL ID
+============================================================
+
+Inspect the existing architecture before deciding how to implement
+External ID.
+
+If the current cross-account security model requires External ID,
+support it appropriately.
+
+Do NOT expose an unnecessary field merely because it exists in a
+generic example.
+
+If implementing External ID:
+
+- generate it securely where appropriate
+- never log secrets
+- persist only if required by the trust relationship
+- clearly distinguish it from AWS credentials
+
+Do not invent an External ID protocol without understanding the
+actual CloudOps trust model.
+
+============================================================
+15. CLOUD ACCOUNT REPOSITORY
+============================================================
+
+Implement a repository/service abstraction for cloud accounts if
+one does not already exist.
+
+Required operations:
+
+create
+getById
+listByTenant
+findExisting
+updateStatus
+delete/disconnect
+
+Keep database access out of the HTTP route where the existing
+architecture separates these concerns.
+
+============================================================
+16. AWS SERVICE ABSTRACTION
+============================================================
+
+Create a narrow AWS abstraction.
+
+For example:
+
+AwsStsService
+
+Responsibilities:
+
+getCallerIdentity()
+assumeRole()
+
+Do not mix:
+- HTTP concerns
+- PostgreSQL concerns
+- AWS SDK calls
+- UI concerns
+
+into one class.
+
+============================================================
+17. FRONTEND API CLIENT
+============================================================
+
+Extend the existing:
+
+apps/web/src/lib/api.ts
+
+with real cloud account functions.
+
+For example:
+
+createCloudAccount()
+fetchCloudAccounts()
+deleteCloudAccount()
+
+Use the existing API client conventions.
+
+Do not create a second HTTP client unless there is a strong
+architectural reason.
+
+============================================================
+18. FRONTEND CONNECT FLOW
+============================================================
+
+The modal should have these states:
+
+IDLE
+
+↓
+CONNECTING
+
+↓
+CONNECTED
+
+or
+
+ERROR
+
+During CONNECTING:
+
+Connect AWS button becomes:
+
+[ Connecting... ]
+
+Disable duplicate submission.
+
+On success:
+
+Show:
+
+AWS Account Connected
+
+Account:
+<actual AWS account ID>
+
+Region:
+<actual region>
+
+Connection:
+Connected
+
+Then close/transition the modal and refresh the account list.
+
+Do not hardcode:
+- account IDs
+- regions
+- role names
+- service counts
+- health status
+
+============================================================
+19. ERROR HANDLING
+============================================================
+
+Map backend errors to safe user-facing messages.
+
+Examples:
+
+Invalid AWS credentials
+Unable to validate AWS credentials
+Unable to assume IAM role
+AWS account verification failed
+AWS connection timed out
+
+Do not expose:
+
+secretAccessKey
+sessionToken
+raw AWS SDK credential objects
+authorization headers
+internal stack traces
+
+Development logs may contain diagnostic metadata, but NEVER secrets.
+
+============================================================
+20. LOGGING
+============================================================
+
+Audit the existing logger/redaction configuration.
+
+Ensure these fields are redacted:
+
+accessKeyId
+secretAccessKey
+sessionToken
+credential
+credentials
+authorization
+token
+
+Do not use:
+
+console.log(request.body)
+
+or equivalent.
+
+Never log the complete AWS connection request.
+
+============================================================
+21. DISCONNECT
+============================================================
+
+Implement:
+
+DELETE /v1/cloud-accounts/:id
+
+if this fits the existing architecture.
+
+When disconnecting:
+
+- verify tenant ownership
+- invalidate the backend temporary AWS session
+- mark/delete cloud account according to the chosen lifecycle
+- do not expose credentials
+
+The browser should return to the disconnected state.
+
+============================================================
+22. GET CONNECTED ACCOUNTS
+============================================================
+
+Implement:
+
+GET /v1/cloud-accounts
+
+Return safe metadata only.
+
+Example:
+
+[
+  {
+    "id": "cld_...",
+    "provider": "aws",
+    "accountId": "123456789012",
+    "region": "us-east-1",
+    "roleArn": "arn:aws:iam::123456789012:role/CloudOpsRole",
+    "status": "CONNECTED"
+  }
+]
+
+Never return:
+- access key
+- secret key
+- session token
+- STS credentials
+
+============================================================
+23. PREPARE FOR TOOL GATEWAY
+============================================================
+
+The connection module must be designed so that later:
+
+Hermes
+  ↓
+CloudOps Gateway
+  ↓
+Tool Gateway
+  ↓
+Cloud Account
+  ↓
+AWS Session Manager
+  ↓
+temporary AWS credentials
+  ↓
+AWS SDK
+  ↓
+AWS service
+
+The agent must NEVER receive AWS credentials.
+
+The Tool Gateway will eventually execute:
+
+aws.ecs.list_clusters
+aws.ecs.list_services
+aws.ecs.describe_service
+aws.cloudwatch.get_metrics
+etc.
+
+Do not implement the entire Tool Gateway in this task unless
+required by an existing dependency.
+
+Just make the cloud connection/session abstraction compatible with it.
+
+============================================================
+24. SECURITY TESTS
+============================================================
+
+Add tests proving:
+
+1. Valid AWS credentials can authenticate.
+2. Invalid credentials fail.
+3. Invalid Role ARN fails.
+4. AssumeRole failure does not create CONNECTED account.
+5. Access keys are not persisted in PostgreSQL.
+6. Secret access keys are not returned in API responses.
+7. Session tokens are not returned in API responses.
+8. Credentials are not logged.
+9. Tenant isolation works.
+10. Duplicate submission is handled.
+11. Disconnect invalidates the session.
+12. Temporary credentials are not exposed to agents.
+
+AWS SDK calls should be mocked in unit tests.
+
+Use real AWS only for an explicitly configured integration/E2E test.
+
+Never put real AWS credentials in the repository.
+
+============================================================
+25. REAL AWS INTEGRATION TEST
+============================================================
+
+If the repository already has an AWS integration-test pattern,
+extend it.
+
+Otherwise create a clearly isolated integration test that runs
+ONLY when explicitly enabled through environment variables.
+
+Example:
+
+CLOUDOPS_AWS_E2E=true
+
+Never run real AWS credentials in ordinary unit tests.
+
+Never commit credentials.
+
+The real integration test should verify:
+
+Connect
+  ↓
+GetCallerIdentity
+  ↓
+Optional AssumeRole
+  ↓
+Cloud account persisted
+  ↓
+Safe response
+  ↓
+No credential persistence
+
+============================================================
+26. UI SECURITY
+============================================================
+
+Inspect browser behavior.
+
+Verify:
+
+- no localStorage writes
+- no sessionStorage writes
+- no cookies containing AWS credentials
+- no credentials in URLs
+- no credentials in browser console
+- no credentials in React persistence
+- no credentials displayed after submission
+
+The modal should clear sensitive fields after successful connection.
+
+============================================================
+27. DO NOT IMPLEMENT FAKE BEHAVIOR
+============================================================
+
+Absolutely no:
+
+mock connected AWS account in production
+fake account ID
+fake AWS service list
+fake STS response
+fake connection success
+hardcoded AWS credentials
+hardcoded cloud resources
+
+If AWS connection fails, show failure.
+
+If AWS is not configured, show the real unavailable/error state.
+
+============================================================
+28. UI AFTER CONNECTION
+============================================================
+
+On /cloud/connect show:
+
+AWS
+
+Connected
+
+Account:
+<real account ID>
+
+Region:
+<real region>
+
+Role:
+<real role ARN if available>
+
+[ View Infrastructure ]
+[ Connection Settings ]
+[ Disconnect ]
+
+Only show values returned by the real API.
+
+============================================================
+29. GCP AND AZURE
+============================================================
+
+Do not implement fake GCP/Azure connections as part of this task.
+
+Keep their cards if already present.
+
+They should clearly indicate that their real connection flow is
+not implemented yet.
+
+Do not show them as connected.
+
+============================================================
+30. ACCEPTANCE CRITERIA
+============================================================
+
+The feature is complete only when:
+
+Frontend:
+
+[ ] /cloud/connect has provider cards
+[ ] AWS has Connect AWS button
+[ ] AWS modal opens
+[ ] Modal matches the reference interaction pattern
+[ ] Region field exists
+[ ] Access Key ID field exists
+[ ] Secret Access Key field exists
+[ ] Session Token optional field exists
+[ ] Assume Role ARN optional field exists
+[ ] Secret field is masked
+[ ] Loading state works
+[ ] Success state works
+[ ] Error state works
+[ ] No browser persistence of credentials
+
+Backend:
+
+[ ] POST /v1/cloud-accounts exists
+[ ] GET /v1/cloud-accounts exists
+[ ] DELETE /v1/cloud-accounts/:id exists
+[ ] Operator authentication enforced
+[ ] Tenant isolation enforced
+[ ] AWS SDK integrated
+[ ] GetCallerIdentity implemented
+[ ] AssumeRole implemented when ARN supplied
+[ ] Temporary AWS session abstraction implemented
+[ ] Cloud account metadata persisted
+[ ] Secrets never persisted
+[ ] Secrets never returned
+[ ] Secrets never logged
+
+Database:
+
+[ ] cloud_accounts used
+[ ] no secret credential columns
+[ ] account metadata persisted correctly
+[ ] tenant isolation maintained
+
+Testing:
+
+[ ] unit tests pass
+[ ] integration tests pass
+[ ] security tests pass
+[ ] typecheck passes
+[ ] frontend build passes
+
+============================================================
+31. REQUIRED FINAL REPORT
+============================================================
+
+After implementation, give me a concise implementation report:
+
+1. Files created
+2. Files modified
+3. New API endpoints
+4. AWS authentication flow
+5. Credential lifecycle
+6. Database changes
+7. Security guarantees
+8. Tests added
+9. Test results
+10. Known limitations
+
+Also explicitly answer:
+
+"Can an AWS secret credential reach PostgreSQL?"
+
+"Can an AWS secret credential reach the browser after submission?"
+
+"Can an AWS secret credential reach an agent?"
+
+"Where do temporary AWS credentials live?"
+
+"How does Tool Gateway obtain/use the AWS session?"
+
+If any of these answers cannot be guaranteed by the current
+implementation, say so explicitly.
+
+FINAL RULE:
+
+Do not claim the AWS connection is implemented unless a real
+backend AWS STS call is actually implemented and the complete
+frontend → API → AWS → database flow works.
+
+Do not hide incomplete functionality behind a successful UI.

@@ -1,0 +1,267 @@
+import type { WebSocket } from "ws";
+import {
+  RuntimeCredentialService,
+  RuntimeSessionService
+} from "@cloudops/runtime";
+import { GatewayAuthenticator } from "./authenticator.js";
+import { GatewayConnectionManager } from "./connectionManager.js";
+import {
+  ClientMessageSchema,
+  type AuthSuccessMessage,
+  type AuthFailedMessage,
+  type HeartbeatAckMessage,
+  type CredentialRotatedMessage,
+  type ErrorMessage,
+  type ServerMessage
+} from "./protocol.js";
+
+export interface GatewayHandlerOptions {
+  authTimeoutMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  gatewayNodeId?: string;
+}
+
+export class GatewayHandler {
+  private readonly authTimeoutMs: number;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private readonly gatewayNodeId: string;
+
+  constructor(
+    public readonly authenticator: GatewayAuthenticator = new GatewayAuthenticator(),
+    public readonly connectionManager: GatewayConnectionManager = new GatewayConnectionManager(),
+    public readonly credentialService: RuntimeCredentialService = new RuntimeCredentialService(),
+    public readonly sessionService: RuntimeSessionService = new RuntimeSessionService(),
+    options: GatewayHandlerOptions = {}
+  ) {
+    this.authTimeoutMs = options.authTimeoutMs || 10000;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs || 15000;
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs || 45000;
+    this.gatewayNodeId = options.gatewayNodeId || "gateway-node-1";
+  }
+
+  /**
+   * Handle an incoming WebSocket connection.
+   */
+  handleConnection(ws: WebSocket): void {
+    let isAuthenticated = false;
+
+    // Strict handshake timeout: must authenticate within authTimeoutMs
+    const authTimer = setTimeout(() => {
+      if (!isAuthenticated && ws.readyState === ws.OPEN) {
+        const timeoutMsg: AuthFailedMessage = {
+          type: "AUTH_FAILED",
+          code: "AUTHENTICATION_TIMEOUT",
+          message: "Authentication handshake timed out"
+        };
+        try {
+          ws.send(JSON.stringify(timeoutMsg));
+          ws.close(1008, "Authentication timeout");
+        } catch {
+          // Ignore
+        }
+      }
+    }, this.authTimeoutMs);
+
+    ws.on("message", async (data: Buffer | string) => {
+      try {
+        const rawString = typeof data === "string" ? data : data.toString("utf-8");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(rawString);
+        } catch {
+          const errMsg: ErrorMessage = {
+            type: "ERROR",
+            code: "MALFORMED_JSON",
+            message: "Incoming message is not valid JSON"
+          };
+          ws.send(JSON.stringify(errMsg));
+          return;
+        }
+
+        const parseResult = ClientMessageSchema.safeParse(parsed);
+        if (!parseResult.success) {
+          const errMsg: ErrorMessage = {
+            type: "ERROR",
+            code: "MALFORMED_MESSAGE",
+            message: parseResult.error.errors.map(e => `${e.path.join(".")}: ${e.message}`).join(", ")
+          };
+          ws.send(JSON.stringify(errMsg));
+          return;
+        }
+
+        const msg = parseResult.data;
+
+        // 1. Handshake Phase: Expect AUTH first
+        if (!isAuthenticated) {
+          if (msg.type !== "AUTH") {
+            const errMsg: ErrorMessage = {
+              type: "ERROR",
+              code: "UNAUTHENTICATED",
+              message: "First message must be an AUTH message"
+            };
+            ws.send(JSON.stringify(errMsg));
+            ws.close(1008, "Unauthenticated");
+            return;
+          }
+
+          try {
+            const authResult = await this.authenticator.authenticate(msg, this.gatewayNodeId);
+            clearTimeout(authTimer);
+            isAuthenticated = true;
+
+            // Register session in ConnectionManager (which also closes any previous session cleanly)
+            this.connectionManager.registerSession(
+              authResult.session,
+              ws,
+              authResult.previousSessionId
+            );
+
+            const successMsg: AuthSuccessMessage = {
+              type: "AUTH_SUCCESS",
+              sessionId: authResult.session.id,
+              agentId: authResult.session.agentId,
+              tenantId: authResult.session.tenantId,
+              authType: authResult.authType,
+              ...(authResult.runtimeCredential ? { runtimeCredential: authResult.runtimeCredential } : {}),
+              heartbeatIntervalMs: this.heartbeatIntervalMs,
+              heartbeatTimeoutMs: this.heartbeatTimeoutMs
+            };
+
+            ws.send(JSON.stringify(successMsg));
+            return;
+          } catch (authErr: any) {
+            clearTimeout(authTimer);
+            const failMsg: AuthFailedMessage = {
+              type: "AUTH_FAILED",
+              code: authErr?.code || "AUTHENTICATION_FAILED",
+              message: authErr?.message || "Authentication failed"
+            };
+            ws.send(JSON.stringify(failMsg));
+            ws.close(1008, "Authentication failed");
+            return;
+          }
+        }
+
+        // 2. Authenticated Session Phase
+        const meta = this.connectionManager.getMetadata(ws);
+        if (!meta) {
+          ws.close(1008, "Session metadata missing");
+          return;
+        }
+
+        switch (msg.type) {
+          case "HEARTBEAT": {
+            if (msg.sessionId !== meta.sessionId) {
+              const errMsg: ErrorMessage = {
+                type: "ERROR",
+                code: "SESSION_MISMATCH",
+                message: "Heartbeat sessionId does not match active connection session"
+              };
+              ws.send(JSON.stringify(errMsg));
+              return;
+            }
+
+            await this.sessionService.recordHeartbeat(meta.sessionId);
+            this.connectionManager.updateHeartbeat(ws);
+
+            const ack: HeartbeatAckMessage = {
+              type: "HEARTBEAT_ACK",
+              sessionId: meta.sessionId,
+              timestamp: Date.now()
+            };
+            ws.send(JSON.stringify(ack));
+            break;
+          }
+
+          case "ROTATE_CREDENTIAL": {
+            if (msg.sessionId !== meta.sessionId) {
+              const errMsg: ErrorMessage = {
+                type: "ERROR",
+                code: "SESSION_MISMATCH",
+                message: "Rotate credential sessionId does not match active connection session"
+              };
+              ws.send(JSON.stringify(errMsg));
+              return;
+            }
+
+            try {
+              const newCred = await this.credentialService.rotateCredential(
+                meta.tenantId,
+                meta.agentId,
+                meta.credentialId
+              );
+
+              // Update metadata with new credential ID
+              meta.credentialId = newCred.credentialId;
+
+              const rotatedMsg: CredentialRotatedMessage = {
+                type: "CREDENTIAL_ROTATED",
+                newRuntimeCredential: {
+                  credentialId: newCred.credentialId,
+                  secret: newCred.secret,
+                  expiresAt: newCred.expiresAt.toISOString()
+                }
+              };
+              ws.send(JSON.stringify(rotatedMsg));
+            } catch (rotErr: any) {
+              const errMsg: ErrorMessage = {
+                type: "ERROR",
+                code: rotErr?.code || "ROTATION_FAILED",
+                message: rotErr?.message || "Failed to rotate credential"
+              };
+              ws.send(JSON.stringify(errMsg));
+            }
+            break;
+          }
+
+          case "DISCONNECT": {
+            this.connectionManager.unregisterSocket(ws);
+            await this.sessionService.terminateSession(meta.sessionId, "CLIENT_DISCONNECT");
+            ws.close(1000, "Client initiated disconnect");
+            break;
+          }
+
+          case "AUTH": {
+            // Already authenticated
+            const errMsg: ErrorMessage = {
+              type: "ERROR",
+              code: "ALREADY_AUTHENTICATED",
+              message: "Connection is already authenticated"
+            };
+            ws.send(JSON.stringify(errMsg));
+            break;
+          }
+        }
+      } catch (err: any) {
+        const errMsg: ErrorMessage = {
+          type: "ERROR",
+          code: "INTERNAL_ERROR",
+          message: "Internal gateway processing error"
+        };
+        try {
+          ws.send(JSON.stringify(errMsg));
+        } catch {
+          // Ignore
+        }
+      }
+    });
+
+    ws.on("close", async () => {
+      clearTimeout(authTimer);
+      const meta = this.connectionManager.unregisterSocket(ws);
+      if (meta) {
+        await this.sessionService.terminateSession(meta.sessionId, "CLIENT_DISCONNECT");
+      }
+    });
+
+    ws.on("error", async () => {
+      clearTimeout(authTimer);
+      const meta = this.connectionManager.unregisterSocket(ws);
+      if (meta) {
+        await this.sessionService.terminateSession(meta.sessionId, "CLIENT_DISCONNECT");
+      }
+    });
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@cloudops/adapters",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1127.0",
+    "@aws-sdk/client-ecs": "^3.1127.0",
+    "@aws-sdk/client-rds": "^3.1127.0",
+    "@aws-sdk/client-s3": "^3.1127.0",
+    "@aws-sdk/client-sts": "^3.1127.0",
+    "@cloudops/shared": "*"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "cloudops",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=11.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "database"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -p \"[{name}]\" -n \"api,web\" -c \"magenta,blue\" \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm run dev --workspace=@cloudops/api",
+    "dev:web": "npm run dev --workspace=@cloudops/web",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "tsx database/src/migrate.ts",
+    "db:reset": "tsx database/src/reset.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "concurrently": "^10.0.5",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7",
+    "ws": "^8.21.3"
+  }
+}
