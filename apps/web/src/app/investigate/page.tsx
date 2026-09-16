@@ -52,7 +52,18 @@ export default function InvestigatePage() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // 1. Fetch real incidents from PostgreSQL API
+  // Dynamic investigation configuration parameters
+  const [targetService, setTargetService] = useState("starvision-motors");
+  const [targetCluster, setTargetCluster] = useState("cloudops-test");
+  const [targetRegion, setTargetRegion] = useState("eu-north-1");
+  const [targetSeverity, setTargetSeverity] = useState<"CRITICAL" | "HIGH" | "MEDIUM" | "LOW">("CRITICAL");
+  const [targetAlertDesc, setTargetAlertDesc] = useState(
+    "Service health anomaly on ECS tasks. Tasks failing steady-state verification. ALB target 5xx error rate spiking."
+  );
+  const [showConfigPanel, setShowConfigPanel] = useState(false);
+  const [discoveredWorkloads, setDiscoveredWorkloads] = useState<{ name: string; cluster?: string; region?: string }[]>([]);
+
+  // 1. Fetch real incidents and connected workloads from PostgreSQL API
   const loadIncidents = useCallback(async () => {
     try {
       setLoading(true);
@@ -67,6 +78,30 @@ export default function InvestigatePage() {
           setSelectedIncidentId(items[0].id);
         }
       }
+
+      // Query connected cloud accounts and workloads dynamically
+      try {
+        const accRes = await fetch("http://localhost:3000/v1/cloud-accounts", {
+          headers: { "x-tenant-id": "ten_default_tenant", "x-operator-id": "op_admin" }
+        });
+        if (accRes.ok) {
+          const accs = await accRes.json();
+          if (Array.isArray(accs) && accs.length > 0 && accs[0].region) {
+            setTargetRegion(accs[0].region);
+            const wlRes = await fetch(`http://localhost:3000/v1/cloud-accounts/${accs[0].id}/workloads`, {
+              headers: { "x-tenant-id": "ten_default_tenant", "x-operator-id": "op_admin" }
+            });
+            if (wlRes.ok) {
+              const wlData = await wlRes.json();
+              if (Array.isArray(wlData?.workloads) && wlData.workloads.length > 0) {
+                setDiscoveredWorkloads(wlData.workloads);
+                setTargetService(wlData.workloads[0].name);
+                if (wlData.workloads[0].cluster) setTargetCluster(wlData.workloads[0].cluster);
+              }
+            }
+          }
+        }
+      } catch {}
     } catch (err) {
       console.error("Failed to load incidents", err);
     } finally {
@@ -80,29 +115,49 @@ export default function InvestigatePage() {
 
   useEffect(() => {
     if (selectedIncidentId) {
+      const selected = incidents.find((i) => i.id === selectedIncidentId);
+      const svc = selected?.service ? selected.service.split("/").pop() || selected.service : targetService;
       setChatContext({
         investigationId: selectedIncidentId,
-        service: "starvision-motors",
+        service: svc,
         sourcePage: "Investigations"
       });
     }
-  }, [selectedIncidentId, setChatContext]);
+  }, [selectedIncidentId, incidents, targetService, setChatContext]);
 
-  // 2. Trigger real controlled failure simulation and live Hermes investigation
-  const handleSimulateAndInvestigate = async (serviceName = "starvision-motors", cluster = "cloudops-test", region = "us-east-1") => {
+  // 2. Trigger dynamic autonomous Hermes investigation
+  const handleTriggerInvestigation = async (overrideParams?: {
+    service?: string;
+    cluster?: string;
+    region?: string;
+    severity?: string;
+    alertDescription?: string;
+  }) => {
+    const sName = overrideParams?.service || targetService;
+    const cName = overrideParams?.cluster || targetCluster;
+    const reg = overrideParams?.region || targetRegion;
+    const sev = overrideParams?.severity || targetSeverity;
+    const alertDesc = overrideParams?.alertDescription || targetAlertDesc;
+
     setIsInvestigating(true);
     setLiveSteps([]);
     setRootCause(null);
     setPendingApprovalId(null);
 
     try {
-      const res = await fetch("http://localhost:3000/v1/incidents/simulate-failure", {
+      const res = await fetch("http://localhost:3000/v1/incidents/trigger", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "x-tenant-id": "ten_default_tenant"
         },
-        body: JSON.stringify({ service: serviceName, cluster, region })
+        body: JSON.stringify({
+          service: sName,
+          cluster: cName,
+          region: reg,
+          severity: sev,
+          alertDescription: alertDesc
+        })
       });
 
       if (res.ok) {
@@ -122,7 +177,7 @@ export default function InvestigatePage() {
         setIsInvestigating(false);
       }
     } catch (err) {
-      console.error("Failed to simulate failure", err);
+      console.error("Failed to trigger investigation", err);
       setIsInvestigating(false);
     }
   };
@@ -314,12 +369,21 @@ export default function InvestigatePage() {
         <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
           <button
             type="button"
-            onClick={() => handleSimulateAndInvestigate("starvision-motors", "cloudops-test", "us-east-1")}
+            onClick={() => setShowConfigPanel(!showConfigPanel)}
+            className="btn-secondary"
+            style={{ fontSize: "13px" }}
+          >
+            {showConfigPanel ? "Hide Target Settings" : "⚙ Target Settings"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleTriggerInvestigation()}
             disabled={isInvestigating}
             className="btn-primary"
             style={{ fontSize: "13px", background: "#b91c1c", borderColor: "#991b1b" }}
           >
-            {isInvestigating ? "Investigating Real Workload..." : "🔥 Trigger Failure & Run Hermes SRE"}
+            {isInvestigating ? "Investigating Real Workload..." : "🚀 Launch Live Hermes SRE"}
           </button>
 
           {selectedIncident && (
@@ -335,6 +399,102 @@ export default function InvestigatePage() {
           )}
         </div>
       </div>
+
+      {/* Dynamic Target Configuration Panel */}
+      {showConfigPanel && (
+        <div className="harvey-card" style={{ padding: "20px", background: "#fdfdfc", border: "1px solid var(--warm-gray-border)" }}>
+          <div style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--near-black-ink)", marginBottom: "12px" }}>
+            Dynamic Target Workload Configuration
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "12px", marginBottom: "12px" }}>
+            <div>
+              <label style={{ display: "block", fontSize: "11.5px", fontWeight: 500, color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
+                Target Service
+              </label>
+              {discoveredWorkloads.length > 0 ? (
+                <select
+                  value={targetService}
+                  onChange={(e) => {
+                    setTargetService(e.target.value);
+                    const matched = discoveredWorkloads.find((w) => w.name === e.target.value);
+                    if (matched?.cluster) setTargetCluster(matched.cluster);
+                  }}
+                  style={{ width: "100%", padding: "8px 10px", fontSize: "13px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warm-gray-border)", background: "#ffffff" }}
+                >
+                  {discoveredWorkloads.map((w) => (
+                    <option key={w.name} value={w.name}>
+                      {w.name} ({w.cluster || "default"})
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  type="text"
+                  value={targetService}
+                  onChange={(e) => setTargetService(e.target.value)}
+                  placeholder="e.g. starvision-motors"
+                  style={{ width: "100%", padding: "8px 10px", fontSize: "13px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warm-gray-border)", background: "#ffffff" }}
+                />
+              )}
+            </div>
+
+            <div>
+              <label style={{ display: "block", fontSize: "11.5px", fontWeight: 500, color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
+                ECS Cluster
+              </label>
+              <input
+                type="text"
+                value={targetCluster}
+                onChange={(e) => setTargetCluster(e.target.value)}
+                placeholder="e.g. cloudops-test"
+                style={{ width: "100%", padding: "8px 10px", fontSize: "13px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warm-gray-border)", background: "#ffffff" }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: "block", fontSize: "11.5px", fontWeight: 500, color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
+                AWS Region
+              </label>
+              <input
+                type="text"
+                value={targetRegion}
+                onChange={(e) => setTargetRegion(e.target.value)}
+                placeholder="e.g. eu-north-1"
+                style={{ width: "100%", padding: "8px 10px", fontSize: "13px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warm-gray-border)", background: "#ffffff" }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: "block", fontSize: "11.5px", fontWeight: 500, color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
+                Severity
+              </label>
+              <select
+                value={targetSeverity}
+                onChange={(e) => setTargetSeverity(e.target.value as any)}
+                style={{ width: "100%", padding: "8px 10px", fontSize: "13px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warm-gray-border)", background: "#ffffff" }}
+              >
+                <option value="CRITICAL">CRITICAL</option>
+                <option value="HIGH">HIGH</option>
+                <option value="MEDIUM">MEDIUM</option>
+                <option value="LOW">LOW</option>
+              </select>
+            </div>
+          </div>
+
+          <div style={{ marginBottom: "12px" }}>
+            <label style={{ display: "block", fontSize: "11.5px", fontWeight: 500, color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
+              Alert / Issue Description (Input to Hermes Agent)
+            </label>
+            <input
+              type="text"
+              value={targetAlertDesc}
+              onChange={(e) => setTargetAlertDesc(e.target.value)}
+              placeholder="e.g. ECS Task steady-state check failed. ALB reporting 5xx errors."
+              style={{ width: "100%", padding: "8px 10px", fontSize: "13px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warm-gray-border)", background: "#ffffff" }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* 2. Incidents List Table */}
       <div className="harvey-card" style={{ padding: "0" }}>
@@ -402,17 +562,27 @@ export default function InvestigatePage() {
               No Active Incidents Logged Yet
             </div>
             <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", maxWidth: "560px", margin: "0 auto 16px" }}>
-              The PostgreSQL incident database is clean. Click below to simulate a live container failure on real discovered workload <strong>starvision-motors</strong> (cloudops-test / us-east-1) and dispatch the live <strong>cloud-hermes</strong> autonomous agent.
+              The PostgreSQL incident database is clean. Launch an autonomous SRE investigation on workload <strong>{targetService}</strong> ({targetCluster} / {targetRegion}) to dispatch the live <strong>cloud-hermes</strong> agent with real-time AWS telemetry correlation.
             </p>
-            <button
-              type="button"
-              onClick={() => handleSimulateAndInvestigate("starvision-motors", "cloudops-test", "us-east-1")}
-              disabled={isInvestigating}
-              className="btn-primary"
-              style={{ fontSize: "13px" }}
-            >
-              🔥 Simulate Incident & Run Live Hermes Investigation
-            </button>
+            <div style={{ display: "flex", gap: "10px", justifyContent: "center" }}>
+              <button
+                type="button"
+                onClick={() => setShowConfigPanel(!showConfigPanel)}
+                className="btn-secondary"
+                style={{ fontSize: "13px" }}
+              >
+                {showConfigPanel ? "Hide Target Settings" : "⚙ Target Settings"}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleTriggerInvestigation()}
+                disabled={isInvestigating}
+                className="btn-primary"
+                style={{ fontSize: "13px" }}
+              >
+                🚀 Launch Autonomous SRE Investigation
+              </button>
+            </div>
           </div>
         )}
       </div>

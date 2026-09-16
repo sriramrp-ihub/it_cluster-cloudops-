@@ -51,7 +51,7 @@ export function buildApp(opts: BuildAppOptions = {}) {
 
   const gatewayHandler = opts.gatewayHandler || new GatewayHandler();
   const approvalService = opts.approvalService || new ApprovalService();
-  const agentAdapter = opts.agentAdapter || new HermesAgentAdapter();
+  const agentAdapter = opts.agentAdapter || new HermesAgentAdapter({ enableLiveInference: true });
 
   if (opts.startHeartbeatMonitor !== false) {
     gatewayHandler.connectionManager.startHeartbeatMonitor(10000, 30000);

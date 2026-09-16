@@ -1,7 +1,8 @@
 import type { FastifyPluginAsync } from "fastify";
 import { IncidentService } from "@cloudops/adapters";
-import { MockAgentAdapter, type AgentAdapter } from "@cloudops/runtime";
+import { HermesAgentAdapter, type AgentAdapter } from "@cloudops/runtime";
 import { ApprovalService } from "@cloudops/approvals";
+import { CANONICAL_TOOLS } from "@cloudops/tools";
 import { ValidationError, NotFoundError } from "@cloudops/shared";
 import { randomUUID } from "node:crypto";
 
@@ -16,7 +17,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
   opts
 ) => {
   const incidentService = opts.incidentService || new IncidentService();
-  const agentAdapter = opts.agentAdapter || new MockAgentAdapter();
+  const agentAdapter = opts.agentAdapter || new HermesAgentAdapter({ enableLiveInference: true });
   const approvalService = opts.approvalService || new ApprovalService();
   const awsAccountId = process.env.AWS_ACCOUNT_ID || "265766933076";
 
@@ -43,24 +44,102 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
   });
 
   /**
-   * POST /v1/incidents/simulate-failure
-   * Triggers an automated controlled failure and starts live investigation turn on a workload.
+   * Builds an active tool call execution handler that connects agent tool calls
+   * directly to canonical AWS SDK commands and registers mutations into the Approvals service.
    */
-  fastify.post<{
-    Body: {
-      workloadId?: string;
-      service?: string;
-      cluster?: string;
-      region?: string;
-      severity?: string;
+  function buildToolCallHandler(
+    tenantId: string,
+    effectiveAgentId: string,
+    cluster: string,
+    service: string,
+    region: string
+  ) {
+    return async (call: any) => {
+      const toolDef = CANONICAL_TOOLS.find((t) => t.name === call.toolName);
+
+      // Mutating operations or tools requiring human operator authorization
+      const isMutation =
+        toolDef?.operationType === "MUTATION" ||
+        toolDef?.operationType === "DEPLOY" ||
+        toolDef?.requiresApproval ||
+        call.toolName.includes("update") ||
+        call.toolName.includes("rollback") ||
+        call.toolName.includes("remediate") ||
+        call.toolName.includes("reboot");
+
+      if (isMutation) {
+        const approval = await approvalService.createApprovalRequest({
+          tenantId: tenantId as any,
+          agentId: effectiveAgentId as any,
+          toolName: call.toolName,
+          operationType: "MUTATION",
+          rawPayload: call.arguments as Record<string, unknown>,
+          dryRunDiff: {
+            resource: `arn:aws:ecs:${region}:${awsAccountId}:service/${cluster}/${service}`,
+            action: call.toolName.toUpperCase(),
+            parameters: call.arguments,
+            riskLevel: toolDef?.riskLevel || "HIGH"
+          }
+        });
+        return {
+          callId: call.callId,
+          status: "AWAITING_APPROVAL" as const,
+          approvalId: approval.id,
+          data: {
+            approvalId: approval.id,
+            toolName: call.toolName,
+            status: "AWAITING_APPROVAL",
+            message: "Mutation routed to human operator authorization queue",
+            dryRunDiff: approval.dryRunDiff
+          }
+        };
+      }
+
+      // Execute canonical AWS tool using live AWS SDK
+      if (toolDef) {
+        try {
+          const toolResult = await toolDef.handler(call.arguments || {}, {
+            agentId: effectiveAgentId,
+            tenantId
+          });
+          return {
+            callId: call.callId,
+            status: "SUCCESS" as const,
+            data: toolResult
+          };
+        } catch (err: any) {
+          return {
+            callId: call.callId,
+            status: "ERROR" as const,
+            error: err?.message || `Execution of ${call.toolName} failed`,
+            data: { error: err?.message, toolName: call.toolName }
+          };
+        }
+      }
+
+      return {
+        callId: call.callId,
+        status: "ERROR" as const,
+        error: `Tool '${call.toolName}' not found in canonical tool registry`,
+        data: { error: `Tool ${call.toolName} not found`, toolName: call.toolName }
+      };
     };
-  }>("/v1/incidents/simulate-failure", async (request, reply) => {
+  }
+
+  /**
+   * Helper to handle dynamic incident trigger and autonomous investigation dispatch
+   */
+  async function handleTriggerInvestigation(request: any, reply: any) {
     const tenantId = getTenantId(request);
     const body = request.body || {};
     const serviceName = body.service || "starvision-motors";
     const clusterName = body.cluster || "cloudops-test";
-    const region = body.region || "us-east-1";
+    const region = body.region || process.env.AWS_REGION || "eu-north-1";
     const severity = body.severity || "CRITICAL";
+    const title = body.title || `ECS Incident on ${serviceName}: Tasks failing steady-state check`;
+    const alertDescription =
+      body.alertDescription ||
+      `Service health anomaly on ${serviceName} in cluster ${clusterName} (${region}). Tasks failing steady-state verification.`;
 
     const incidentId = `inc_${randomUUID().substring(0, 8)}`;
     const createdIncident = await incidentService.createIncident(tenantId, {
@@ -71,8 +150,8 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       service: `${clusterName}/${serviceName}`,
       resourceId: `arn:aws:ecs:${region}:${awsAccountId}:service/${clusterName}/${serviceName}`,
       severity,
-      title: `ECS CrashLoop on ${serviceName}: Tasks failing steady-state check`,
-      alertDescription: `CannotPullContainerError: Container image manifest missing or tag does not exist for service ${serviceName} on cluster ${clusterName}. ALB reporting HTTP 503 errors.`,
+      title,
+      alertDescription,
       sourceMetadata: {
         monitorId: "mon_alb_5xx_spike",
         triggerMetric: "Target5xxCountHigh",
@@ -90,46 +169,23 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       adapter: agentAdapter
     });
 
-    // Register tool call handler to bind mutations directly to real approval records
+    // Wire live tool handler that executes canonical AWS SDK commands
     if (typeof (agentAdapter as any).onToolCall === "function") {
-      agentAdapter.onToolCall(session.sessionId, async (call: any) => {
-        if (call.toolName.includes("update") || call.toolName.includes("rollback") || call.toolName.includes("remediate")) {
-          const approval = await approvalService.createApprovalRequest({
-            tenantId: tenantId as any,
-            agentId: effectiveAgentId as any,
-            toolName: call.toolName,
-            operationType: "MUTATION",
-            rawPayload: call.arguments as Record<string, unknown>,
-            dryRunDiff: {
-              resource: `arn:aws:ecs:${region}:${awsAccountId}:service/${clusterName}/${serviceName}`,
-              action: "ROLLBACK_TASK_DEFINITION",
-              current: `${serviceName}:2 (Broken manifest)`,
-              target: `${serviceName}:1 (Stable baseline)`
-            }
-          });
-          return {
-            callId: call.callId,
-            status: "AWAITING_APPROVAL",
-            approvalId: approval.id,
-            data: { approvalId: approval.id, message: "Mutation routed to human operator authorization queue" }
-          };
-        }
-        return {
-          callId: call.callId,
-          status: "SUCCESS",
-          data: { status: "INSPECTED", resource: `${clusterName}/${serviceName}`, timestamp: new Date().toISOString() }
-        };
-      });
+      agentAdapter.onToolCall(
+        session.sessionId,
+        buildToolCallHandler(tenantId, effectiveAgentId, clusterName, serviceName, region)
+      );
     }
 
-    // Asynchronously drive the investigation in the background
+    // Asynchronously drive the investigation in the background with live inference
     if (typeof (agentAdapter as any).runInvestigation === "function") {
       (agentAdapter as any)
         .runInvestigation(session.sessionId, {
           cluster: clusterName,
           service: serviceName,
           region,
-          alertDescription: createdIncident.alertDescription
+          alertDescription: createdIncident.alertDescription,
+          liveInference: true
         })
         .catch(async (err: any) => {
           await incidentService.failInvestigation(
@@ -145,7 +201,19 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       investigation,
       session
     });
-  });
+  }
+
+  /**
+   * POST /v1/incidents/simulate-failure
+   * Triggers an automated controlled failure and starts live investigation turn on a workload.
+   */
+  fastify.post("/v1/incidents/simulate-failure", handleTriggerInvestigation);
+
+  /**
+   * POST /v1/incidents/trigger
+   * Direct dynamic trigger for an autonomous SRE investigation on any workload.
+   */
+  fastify.post("/v1/incidents/trigger", handleTriggerInvestigation);
 
   /**
    * GET /v1/incidents
@@ -224,46 +292,23 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       adapter: agentAdapter
     });
 
-    // Register tool call handler to bind mutations directly to real approval records
+    // Wire live tool handler that executes canonical AWS SDK commands
     if (typeof (agentAdapter as any).onToolCall === "function") {
-      agentAdapter.onToolCall(session.sessionId, async (call: any) => {
-        if (call.toolName.includes("update") || call.toolName.includes("rollback") || call.toolName.includes("remediate")) {
-          const approval = await approvalService.createApprovalRequest({
-            tenantId: tenantId as any,
-            agentId: effectiveAgentId as any,
-            toolName: call.toolName,
-            operationType: "MUTATION",
-            rawPayload: call.arguments as Record<string, unknown>,
-            dryRunDiff: {
-              resource: `arn:aws:ecs:${region}:${awsAccountId}:service/${cluster}/${service}`,
-              action: "ROLLBACK_TASK_DEFINITION",
-              current: `${service}:2 (Broken manifest)`,
-              target: `${service}:1 (Stable baseline)`
-            }
-          });
-          return {
-            callId: call.callId,
-            status: "AWAITING_APPROVAL",
-            approvalId: approval.id,
-            data: { approvalId: approval.id, message: "Mutation routed to human operator authorization queue" }
-          };
-        }
-        return {
-          callId: call.callId,
-          status: "SUCCESS",
-          data: { status: "INSPECTED", resource: `${cluster}/${service}`, timestamp: new Date().toISOString() }
-        };
-      });
+      agentAdapter.onToolCall(
+        session.sessionId,
+        buildToolCallHandler(tenantId, effectiveAgentId, cluster, service, region)
+      );
     }
 
-    // Asynchronously drive the investigation in the background
+    // Asynchronously drive the investigation in the background with live inference
     if (typeof (agentAdapter as any).runInvestigation === "function") {
       (agentAdapter as any)
         .runInvestigation(session.sessionId, {
           cluster,
           service,
           region,
-          alertDescription: incDetails.incident.alertDescription
+          alertDescription: incDetails.incident.alertDescription,
+          liveInference: true
         })
         .catch(async (err: any) => {
           await incidentService.failInvestigation(

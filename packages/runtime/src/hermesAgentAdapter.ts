@@ -76,7 +76,7 @@ export class HermesAgentAdapter implements AgentAdapter {
       process.env.HERMES_BIN ||
       "/Users/user/Desktop/hermes/hermes-agent/hermes";
     this.enableLiveInference =
-      config.enableLiveInference ?? (process.env.HERMES_LIVE_INFERENCE === "true");
+      config.enableLiveInference ?? (process.env.HERMES_LIVE_INFERENCE !== "false");
   }
 
   /**
@@ -553,12 +553,11 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
     }
 
     if (!hermesInferenceSucceeded) {
-      // Grounded heuristics fallback
-      const hasRunningTasks = svc ? (svc.runningCount ?? 0) > 0 : null;
+      // Grounded truthful telemetry evaluation directly from live AWS SDK inspection
       const hasStoppedTasks = stoppedTaskCount > 0;
       const deploymentFailed =
         svc?.deployments?.[0]?.rolloutState === "FAILED" ||
-        svc?.deployments?.[0]?.failedTasks > 0;
+        (svc?.deployments?.[0]?.failedTasks ?? 0) > 0;
       const awsError = svcData?.error || stoppedData?.error;
 
       if (awsError && awsError.includes("credentials")) {
@@ -577,26 +576,21 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
         remediationToolName = "aws_ecs_describe_clusters";
         remediationParams = { region: targetRegion };
         riskLevel = "LOW";
-      } else if (
-        (hasStoppedTasks && (containerError || stopReason)) ||
-        (awsError && (awsError.includes("CannotPull") || awsError.includes("CrashLoop"))) ||
-        (incidentContext?.alertDescription && (incidentContext.alertDescription.includes("CannotPull") || incidentContext.alertDescription.includes("503") || incidentContext.alertDescription.includes("spike") || incidentContext.alertDescription.includes("error")))
-      ) {
-        const errorDetail = containerError || stopReason || awsError || incidentContext?.alertDescription || "unknown container exit";
-        finding = `ECS Tasks failing to start for '${targetService}': "${errorDetail}"`;
-        rootCauseText = `${stoppedTaskCount || 1} stopped task(s) found on cluster '${targetCluster}'. ` +
+      } else if (hasStoppedTasks) {
+        const errorDetail = containerError || stopReason || "essential container exited";
+        finding = `ECS Tasks stopped for '${targetService}': "${errorDetail}"`;
+        rootCauseText = `AWS ECS reports ${stoppedTaskCount} stopped task(s) on cluster '${targetCluster}'. ` +
           (stopReason ? `Task stop reason: "${stopReason}". ` : "") +
           (containerError ? `Container-level error: "${containerError}". ` : "") +
-          `This indicates the container is failing to start or is being killed by ECS. ` +
           (errorDetail.toLowerCase().includes("pull") || errorDetail.toLowerCase().includes("image")
             ? `Image pull failure detected — the container image reference may be invalid or the tag may not exist in ECR.`
             : errorDetail.toLowerCase().includes("oom") || errorDetail.toLowerCase().includes("memory")
             ? `Out-of-memory condition — container is exceeding its allocated memory limit.`
             : `Review container logs and task definition for misconfiguration.`);
         confidence = 0.95;
-        remediationToolName = "aws_ecs_update_service_image";
+        remediationToolName = "aws_ecs_rollback_service";
         remediationParams = { cluster: targetCluster, service: targetService, region: targetRegion };
-        riskLevel = "CRITICAL";
+        riskLevel = "HIGH";
       } else if (deploymentFailed) {
         finding = `ECS deployment for '${targetService}' is in FAILED state`;
         rootCauseText = `The active ECS deployment on cluster '${targetCluster}' has rolloutState=FAILED with ` +
@@ -611,10 +605,7 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
         const missing = (svc.desiredCount ?? 0) - (svc.runningCount ?? 0);
         finding = `ECS service '${targetService}' is under-provisioned: ${missing} task(s) missing`;
         rootCauseText = `Service '${targetService}' on cluster '${targetCluster}' has desiredCount=${svc.desiredCount} but only runningCount=${svc.runningCount}. ` +
-          `${missing} task(s) are failing to reach RUNNING state. ` +
-          (stoppedData?.stoppedTaskCount > 0
-            ? `${stoppedData.stoppedTaskCount} recently stopped task(s) confirm ongoing placement/startup failures.`
-            : `No recent stopped tasks found — tasks may be stuck in PENDING state.`);
+          `${missing} task(s) are failing to reach RUNNING state. No stopped tasks found — tasks may be stuck in PENDING state.`;
         confidence = 0.88;
         remediationToolName = "aws_ecs_update_service";
         remediationParams = { cluster: targetCluster, service: targetService, forceNewDeployment: true, region: targetRegion };
@@ -627,14 +618,19 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
         remediationToolName = "aws_ecs_describe_services";
         remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
         riskLevel = "LOW";
+      } else if (svc) {
+        finding = `ECS service '${targetService}' is healthy (desired=${svc.desiredCount}, running=${svc.runningCount})`;
+        rootCauseText = `ECS service '${targetService}' on '${targetCluster}' reports desiredCount=${svc.desiredCount}, runningCount=${svc.runningCount}. ` +
+          `No stopped tasks or failed deployments were found in the AWS inspection window.`;
+        confidence = 0.90;
+        remediationToolName = "aws_ecs_describe_services";
+        remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
+        riskLevel = "LOW";
       } else {
-        finding = `No critical failure detected for '${targetService}' — service appears healthy`;
-        rootCauseText = svc
-          ? `ECS service '${targetService}' on '${targetCluster}' reports desiredCount=${svc.desiredCount}, runningCount=${svc.runningCount}. ` +
-            `No stopped tasks or failed deployments were found in the inspection window. The alert may have resolved or triggered on a transient spike.`
-          : `Live AWS inspection returned no actionable data for '${targetService}'. ` +
-            `The service may not exist in cluster '${targetCluster}' in region '${targetRegion}', or credentials may lack sufficient permissions.`;
-        confidence = 0.6;
+        finding = `No ECS service records returned for '${targetService}' in cluster '${targetCluster}'`;
+        rootCauseText = `Live AWS inspection returned no active service data for '${targetService}'. ` +
+          `The service may not exist in cluster '${targetCluster}' in region '${targetRegion}', or credentials may lack sufficient permissions.`;
+        confidence = 0.7;
         remediationToolName = "aws_ecs_describe_services";
         remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
         riskLevel = "LOW";
