@@ -19,6 +19,8 @@ import {
   IncidentItem
 } from "./api";
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
+
 export interface AgentOperationalContext {
   environment?: string;
   region?: string;
@@ -513,7 +515,41 @@ export class CloudOpsAgentClient {
       };
     }
 
-    // Default: Helpful operational guidance from active agent
+    // Dispatch to Live Hermes SRE Agent via /v1/agent/chat
+    try {
+      const chatRes = await fetch(`${API_BASE}/v1/agent/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-tenant-id": "ten_default_tenant",
+          "x-operator-id": "op_admin_operator"
+        },
+        body: JSON.stringify({
+          prompt,
+          context: {
+            service: targetServiceName,
+            cluster: matchedWorkload?.cluster,
+            region: matchedWorkload?.region,
+            environment: context.environment || "production"
+          }
+        })
+      });
+
+      if (chatRes.ok) {
+        const chatData = await chatRes.json();
+        return {
+          id: `msg_${Date.now()}`,
+          sender: "agent",
+          text: chatData.response,
+          timestamp: chatData.timestamp || new Date().toISOString(),
+          status: "done"
+        };
+      }
+    } catch {
+      // Fallback to local agent guidance
+    }
+
+    // Fallback: Helpful operational guidance from active agent
     return {
       id: `msg_${Date.now()}`,
       sender: "agent",

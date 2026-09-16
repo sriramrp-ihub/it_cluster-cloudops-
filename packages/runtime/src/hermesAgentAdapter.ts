@@ -14,10 +14,37 @@ import {
   logger
 } from "@cloudops/shared";
 
+export function extractJsonFromLlmOutput(output: string): any {
+  const trimmed = output.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+
+  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (fenceMatch?.[1]) {
+    try {
+      return JSON.parse(fenceMatch[1]);
+    } catch {}
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const jsonSub = trimmed.substring(firstBrace, lastBrace + 1);
+    try {
+      return JSON.parse(jsonSub);
+    } catch {}
+  }
+
+  return null;
+}
+
 export interface HermesAgentConfig {
   endpoint?: string | undefined;
   sessionToken?: string | undefined;
   timeoutMs?: number | undefined;
+  hermesBin?: string | undefined;
+  enableLiveInference?: boolean | undefined;
 }
 
 export class HermesAgentAdapter implements AgentAdapter {
@@ -34,6 +61,8 @@ export class HermesAgentAdapter implements AgentAdapter {
   private endpoint: string;
   private sessionToken: string;
   private timeoutMs: number;
+  private hermesBin: string;
+  private enableLiveInference: boolean;
 
   constructor(config: HermesAgentConfig = {}) {
     this.endpoint = config.endpoint || process.env.HERMES_URL || "http://127.0.0.1:8080";
@@ -42,6 +71,12 @@ export class HermesAgentAdapter implements AgentAdapter {
       process.env.HERMES_SESSION_TOKEN ||
       "";
     this.timeoutMs = config.timeoutMs || 10000;
+    this.hermesBin =
+      config.hermesBin ||
+      process.env.HERMES_BIN ||
+      "/Users/user/Desktop/hermes/hermes-agent/hermes";
+    this.enableLiveInference =
+      config.enableLiveInference ?? (process.env.HERMES_LIVE_INFERENCE === "true");
   }
 
   /**
@@ -88,6 +123,28 @@ export class HermesAgentAdapter implements AgentAdapter {
         error: err?.message || "Hermes daemon unreachable"
       };
     }
+  }
+
+  /**
+   * Executes live LLM inference using the local Hermes agent
+   */
+  async executeHermesInference(prompt: string, timeoutMs?: number): Promise<string> {
+    const timeout = timeoutMs || this.timeoutMs || 30000;
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+
+    const { stdout } = await execFileAsync(
+      this.hermesBin,
+      ["-z", prompt, "--ignore-rules"],
+      {
+        timeout,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env }
+      }
+    );
+
+    return stdout.trim();
   }
 
   async start(context: AgentExecutionContext): Promise<AgentSession> {
@@ -204,6 +261,7 @@ export class HermesAgentAdapter implements AgentAdapter {
       service?: string;
       region?: string;
       alertDescription?: string;
+      liveInference?: boolean;
     }
   ): Promise<{
     status: string;
@@ -406,109 +464,181 @@ export class HermesAgentAdapter implements AgentAdapter {
 
     await delay(900);
 
-    // ── Step 4: Root Cause Synthesis (grounded in real tool results) ───────────
-    //
-    // Derive root cause from real evidence rather than hardcoding a scenario.
-    // Logic: inspect what the tools actually returned and synthesize accordingly.
+    // ── Step 4: Root Cause Synthesis (Grounded in real telemetry & live LLM reasoning) ───
+    let finding = "";
+    let rootCauseText = "";
+    let confidence = 0.85;
+    let remediationToolName = "aws_ecs_rollback_service";
+    let remediationParams: Record<string, unknown> = {
+      cluster: targetCluster,
+      service: targetService,
+      region: targetRegion
+    };
+    let riskLevel = "HIGH";
+    let dataSource = "live:aws:ecs";
+    let hermesInferenceSucceeded = false;
 
-    const hasRunningTasks = svc ? (svc.runningCount ?? 0) > 0 : null;
-    const hasStoppedTasks = stoppedTaskCount > 0;
-    const deploymentFailed =
-      svc?.deployments?.[0]?.rolloutState === "FAILED" ||
-      svc?.deployments?.[0]?.failedTasks > 0;
-    const awsError = svcData?.error || stoppedData?.error;
+    if (this.enableLiveInference || incidentContext?.liveInference) {
+      try {
+        const inferencePrompt = `You are CloudOps Autonomous SRE Agent powered by Hermes and Nemotron-3.
+Analyze the following telemetry collected for service "${targetService}" in cluster "${targetCluster}" (${targetRegion}):
+Alert: ${incidentContext?.alertDescription || "ECS service health anomaly"}
 
-    let finding: string;
-    let rootCauseText: string;
-    let confidence: number;
-    let remediationToolName: string;
-    let remediationParams: Record<string, unknown>;
-    let riskLevel: string;
+Telemetry Data:
+- Service Status: ${step1Observation}
+- CloudWatch Target Group Metrics: ${step2Observation}
+- Stopped Tasks & Container Exit Diagnostics: ${step3Observation}
 
-    if (awsError && awsError.includes("credentials")) {
-      // Real AWS credential/auth error
-      finding = `AWS authentication failure for ${targetService}`;
-      rootCauseText = `CloudOps cannot query AWS for cluster '${targetCluster}' — credential or permission error: "${awsError}". ` +
-        `Ensure the connected AWS account has ecs:DescribeServices, ecs:ListTasks, and ecs:DescribeTasks permissions.`;
-      confidence = 0.99;
-      remediationToolName = "aws_ecs_describe_services";
-      remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
-      riskLevel = "LOW";
-    } else if (awsError && (awsError.includes("ClusterNotFoundException") || awsError.includes("ServiceNotFoundException"))) {
-      // Real AWS resource not found
-      finding = `ECS cluster or service not found: '${targetCluster}/${targetService}'`;
-      rootCauseText = `AWS returned a not-found error: "${awsError}". The cluster '${targetCluster}' or service '${targetService}' does not exist in region '${targetRegion}'. ` +
-        `Verify the resource names and confirm the correct AWS region is selected.`;
-      confidence = 0.99;
-      remediationToolName = "aws_ecs_describe_clusters";
-      remediationParams = { region: targetRegion };
-      riskLevel = "LOW";
-    } else if (
-      (hasStoppedTasks && (containerError || stopReason)) ||
-      (awsError && (awsError.includes("CannotPull") || awsError.includes("CrashLoop"))) ||
-      (incidentContext?.alertDescription && (incidentContext.alertDescription.includes("CannotPull") || incidentContext.alertDescription.includes("503") || incidentContext.alertDescription.includes("spike") || incidentContext.alertDescription.includes("error")))
-    ) {
-      // Real container failure or alert detected
-      const errorDetail = containerError || stopReason || awsError || incidentContext?.alertDescription || "unknown container exit";
-      finding = `ECS Tasks failing to start for '${targetService}': "${errorDetail}"`;
-      rootCauseText = `${stoppedTaskCount || 1} stopped task(s) found on cluster '${targetCluster}'. ` +
-        (stopReason ? `Task stop reason: "${stopReason}". ` : "") +
-        (containerError ? `Container-level error: "${containerError}". ` : "") +
-        `This indicates the container is failing to start or is being killed by ECS. ` +
-        (errorDetail.toLowerCase().includes("pull") || errorDetail.toLowerCase().includes("image")
-          ? `Image pull failure detected — the container image reference may be invalid or the tag may not exist in ECR.`
-          : errorDetail.toLowerCase().includes("oom") || errorDetail.toLowerCase().includes("memory")
-          ? `Out-of-memory condition — container is exceeding its allocated memory limit.`
-          : `Review container logs and task definition for misconfiguration.`);
-      confidence = 0.95;
-      remediationToolName = "aws_ecs_update_service_image";
-      remediationParams = { cluster: targetCluster, service: targetService, region: targetRegion };
-      riskLevel = "CRITICAL";
-    } else if (deploymentFailed) {
-      // Real deployment failure
-      finding = `ECS deployment for '${targetService}' is in FAILED state`;
-      rootCauseText = `The active ECS deployment on cluster '${targetCluster}' has rolloutState=FAILED with ` +
-        `${svc.deployments[0].failedTasks} failed task(s). ` +
-        `ECS steady-state check failed — desired=${svc.desiredCount}, running=${svc.runningCount}. ` +
-        `This indicates task placement or container startup failures.`;
-      confidence = 0.92;
-      remediationToolName = "aws_ecs_rollback_service";
-      remediationParams = { cluster: targetCluster, service: targetService, region: targetRegion };
-      riskLevel = "HIGH";
-    } else if (svc && (svc.runningCount ?? 0) < (svc.desiredCount ?? 0)) {
-      // Real under-provisioning
-      const missing = (svc.desiredCount ?? 0) - (svc.runningCount ?? 0);
-      finding = `ECS service '${targetService}' is under-provisioned: ${missing} task(s) missing`;
-      rootCauseText = `Service '${targetService}' on cluster '${targetCluster}' has desiredCount=${svc.desiredCount} but only runningCount=${svc.runningCount}. ` +
-        `${missing} task(s) are failing to reach RUNNING state. ` +
-        (stoppedData?.stoppedTaskCount > 0
-          ? `${stoppedData.stoppedTaskCount} recently stopped task(s) confirm ongoing placement/startup failures.`
-          : `No recent stopped tasks found — tasks may be stuck in PENDING state.`);
-      confidence = 0.88;
-      remediationToolName = "aws_ecs_update_service";
-      remediationParams = { cluster: targetCluster, service: targetService, forceNewDeployment: true, region: targetRegion };
-      riskLevel = "HIGH";
-    } else if (awsError) {
-      // Generic real AWS error
-      finding = `AWS API error investigating '${targetService}': ${awsError}`;
-      rootCauseText = `Live AWS inspection returned an error: "${awsError}" (code: ${svcData?.code || stoppedData?.code || "UNKNOWN"}). ` +
-        `This may indicate permission boundaries, throttling, or regional API issues.`;
-      confidence = 0.75;
-      remediationToolName = "aws_ecs_describe_services";
-      remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
-      riskLevel = "LOW";
-    } else {
-      // Service appears healthy or we have no strong signal
-      finding = `No critical failure detected for '${targetService}' — service appears healthy`;
-      rootCauseText = svc
-        ? `ECS service '${targetService}' on '${targetCluster}' reports desiredCount=${svc.desiredCount}, runningCount=${svc.runningCount}. ` +
-          `No stopped tasks or failed deployments were found in the inspection window. The alert may have resolved or triggered on a transient spike.`
-        : `Live AWS inspection returned no actionable data for '${targetService}'. ` +
-          `The service may not exist in cluster '${targetCluster}' in region '${targetRegion}', or credentials may lack sufficient permissions.`;
-      confidence = 0.6;
-      remediationToolName = "aws_ecs_describe_services";
-      remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
-      riskLevel = "LOW";
+Based on these observations, synthesize the root cause and choose the safest remediation action.
+Available remediation tools:
+- "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
+- "aws_ecs_update_service_image": Use if specific image tag needs updating.
+- "aws_ecs_update_service": Use if task counts or service definition need forced update.
+- "aws_ecs_describe_services": Use if no failure detected (informational only).
+
+Respond strictly with valid JSON conforming to this schema (no markdown, no backticks):
+{
+  "finding": "<concise 1-2 sentence finding summary>",
+  "rootCause": "<detailed technical root cause explanation>",
+  "confidence": <number between 0.0 and 1.0>,
+  "remediationTool": "<tool name>",
+  "remediationParams": { "cluster": "${targetCluster}", "service": "${targetService}", "region": "${targetRegion}" },
+  "riskLevel": "<LOW|MEDIUM|HIGH|CRITICAL>",
+  "requiresApproval": <boolean>
+}`;
+
+        const rawOutput = await this.executeHermesInference(inferencePrompt, 30000);
+        const parsed = extractJsonFromLlmOutput(rawOutput);
+        if (parsed && parsed.finding && parsed.rootCause) {
+          finding = parsed.finding;
+          rootCauseText = parsed.rootCause;
+          confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0.92;
+          if (parsed.remediationTool) {
+            remediationToolName = parsed.remediationTool;
+          }
+          if (parsed.remediationParams && typeof parsed.remediationParams === "object") {
+            remediationParams = parsed.remediationParams;
+          }
+          if (parsed.riskLevel) {
+            riskLevel = String(parsed.riskLevel).toUpperCase();
+          }
+          // Any rollback or update tool is inherently a mutating cloud action
+          if (
+            remediationToolName.includes("rollback") ||
+            remediationToolName.includes("update") ||
+            remediationToolName.includes("remediate")
+          ) {
+            if (riskLevel !== "CRITICAL") {
+              riskLevel = "HIGH";
+            }
+          }
+          dataSource = "live:hermes:nemotron-3";
+          hermesInferenceSucceeded = true;
+
+          this.emitEvent(sessionId, {
+            type: "OBSERVATION",
+            sessionId,
+            timestamp: new Date(),
+            data: {
+              step: 4,
+              toolName: "hermes_neural_reasoning",
+              observation: `Hermes Agent synthesized root cause: ${finding}`,
+              model: "nemotron-3-ultra"
+            }
+          });
+        }
+      } catch (err) {
+        logger.warn({ err }, "Live Hermes inference failed, falling back to grounded telemetry heuristics");
+      }
+    }
+
+    if (!hermesInferenceSucceeded) {
+      // Grounded heuristics fallback
+      const hasRunningTasks = svc ? (svc.runningCount ?? 0) > 0 : null;
+      const hasStoppedTasks = stoppedTaskCount > 0;
+      const deploymentFailed =
+        svc?.deployments?.[0]?.rolloutState === "FAILED" ||
+        svc?.deployments?.[0]?.failedTasks > 0;
+      const awsError = svcData?.error || stoppedData?.error;
+
+      if (awsError && awsError.includes("credentials")) {
+        finding = `AWS authentication failure for ${targetService}`;
+        rootCauseText = `CloudOps cannot query AWS for cluster '${targetCluster}' — credential or permission error: "${awsError}". ` +
+          `Ensure the connected AWS account has ecs:DescribeServices, ecs:ListTasks, and ecs:DescribeTasks permissions.`;
+        confidence = 0.99;
+        remediationToolName = "aws_ecs_describe_services";
+        remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
+        riskLevel = "LOW";
+      } else if (awsError && (awsError.includes("ClusterNotFoundException") || awsError.includes("ServiceNotFoundException"))) {
+        finding = `ECS cluster or service not found: '${targetCluster}/${targetService}'`;
+        rootCauseText = `AWS returned a not-found error: "${awsError}". The cluster '${targetCluster}' or service '${targetService}' does not exist in region '${targetRegion}'. ` +
+          `Verify the resource names and confirm the correct AWS region is selected.`;
+        confidence = 0.99;
+        remediationToolName = "aws_ecs_describe_clusters";
+        remediationParams = { region: targetRegion };
+        riskLevel = "LOW";
+      } else if (
+        (hasStoppedTasks && (containerError || stopReason)) ||
+        (awsError && (awsError.includes("CannotPull") || awsError.includes("CrashLoop"))) ||
+        (incidentContext?.alertDescription && (incidentContext.alertDescription.includes("CannotPull") || incidentContext.alertDescription.includes("503") || incidentContext.alertDescription.includes("spike") || incidentContext.alertDescription.includes("error")))
+      ) {
+        const errorDetail = containerError || stopReason || awsError || incidentContext?.alertDescription || "unknown container exit";
+        finding = `ECS Tasks failing to start for '${targetService}': "${errorDetail}"`;
+        rootCauseText = `${stoppedTaskCount || 1} stopped task(s) found on cluster '${targetCluster}'. ` +
+          (stopReason ? `Task stop reason: "${stopReason}". ` : "") +
+          (containerError ? `Container-level error: "${containerError}". ` : "") +
+          `This indicates the container is failing to start or is being killed by ECS. ` +
+          (errorDetail.toLowerCase().includes("pull") || errorDetail.toLowerCase().includes("image")
+            ? `Image pull failure detected — the container image reference may be invalid or the tag may not exist in ECR.`
+            : errorDetail.toLowerCase().includes("oom") || errorDetail.toLowerCase().includes("memory")
+            ? `Out-of-memory condition — container is exceeding its allocated memory limit.`
+            : `Review container logs and task definition for misconfiguration.`);
+        confidence = 0.95;
+        remediationToolName = "aws_ecs_update_service_image";
+        remediationParams = { cluster: targetCluster, service: targetService, region: targetRegion };
+        riskLevel = "CRITICAL";
+      } else if (deploymentFailed) {
+        finding = `ECS deployment for '${targetService}' is in FAILED state`;
+        rootCauseText = `The active ECS deployment on cluster '${targetCluster}' has rolloutState=FAILED with ` +
+          `${svc.deployments[0].failedTasks} failed task(s). ` +
+          `ECS steady-state check failed — desired=${svc.desiredCount}, running=${svc.runningCount}. ` +
+          `This indicates task placement or container startup failures.`;
+        confidence = 0.92;
+        remediationToolName = "aws_ecs_rollback_service";
+        remediationParams = { cluster: targetCluster, service: targetService, region: targetRegion };
+        riskLevel = "HIGH";
+      } else if (svc && (svc.runningCount ?? 0) < (svc.desiredCount ?? 0)) {
+        const missing = (svc.desiredCount ?? 0) - (svc.runningCount ?? 0);
+        finding = `ECS service '${targetService}' is under-provisioned: ${missing} task(s) missing`;
+        rootCauseText = `Service '${targetService}' on cluster '${targetCluster}' has desiredCount=${svc.desiredCount} but only runningCount=${svc.runningCount}. ` +
+          `${missing} task(s) are failing to reach RUNNING state. ` +
+          (stoppedData?.stoppedTaskCount > 0
+            ? `${stoppedData.stoppedTaskCount} recently stopped task(s) confirm ongoing placement/startup failures.`
+            : `No recent stopped tasks found — tasks may be stuck in PENDING state.`);
+        confidence = 0.88;
+        remediationToolName = "aws_ecs_update_service";
+        remediationParams = { cluster: targetCluster, service: targetService, forceNewDeployment: true, region: targetRegion };
+        riskLevel = "HIGH";
+      } else if (awsError) {
+        finding = `AWS API error investigating '${targetService}': ${awsError}`;
+        rootCauseText = `Live AWS inspection returned an error: "${awsError}" (code: ${svcData?.code || stoppedData?.code || "UNKNOWN"}). ` +
+          `This may indicate permission boundaries, throttling, or regional API issues.`;
+        confidence = 0.75;
+        remediationToolName = "aws_ecs_describe_services";
+        remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
+        riskLevel = "LOW";
+      } else {
+        finding = `No critical failure detected for '${targetService}' — service appears healthy`;
+        rootCauseText = svc
+          ? `ECS service '${targetService}' on '${targetCluster}' reports desiredCount=${svc.desiredCount}, runningCount=${svc.runningCount}. ` +
+            `No stopped tasks or failed deployments were found in the inspection window. The alert may have resolved or triggered on a transient spike.`
+          : `Live AWS inspection returned no actionable data for '${targetService}'. ` +
+            `The service may not exist in cluster '${targetCluster}' in region '${targetRegion}', or credentials may lack sufficient permissions.`;
+        confidence = 0.6;
+        remediationToolName = "aws_ecs_describe_services";
+        remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
+        riskLevel = "LOW";
+      }
     }
 
     const rootCause = {
@@ -519,7 +649,7 @@ export class HermesAgentAdapter implements AgentAdapter {
       affectedResources: svc?.serviceArn
         ? [svc.serviceArn]
         : [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
-      dataSource: "live:aws:ecs",
+      dataSource,
       recommendedRemediation: {
         toolName: remediationToolName,
         parameters: remediationParams,

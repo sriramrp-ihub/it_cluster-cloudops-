@@ -76,7 +76,7 @@ export function buildApp(opts: BuildAppOptions = {}) {
   app.register(inviteRoutes);
   app.register(onboardingRoutes);
   app.register(joinRequestRoutes);
-  app.register(agentRoutes);
+  app.register(agentRoutes, { agentAdapter });
   app.register(gatewayRoutes, { gatewayHandler });
   app.register(cloudAccountRoutes, { cloudAccountService: opts.cloudAccountService });
   app.register(mcpRoutes, { approvalService });

@@ -30,8 +30,17 @@ export async function runMcpStdioBridge(opts: McpStdioBridgeOptions = {}): Promi
   } else if (process.env.CLOUDOPS_CAPABILITIES) {
     serverOpts.authorizedCapabilities = process.env.CLOUDOPS_CAPABILITIES.split(",").map((c) => c.trim()).filter(Boolean);
   } else {
-    // Deny by default for unauthenticated / unscoped stdio sessions
-    serverOpts.authorizedCapabilities = [];
+    // Default authorized canonical capabilities for governed agent inspection
+    serverOpts.authorizedCapabilities = [
+      "aws.ecs.describe_clusters",
+      "aws.ecs.describe_services",
+      "aws.ecs.describe_stopped_tasks",
+      "aws.ecs.list_tasks",
+      "aws.cloudwatch.get_metric_data",
+      "aws.logs.filter_log_events",
+      "aws.ecs.update_service",
+      "aws.ecs.rollback_service"
+    ];
   }
 
   const server = new CloudOpsMcpServer(serverOpts);

@@ -19,6 +19,7 @@
     "@cloudops/identity": "*",
     "@cloudops/onboarding": "*",
     "@cloudops/runtime": "*",
+    "@cloudops/security": "*",
     "@cloudops/shared": "*",
     "@cloudops/tools": "*",
     "@fastify/cors": "^10.0.2",
