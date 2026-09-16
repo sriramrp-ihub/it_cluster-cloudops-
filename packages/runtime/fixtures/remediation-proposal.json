@@ -1,0 +1,34 @@
+{
+  "scenarioId": "remediation-proposal-rollback",
+  "proposal": {
+    "toolName": "aws_ecs_rollback_service",
+    "operationType": "DEPLOY",
+    "riskLevel": "HIGH",
+    "requiresApproval": true,
+    "arguments": {
+      "cluster": "production-cluster",
+      "service": "checkout-service",
+      "targetTaskDefinition": "arn:aws:ecs:us-east-1:265766933076:task-definition/checkout-service:1",
+      "region": "us-east-1"
+    }
+  },
+  "initialGatewayResponse": {
+    "status": "AWAITING_APPROVAL",
+    "requiresApproval": true,
+    "approvalId": "appr_mock_remediation_001",
+    "operationPayloadHash": "b781e9b25c35b62b1a8f94cb4d142d7b1b36bb5c38d827c1264c7ad078b5ce28",
+    "expiresAt": "2026-09-16T14:00:00.000Z",
+    "dryRunDiff": {
+      "action": "ROLLBACK",
+      "targetResource": "arn:aws:ecs:us-east-1:265766933076:service/production-cluster/checkout-service",
+      "cluster": "production-cluster",
+      "service": "checkout-service",
+      "previousTaskDefinition": "arn:aws:ecs:us-east-1:265766933076:task-definition/checkout-service:2",
+      "taskDefinition": "arn:aws:ecs:us-east-1:265766933076:task-definition/checkout-service:1",
+      "riskLevel": "HIGH",
+      "summary": "Revert checkout-service to verified stable revision 1",
+      "estimatedMonthlyCostUsd": 24.32,
+      "rollbackAvailable": true
+    }
+  }
+}

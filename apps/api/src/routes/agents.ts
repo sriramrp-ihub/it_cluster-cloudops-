@@ -55,4 +55,25 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
   );
+
+  /**
+   * DELETE /v1/agents/:id
+   * Operator deletes/removes an agent and cleans up associated credentials, sessions, and references.
+   */
+  fastify.delete<{ Params: { id: string } }>(
+    "/v1/agents/:id",
+    { preHandler: [requireOperatorAuth] },
+    async (request, reply) => {
+      const operator = request.operator!;
+      const { id } = request.params;
+
+      const result = await agentService.deleteAgent(operator.tenantId, id as any);
+
+      return reply.status(200).send({
+        success: true,
+        message: `Agent '${result.name}' (${result.id}) was successfully deleted`,
+        deletedAgentId: result.id
+      });
+    }
+  );
 };

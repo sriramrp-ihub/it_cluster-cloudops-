@@ -1,0 +1,116 @@
+{
+  "scenarioId": "ecs-image-pull-failure",
+  "incident": {
+    "id": "inc_ecs_prod_checkout_down",
+    "provider": "aws",
+    "accountId": "265766933076",
+    "region": "us-east-1",
+    "service": "production-cluster/checkout-service",
+    "severity": "CRITICAL",
+    "description": "ECS Tasks failing to start; service returning HTTP 503 at ALB",
+    "source": "CloudWatchAlarm:Target5xxCountHigh",
+    "injectedAt": "2026-09-16T10:00:00.000Z"
+  },
+  "groundTruth": {
+    "cause": "image_not_found",
+    "imageTag": "cloudops-demo-checkout:v2.4.1-broken",
+    "rootCause": "Task definition revision references non-existent container image tag 'cloudops-demo-checkout:v2.4.1-broken' in ECR",
+    "targetService": "checkout-service",
+    "targetCluster": "production-cluster",
+    "safeRollbackTaskDefinition": "arn:aws:ecs:us-east-1:265766933076:task-definition/checkout-service:1"
+  },
+  "toolCallSequence": [
+    {
+      "step": 1,
+      "toolName": "aws_ecs_describe_clusters",
+      "arguments": {
+        "clusters": ["production-cluster"],
+        "region": "us-east-1"
+      },
+      "expectedObservation": "Cluster has 0 running tasks, 2 desired tasks, 4 failed task deployments in last 15 minutes",
+      "evidenceId": "ev_ecs_cluster_state"
+    },
+    {
+      "step": 2,
+      "toolName": "aws_ecs_list_tasks",
+      "arguments": {
+        "cluster": "production-cluster",
+        "serviceName": "checkout-service",
+        "region": "us-east-1"
+      },
+      "expectedObservation": "No active tasks currently RUNNING for service checkout-service",
+      "evidenceId": "ev_ecs_tasks_empty"
+    },
+    {
+      "step": 3,
+      "toolName": "aws_ecs_describe_stopped_tasks",
+      "arguments": {
+        "cluster": "production-cluster",
+        "serviceName": "checkout-service",
+        "limit": 5,
+        "region": "us-east-1"
+      },
+      "expectedObservation": "StoppedReason: CannotPullContainerError: inspect image has been failed: repository not found or tag does not exist",
+      "evidenceId": "ev_ecs_stopped_task_error"
+    },
+    {
+      "step": 4,
+      "toolName": "aws_cloudwatch_get_metric_data",
+      "arguments": {
+        "metricName": "CPUUtilization",
+        "namespace": "AWS/ECS",
+        "period": 300,
+        "region": "us-east-1"
+      },
+      "expectedObservation": "CPU utilization dropped to 0.0% due to absent running containers",
+      "evidenceId": "ev_cloudwatch_cpu_drop"
+    },
+    {
+      "step": 5,
+      "toolName": "aws_alb_get_target_health",
+      "arguments": {
+        "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:265766933076:targetgroup/tg-checkout/1234567890",
+        "region": "us-east-1"
+      },
+      "expectedObservation": "All targets marked Unhealthy: Target.ResponseCodeMismatch (503)",
+      "evidenceId": "ev_alb_targets_unhealthy"
+    },
+    {
+      "step": 6,
+      "toolName": "aws_ecr_describe_images",
+      "arguments": {
+        "repositoryName": "cloudops-demo-checkout",
+        "imageTag": "v2.4.1-broken",
+        "region": "us-east-1"
+      },
+      "expectedObservation": "ImageNotFoundException: The image with tag 'v2.4.1-broken' does not exist in repository 'cloudops-demo-checkout'",
+      "evidenceId": "ev_ecr_tag_missing"
+    }
+  ],
+  "expectedRootCause": {
+    "type": "root_cause_analysis",
+    "finding": "ContainerImageNotFound",
+    "rootCause": "Task definition revision references non-existent container image tag 'cloudops-demo-checkout:v2.4.1-broken' in ECR",
+    "confidence": 0.99,
+    "evidenceIds": [
+      "ev_ecs_stopped_task_error",
+      "ev_ecr_tag_missing",
+      "ev_alb_targets_unhealthy"
+    ],
+    "affectedResources": [
+      "arn:aws:ecs:us-east-1:265766933076:service/production-cluster/checkout-service",
+      "arn:aws:elasticloadbalancing:us-east-1:265766933076:targetgroup/tg-checkout/1234567890"
+    ],
+    "recommendedRemediation": {
+      "toolName": "aws_ecs_rollback_service",
+      "arguments": {
+        "cluster": "production-cluster",
+        "service": "checkout-service",
+        "targetTaskDefinition": "arn:aws:ecs:us-east-1:265766933076:task-definition/checkout-service:1",
+        "region": "us-east-1"
+      },
+      "riskLevel": "HIGH",
+      "requiresApproval": true
+    }
+  }
+}

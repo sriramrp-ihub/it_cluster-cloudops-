@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import Link from "next/link";
-import { fetchAgents, AgentItem } from "../../lib/api";
+import { fetchAgents, deleteAgent, AgentItem } from "../../lib/api";
 import { useOperator } from "../../auth/OperatorContext";
 import { useAgentChat } from "../../context/AgentChatContext";
 
@@ -12,7 +12,10 @@ export default function AgentsFleetPage() {
   const [agents, setAgents] = useState<AgentItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [agentToDelete, setAgentToDelete] = useState<AgentItem | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   const tenantId = session?.tenantId || "ten_default_tenant";
   const operatorId = session?.operatorId || "op_admin_operator";
@@ -27,6 +30,23 @@ export default function AgentsFleetPage() {
       setErrorMsg(`Failed to load agents: ${err.message}`);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleConfirmDelete() {
+    if (!agentToDelete) return;
+    setIsDeleting(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    try {
+      const res = await deleteAgent(agentToDelete.id, tenantId, operatorId);
+      setSuccessMsg(res.message || `Agent '${agentToDelete.name}' was successfully deleted.`);
+      setAgentToDelete(null);
+      await loadAgents();
+    } catch (err: any) {
+      setErrorMsg(`Failed to delete agent: ${err.message}`);
+    } finally {
+      setIsDeleting(false);
     }
   }
 
@@ -84,10 +104,15 @@ export default function AgentsFleetPage() {
         </div>
       </div>
 
-      {/* 2. Error Message */}
+      {/* 2. Feedback Messages */}
       {errorMsg && (
         <div className="alert-banner error">
           <div>{errorMsg}</div>
+        </div>
+      )}
+      {successMsg && (
+        <div className="alert-banner" style={{ background: "#ecfdf5", border: "1px solid #6ee7b7", color: "#065f46" }}>
+          <div>✓ {successMsg}</div>
         </div>
       )}
 
@@ -139,6 +164,15 @@ export default function AgentsFleetPage() {
                     style={{ fontSize: "12.5px" }}
                   >
                     Inquire
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAgentToDelete(agent)}
+                    className="btn-danger"
+                    style={{ fontSize: "12.5px" }}
+                    title="Remove and decommission agent"
+                  >
+                    Delete
                   </button>
                 </div>
               </div>
@@ -248,13 +282,24 @@ export default function AgentsFleetPage() {
                       {new Date(agent.createdAt).toLocaleDateString()}
                     </td>
                     <td style={{ textAlign: "right" }}>
-                      <Link
-                        href={`/agents/${agent.id}`}
-                        className="btn-secondary"
-                        style={{ padding: "4px 10px", fontSize: "12px" }}
-                      >
-                        View Dossier →
-                      </Link>
+                      <div style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
+                        <Link
+                          href={`/agents/${agent.id}`}
+                          className="btn-secondary"
+                          style={{ padding: "4px 10px", fontSize: "12px" }}
+                        >
+                          View Dossier →
+                        </Link>
+                        <button
+                          type="button"
+                          onClick={() => setAgentToDelete(agent)}
+                          className="btn-danger"
+                          style={{ padding: "4px 8px", fontSize: "12px" }}
+                          title="Delete Agent"
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -263,6 +308,88 @@ export default function AgentsFleetPage() {
           </div>
         )}
       </div>
+
+      {/* 5. Delete Agent Confirmation Modal */}
+      {agentToDelete && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            backgroundColor: "rgba(0, 0, 0, 0.45)",
+            backdropFilter: "blur(2px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+            padding: "1rem"
+          }}
+          onClick={() => !isDeleting && setAgentToDelete(null)}
+        >
+          <div
+            className="harvey-card"
+            style={{
+              maxWidth: "480px",
+              width: "100%",
+              padding: "24px 28px",
+              backgroundColor: "#ffffff",
+              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)"
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
+              <span style={{ fontSize: "20px" }}>⚠️</span>
+              <h3 style={{ fontFamily: "var(--font-serif)", fontSize: "20px", margin: 0, color: "var(--near-black-ink)" }}>
+                Delete Operational Agent?
+              </h3>
+            </div>
+
+            <div
+              style={{
+                background: "#fef2f2",
+                border: "1px solid #fecaca",
+                borderRadius: "var(--radius-sm)",
+                padding: "12px 14px",
+                fontSize: "13px",
+                color: "#991b1b",
+                marginBottom: "16px",
+                lineHeight: 1.5
+              }}
+            >
+              You are about to permanently delete <strong>{agentToDelete.name}</strong> (<code>{agentToDelete.id}</code>).
+            </div>
+
+            <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)", marginBottom: "20px", lineHeight: 1.6 }}>
+              <ul style={{ margin: 0, paddingLeft: "18px" }}>
+                <li>All active sessions and bootstrap credentials will be revoked immediately.</li>
+                <li>The agent runtime will be disconnected from the Gateway WebSocket transport.</li>
+                <li>Incident investigation records will be unlinked (audit events remain cryptographically chained).</li>
+                <li>This action <strong>cannot be undone</strong>.</li>
+              </ul>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+              <button
+                type="button"
+                onClick={() => setAgentToDelete(null)}
+                disabled={isDeleting}
+                className="btn-secondary"
+                style={{ fontSize: "13px" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                disabled={isDeleting}
+                className="btn-danger"
+                style={{ fontSize: "13px", padding: "6px 16px" }}
+              >
+                {isDeleting ? "Deleting Agent..." : "Confirm & Delete Agent"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -230,6 +230,50 @@ export interface DomainEventTable {
   created_at: Generated<Date>;
 }
 
+export interface IncidentTable {
+  id: string;
+  tenant_id: string;
+  provider: string;
+  account_id: string;
+  region: string;
+  service: string;
+  resource_id: string;
+  severity: string;
+  title: string;
+  alert_description: string;
+  source_metadata: string; // JSONB
+  status: string;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+  resolved_at: Date | null;
+}
+
+export interface InvestigationTable {
+  id: string;
+  incident_id: string;
+  tenant_id: string;
+  agent_id: string | null;
+  session_id: string | null;
+  status: string;
+  root_cause: string | null; // JSONB
+  started_at: Generated<Date>;
+  completed_at: Date | null;
+  error_message: string | null;
+}
+
+export interface IncidentEvidenceTable {
+  id: string;
+  incident_id: string;
+  investigation_id: string | null;
+  tenant_id: string;
+  source: string;
+  resource: string;
+  observation: string;
+  severity: string;
+  raw_payload: string | null; // JSONB
+  created_at: Generated<Date>;
+}
+
 export interface DatabaseSchema {
   tenants: TenantTable;
   agents: AgentTable;
@@ -249,4 +293,8 @@ export interface DatabaseSchema {
   cloud_accounts: CloudAccountTable;
   audit_events: AuditEventTable;
   domain_events: DomainEventTable;
+  incidents: IncidentTable;
+  investigations: InvestigationTable;
+  incident_evidence: IncidentEvidenceTable;
 }
+

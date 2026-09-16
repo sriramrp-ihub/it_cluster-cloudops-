@@ -18,6 +18,7 @@ import {
   CapabilityTier,
   ToolOperationType
 } from "@cloudops/shared";
+import { DefenseClawGuardrailService } from "@cloudops/security";
 
 export interface PolicyEvaluationContext {
   agentId: AgentId | string;
@@ -45,7 +46,7 @@ export interface PolicyFencingConfig {
 }
 
 export const DEFAULT_POLICY_FENCING_CONFIG: PolicyFencingConfig = {
-  allowedRegions: ["us-east-1", "us-west-2", "eu-west-1"],
+  allowedRegions: ["us-east-1", "us-west-2", "eu-west-1", "eu-north-1"],
   allowedEnvironments: ["development", "staging", "production"],
   maxConcurrentDeployments: 3,
   monthlyBudgetLimitUsd: 500.00
@@ -312,3 +313,102 @@ export class PolicyFencingService {
     };
   }
 }
+
+/**
+ * All mutating action patterns that are strictly forbidden from evaluating to ALLOW.
+ */
+export const MUTATING_TOOL_PATTERNS = [
+  /restart/i,
+  /reboot/i,
+  /scale/i,
+  /deploy/i,
+  /delete/i,
+  /modify/i,
+  /rollback/i,
+  /update/i,
+  /terminate/i,
+  /create/i,
+  /(?:^|_)stop(?:$|_)/i,
+  /put/i
+];
+
+export function isMutatingTool(toolName: string, operationType?: string): boolean {
+  if (operationType === "READ_ONLY") {
+    // True read-only inspection calls (describe, get, list) are not mutating
+    if (
+      toolName.includes("describe") ||
+      toolName.includes("list") ||
+      toolName.includes("get")
+    ) {
+      return false;
+    }
+  }
+  if (operationType === "MUTATION" || operationType === "DEPLOY") return true;
+  return MUTATING_TOOL_PATTERNS.some((pattern) => pattern.test(toolName));
+}
+
+
+/**
+ * Unified 3-Tier Policy Engine (CO-018)
+ *
+ * Implements ALLOW, APPROVAL_REQUIRED, and DENY.
+ * HARD CONSTRAINT: Any mutating operation NEVER evaluates to ALLOW.
+ * It is either APPROVAL_REQUIRED (if fences pass and capabilities are granted)
+ * or DENY (if fences fail, capability missing, or security violation).
+ */
+export class PolicyEngine {
+  private fencingService: PolicyFencingService;
+  private defenseClaw: DefenseClawGuardrailService;
+
+  constructor(
+    fencingConfig?: Partial<PolicyFencingConfig>,
+    defenseClaw?: DefenseClawGuardrailService
+  ) {
+    this.fencingService = new PolicyFencingService(fencingConfig);
+    this.defenseClaw = defenseClaw || new DefenseClawGuardrailService();
+  }
+
+  async evaluate(ctx: PolicyEvaluationContext): Promise<PolicyEvaluationResult> {
+    const { toolName, arguments: args, authorizedCapabilities } = ctx;
+
+    // 1. Security Guardrail Layer (DefenseClaw)
+    const defenseClawVerdict = await this.defenseClaw.inspectToolCall({
+      agentId: String(ctx.agentId),
+      tenantId: ctx.tenantId,
+      toolName,
+      arguments: args,
+      grantedCapabilities: authorizedCapabilities
+    });
+
+    if (!defenseClawVerdict.allowed) {
+      return {
+        decision: "DENY",
+        reason: `Security interception: ${defenseClawVerdict.guardrailViolations.join("; ")}`,
+        ruleId: "DEFENSECLAW_SECURITY_FENCE"
+      };
+    }
+
+    // 2. Dynamic Blast-Radius & Scope Fencing (Region, Environment, Budget, Concurrency)
+    const fencingResult = this.fencingService.evaluateFencing(ctx);
+    if (fencingResult.decision === "DENY") {
+      return fencingResult;
+    }
+
+    // 3. Mandatory 3-Tier Classification Gate (CO-018 Hard Constraint)
+    const isMutating = isMutatingTool(toolName, ctx.operationType);
+
+    if (isMutating) {
+      return {
+        decision: "APPROVAL_REQUIRED",
+        reason: `Mutating tool '${toolName}' strictly requires human approval prior to cloud execution.`,
+        ruleId: "MANDATORY_HUMAN_APPROVAL_MUTATION"
+      };
+    }
+
+    return {
+      decision: "ALLOW",
+      reason: `Read-only inspection tool '${toolName}' permitted within authorized capability scope.`
+    };
+  }
+}
+

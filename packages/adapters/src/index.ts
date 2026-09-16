@@ -7,6 +7,9 @@ export * from "./awsSessionManager.js";
 export * from "./cloudAccountRepository.js";
 export * from "./cloudAccountService.js";
 export * from "./awsDiscoveryService.js";
+export * from "./awsIncidentEnvironment.js";
+export * from "./incidentService.js";
+export * from "./remediationVerificationService.js";
 
 import type { CloudProvider } from "@cloudops/shared";
 

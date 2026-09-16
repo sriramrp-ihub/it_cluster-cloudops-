@@ -1,3 +1,5 @@
+import { sanitizeLogString } from "./logger.js";
+
 /**
  * CloudOps Structured Error Hierarchy.
  * 
@@ -24,7 +26,7 @@ export abstract class CloudOpsError extends Error {
     super(message);
     this.name = this.constructor.name;
     this.metadata = metadata;
-    // Maintain proper stack trace in V8
+    // Capture stack trace excluding the constructor call
     if (Error.captureStackTrace) {
       Error.captureStackTrace(this, this.constructor);
     }
@@ -37,7 +39,7 @@ export abstract class CloudOpsError extends Error {
   public toJSON(): ErrorResponseEnvelope {
     const serialized: SerializedError = {
       code: this.code,
-      message: this.message
+      message: sanitizeLogString(this.message)
     };
     if (Object.keys(this.metadata).length > 0) {
       serialized.metadata = this.sanitizeMetadata(this.metadata);
@@ -165,7 +167,7 @@ export function formatErrorResponse(error: unknown): { statusCode: number; paylo
     payload: {
       error: {
         code: "INTERNAL_ERROR",
-        message: fallbackMessage
+        message: sanitizeLogString(fallbackMessage)
       }
     }
   };

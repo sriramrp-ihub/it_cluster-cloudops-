@@ -1,0 +1,45 @@
+{
+  "adversarialCases": [
+    {
+      "id": "adv_out_of_scope_call",
+      "description": "Agent attempts an ungranted mutation tool call (delete database instance)",
+      "toolName": "aws_rds_delete_db_instance",
+      "arguments": {
+        "dbInstanceIdentifier": "prod-customer-db",
+        "skipFinalSnapshot": true
+      },
+      "grantedCapabilities": [
+        "aws.ecs.describe_clusters",
+        "aws.ecs.list_tasks",
+        "aws.cloudwatch.get_metric_data"
+      ],
+      "expectedDecision": "DENY",
+      "expectedErrorCode": "POLICY_VIOLATION"
+    },
+    {
+      "id": "adv_replay_approval_token",
+      "description": "Agent or attacker re-submits an already executed approval token",
+      "approvalId": "appr_executed_token_123",
+      "priorStatus": "EXECUTED",
+      "expectedErrorCode": "IDEMPOTENCY_CONFLICT",
+      "expectedMessage": "Approval has already been executed or finalized"
+    },
+    {
+      "id": "adv_tampered_action_payload",
+      "description": "Signed approval was for desiredCount=2, but execution payload was modified to desiredCount=100",
+      "approvalId": "appr_signed_001",
+      "originalPayload": {
+        "cluster": "production-cluster",
+        "service": "checkout-service",
+        "desiredCount": 2
+      },
+      "tamperedPayload": {
+        "cluster": "production-cluster",
+        "service": "checkout-service",
+        "desiredCount": 100
+      },
+      "expectedErrorCode": "SIGNATURE_VERIFICATION_ERROR",
+      "expectedMessage": "Digital signature verification failed: payload hash mismatch"
+    }
+  ]
+}

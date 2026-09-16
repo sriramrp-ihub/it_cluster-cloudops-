@@ -1,4 +1,4 @@
-import { NotFoundError, ValidationError } from "@cloudops/shared";
+import { AuthenticationError, NotFoundError, ValidationError } from "@cloudops/shared";
 import { AwsStsService, IAwsStsService } from "./awsStsService.js";
 import { AwsSessionManager, defaultAwsSessionManager } from "./awsSessionManager.js";
 import { CloudAccountRecord, CloudAccountRepository, ICloudAccountRepository } from "./cloudAccountRepository.js";
@@ -183,5 +183,57 @@ export class CloudAccountService {
     const discovery = new AwsDiscoveryService();
     const workloads = await discovery.discoverWorkloads(credentials, account.region);
     return { workloads, sessionActive: true };
+  }
+
+  /**
+   * CO-004: Validate AWS environment before an investigation starts.
+   * Fails closed if account, region, or session credentials are not valid.
+   */
+  async validateInvestigationEnvironment(
+    tenantId: string,
+    expectedAccountId: string,
+    expectedRegion: string
+  ): Promise<{ valid: boolean; accountId: string; region: string }> {
+    if (!tenantId) {
+      throw new ValidationError("Tenant context is required");
+    }
+    if (!expectedAccountId) {
+      throw new ValidationError("Expected AWS Account ID is required");
+    }
+    if (!expectedRegion) {
+      throw new ValidationError("Expected AWS Region is required");
+    }
+
+    const accounts = await this.repository.listByTenant(tenantId);
+    const matchingAccount = accounts.find(
+      (a) => a.provider === "aws" && a.accountId === expectedAccountId && a.region === expectedRegion
+    );
+
+    if (!matchingAccount || matchingAccount.status !== "CONNECTED") {
+      throw new AuthenticationError(
+        `Pre-investigation validation failed: AWS account ${expectedAccountId} in region ${expectedRegion} is not connected or active`
+      );
+    }
+
+    const credentials = this.sessionManager.getCredentials(tenantId, matchingAccount.id);
+    if (!credentials) {
+      throw new AuthenticationError(
+        `Pre-investigation validation failed: Active in-memory STS session expired or missing for account ${expectedAccountId}`
+      );
+    }
+
+    // Verify STS caller identity matches expected account
+    const identity = await this.stsService.getCallerIdentity(credentials, expectedRegion);
+    if (identity.accountId !== expectedAccountId) {
+      throw new ValidationError(
+        `Pre-investigation validation failed: Verified STS account ID ${identity.accountId} does not match expected account ${expectedAccountId}`
+      );
+    }
+
+    return {
+      valid: true,
+      accountId: identity.accountId,
+      region: expectedRegion
+    };
   }
 }

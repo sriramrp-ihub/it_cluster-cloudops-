@@ -8,6 +8,7 @@ import {
   OperationalProgressStep
 } from "../lib/agentClient";
 import { useOperator } from "../auth/OperatorContext";
+import { fetchCloudAccounts } from "../lib/api";
 
 interface AgentChatContextType {
   isOpen: boolean;
@@ -37,7 +38,7 @@ export function AgentChatProvider({ children }: { children: React.ReactNode }) {
   const [messages, setMessages] = useState<AgentChatMessage[]>([]);
   const [context, setContextState] = useState<AgentOperationalContext>({
     environment: "Production",
-    region: "us-east-1"
+    region: "eu-north-1"
   });
 
   const tenantId = session?.tenantId || "ten_default_tenant";
@@ -47,6 +48,16 @@ export function AgentChatProvider({ children }: { children: React.ReactNode }) {
     const res = await agentClient.checkAgentStatus(tenantId, operatorId);
     setAgentAvailable(res.available);
     setConnectedAgentsCount(res.connectedCount);
+
+    try {
+      const accounts = await fetchCloudAccounts(tenantId, operatorId);
+      const active = accounts.find((a) => a.status === "CONNECTED") || accounts[0];
+      if (active?.region) {
+        setContextState((prev) => ({ ...prev, region: active.region }));
+      }
+    } catch {
+      // Ignore
+    }
   }, [tenantId, operatorId]);
 
   useEffect(() => {

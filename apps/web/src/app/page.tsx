@@ -29,9 +29,13 @@ export default async function HomePage() {
     pendingJoinCount = 0;
   }
 
+  let activeRegion = process.env.AWS_REGION || "eu-north-1";
   try {
     const accounts = await fetchCloudAccounts();
     const connectedAccounts = accounts.filter((a) => a.status === "CONNECTED");
+    if (connectedAccounts.length > 0 && connectedAccounts[0].region) {
+      activeRegion = connectedAccounts[0].region;
+    }
     for (const acc of connectedAccounts) {
       try {
         const workloadsRes = await fetchAccountWorkloads(acc.id);
@@ -61,7 +65,7 @@ export default async function HomePage() {
             }}
           />
           <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--near-black-ink)", letterSpacing: "0.2px" }}>
-            Production · us-east-1
+            Production · {activeRegion}
           </span>
           <span style={{ fontSize: "12px", color: "var(--muted-gray)" }}>•</span>
           <span style={{ fontSize: "12px", color: "var(--mid-warm-gray)" }}>DevOps Control Plane</span>

@@ -1,0 +1,34 @@
+{
+  "approvalId": "appr_mock_remediation_001",
+  "outcomes": {
+    "EXECUTED": {
+      "status": "EXECUTED",
+      "reviewedBy": "op_cloudops_lead",
+      "signedBy": "op_cloudops_lead",
+      "executionResult": {
+        "status": "ROLLED_BACK",
+        "serviceArn": "arn:aws:ecs:us-east-1:265766933076:service/production-cluster/checkout-service",
+        "activeTaskDefinition": "arn:aws:ecs:us-east-1:265766933076:task-definition/checkout-service:1",
+        "rolledBackAt": "2026-09-16T10:15:00.000Z"
+      },
+      "agentReaction": "Proceed to post-remediation verification checks"
+    },
+    "EXECUTION_FAILED": {
+      "status": "EXECUTION_FAILED",
+      "reviewedBy": "op_cloudops_lead",
+      "errorMessage": "AWS STS AssumeRole failure: AccessDenied on UpdateService API",
+      "agentReaction": "Halt autonomous execution and escalate permission fault to human operator"
+    },
+    "EXPIRED": {
+      "status": "EXPIRED",
+      "errorMessage": "Approval request timed out after 14400 seconds without operator signature",
+      "agentReaction": "Abandon pending remediation and re-evaluate service condition"
+    },
+    "REJECTED": {
+      "status": "REJECTED",
+      "reviewedBy": "op_cloudops_lead",
+      "rejectionReason": "Rollback postponed: feature team deploying critical patch directly",
+      "agentReaction": "Acknowledge rejection and cease mutating actions"
+    }
+  }
+}

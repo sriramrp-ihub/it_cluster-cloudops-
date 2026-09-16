@@ -32,6 +32,10 @@ export const REDACTED_PATHS = [
   "*.secretAccessKey",
   "sessionToken",
   "*.sessionToken",
+  "inviteToken",
+  "*.inviteToken",
+  "claimSecret",
+  "*.claimSecret",
   "key",
   "*.key",
   "apiKey",
@@ -48,6 +52,10 @@ export const REDACTED_PATHS = [
 const TOKEN_PATTERNS = [
   /co_inv_[0-9a-fA-F]+/g,
   /co_agent_[0-9a-fA-F]+/g,
+  /cred_[0-9a-fA-F]+/g,
+  /\b(AKIA[0-9A-Z]{16})\b/g,
+  /\b(AQoDYXdz[a-zA-Z0-9/+=]{30,})\b/g,
+  /\b([a-zA-Z0-9/+=]{40})\b/g,
   /Bearer\s+[A-Za-z0-9\-._~+/]+=*/g
 ];
 

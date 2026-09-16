@@ -102,6 +102,25 @@ export async function fetchAgent(id: string, tenantId?: string, operatorId?: str
   return res.json();
 }
 
+export async function deleteAgent(
+  id: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<{ success: boolean; message: string; deletedAgentId: string }> {
+  const res = await fetch(`${API_BASE}/v1/agents/${id}`, {
+    method: "DELETE",
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
 export async function fetchJoinRequests(tenantId?: string, operatorId?: string, status?: string): Promise<JoinRequestItem[]> {
   const url = new URL(`${API_BASE}/v1/agent-join-requests`);
   if (status) url.searchParams.set("status", status);
@@ -320,6 +339,101 @@ export async function fetchAccountWorkloads(
   operatorId?: string
 ): Promise<{ workloads: DiscoveredWorkload[]; sessionActive: boolean }> {
   const res = await fetch(`${API_BASE}/v1/cloud-accounts/${accountId}/workloads`, {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export interface IncidentItem {
+  id: string;
+  tenantId: string;
+  provider: string;
+  accountId: string;
+  region: string;
+  service: string;
+  resourceId: string;
+  severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | string;
+  title: string;
+  alertDescription: string;
+  status: "OPEN" | "INVESTIGATING" | "IDENTIFIED" | "REMEDIATING" | "RESOLVED" | string;
+  createdAt: string;
+  resolvedAt?: string | null;
+}
+
+export interface InvestigationStartResponse {
+  investigation: {
+    id: string;
+    incidentId: string;
+    tenantId: string;
+    agentId: string | null;
+    sessionId: string | null;
+    status: string;
+    startedAt: string;
+  };
+  session: {
+    sessionId: string;
+    status: string;
+    startedAt: string;
+  };
+}
+
+export async function fetchIncidents(
+  tenantId?: string,
+  operatorId?: string,
+  status?: string
+): Promise<{ items: IncidentItem[]; total: number }> {
+  const url = new URL(`${API_BASE}/v1/incidents`);
+  if (status) url.searchParams.set("status", status);
+
+  const res = await fetch(url.toString(), {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export async function startInvestigation(
+  incidentId: string,
+  agentId?: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<InvestigationStartResponse> {
+  const res = await fetch(`${API_BASE}/v1/investigations/start`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(tenantId, operatorId)
+    },
+    body: JSON.stringify({ incidentId, agentId })
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export async function fetchInvestigation(
+  investigationId: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/v1/investigations/${investigationId}`, {
     headers: getAuthHeaders(tenantId, operatorId),
     cache: "no-store"
   });

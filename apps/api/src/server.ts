@@ -13,9 +13,11 @@ import { gatewayRoutes } from "./routes/gateway.js";
 import { cloudAccountRoutes } from "./routes/cloudAccounts.js";
 import { mcpRoutes } from "./routes/mcp.js";
 import { approvalRoutes } from "./routes/approvals.js";
-import { CloudAccountService } from "@cloudops/adapters";
+import { investigationRoutes } from "./routes/investigations.js";
+import { CloudAccountService, IncidentService } from "@cloudops/adapters";
 import { GatewayHandler } from "@cloudops/gateway";
 import { ApprovalService } from "@cloudops/approvals";
+import { HermesAgentAdapter, type AgentAdapter } from "@cloudops/runtime";
 import fastifyWebsocket from "@fastify/websocket";
 
 const apiLogger = createLogger("cloudops-api", {
@@ -37,6 +39,8 @@ export interface BuildAppOptions {
   startHeartbeatMonitor?: boolean | undefined;
   cloudAccountService?: CloudAccountService | undefined;
   approvalService?: ApprovalService | undefined;
+  incidentService?: IncidentService | undefined;
+  agentAdapter?: AgentAdapter | undefined;
 }
 
 export function buildApp(opts: BuildAppOptions = {}) {
@@ -46,6 +50,8 @@ export function buildApp(opts: BuildAppOptions = {}) {
   });
 
   const gatewayHandler = opts.gatewayHandler || new GatewayHandler();
+  const approvalService = opts.approvalService || new ApprovalService();
+  const agentAdapter = opts.agentAdapter || new HermesAgentAdapter();
 
   if (opts.startHeartbeatMonitor !== false) {
     gatewayHandler.connectionManager.startHeartbeatMonitor(10000, 30000);
@@ -73,8 +79,13 @@ export function buildApp(opts: BuildAppOptions = {}) {
   app.register(agentRoutes);
   app.register(gatewayRoutes, { gatewayHandler });
   app.register(cloudAccountRoutes, { cloudAccountService: opts.cloudAccountService });
-  app.register(mcpRoutes, { approvalService: opts.approvalService });
-  app.register(approvalRoutes, { approvalService: opts.approvalService });
+  app.register(mcpRoutes, { approvalService });
+  app.register(approvalRoutes, { approvalService });
+  app.register(investigationRoutes, {
+    incidentService: opts.incidentService,
+    agentAdapter,
+    approvalService
+  });
 
   // Global Error Handler: safely formats all errors without leaking stack traces or secrets
   app.setErrorHandler((error, request, reply) => {

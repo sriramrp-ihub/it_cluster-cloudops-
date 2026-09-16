@@ -1,7 +1,9 @@
 /**
  * @cloudops/security
- * Placeholder package for DefenseClaw Integration and Security Guardrails (Phase 5).
+ * DefenseClaw Integration and Security Guardrails.
  */
+export * from "./defenseClaw.js";
+
 export interface SecurityCheckResult {
   passed: boolean;
   violations: string[];

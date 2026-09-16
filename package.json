@@ -21,7 +21,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "db:migrate": "tsx database/src/migrate.ts",
-    "db:reset": "tsx database/src/reset.ts"
+    "db:reset": "tsx database/src/reset.ts",
+    "mock-agent:start": "tsx packages/runtime/src/mockAgentCli.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

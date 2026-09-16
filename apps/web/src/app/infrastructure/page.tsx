@@ -28,6 +28,7 @@ export default function InfrastructurePage() {
   const [typeFilter, setTypeFilter] = useState<"ALL" | "ECS_SERVICE" | "EC2_INSTANCE" | "RDS_DATABASE" | "S3_BUCKET">("ALL");
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [isConnectModalOpen, setIsConnectModalOpen] = useState(false);
+  const [backendUnavailable, setBackendUnavailable] = useState(false);
 
   // 1. Fetch connected cloud accounts and workloads
   const loadAccountsAndWorkloads = useCallback(async () => {
@@ -35,6 +36,7 @@ export default function InfrastructurePage() {
       setLoadingAccounts(true);
       const accList = await fetchCloudAccounts(tenantId, operatorId);
       setAccounts(accList);
+      setBackendUnavailable(false);
 
       const connectedAccounts = accList.filter(
         (a) => a.provider.toLowerCase() === "aws" && a.status === "CONNECTED"
@@ -77,7 +79,7 @@ export default function InfrastructurePage() {
           setWorkloads(dedupedWorkloads);
           setSessionActive(anyActive);
         } catch (workloadErr) {
-          console.error("Failed to discover workloads:", workloadErr);
+          console.warn("Workload discovery query failed:", workloadErr);
           setWorkloads([]);
         } finally {
           setLoadingWorkloads(false);
@@ -85,8 +87,9 @@ export default function InfrastructurePage() {
       } else {
         setWorkloads([]);
       }
-    } catch (err) {
-      console.error("Failed to load accounts:", err);
+    } catch (err: any) {
+      setBackendUnavailable(true);
+      console.warn("CloudOps Control Plane API is temporarily unreachable (port 3000):", err?.message || err);
     } finally {
       setLoadingAccounts(false);
     }
@@ -129,6 +132,34 @@ export default function InfrastructurePage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "2rem" }}>
+      {backendUnavailable && (
+        <div
+          style={{
+            padding: "12px 18px",
+            background: "#fef2f2",
+            border: "1px solid #fecaca",
+            borderRadius: "var(--radius-sm)",
+            color: "#991b1b",
+            fontSize: "13px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between"
+          }}
+        >
+          <span>
+            ⚠️ <strong>Control Plane API Offline:</strong> Could not connect to API server at http://localhost:3000. Start it with <code>npm run dev:api</code>.
+          </span>
+          <button
+            type="button"
+            onClick={() => loadAccountsAndWorkloads()}
+            className="btn-secondary"
+            style={{ fontSize: "11px", padding: "4px 8px" }}
+          >
+            Retry Connection
+          </button>
+        </div>
+      )}
+
       {/* 1. Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1rem" }}>
         <div>

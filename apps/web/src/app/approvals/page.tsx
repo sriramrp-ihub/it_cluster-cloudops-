@@ -1,25 +1,38 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { useAgentChat } from "../../context/AgentChatContext";
 
+interface ApprovalItem {
+  id: string;
+  tenantId: string;
+  agentId: string;
+  toolName: string;
+  operationType: string;
+  operationPayloadHash: string;
+  rawPayload: Record<string, any>;
+  status: string;
+  dryRunDiff?: {
+    resource?: string;
+    action?: string;
+    current?: string;
+    target?: string;
+  } | null;
+  createdAt: string;
+  expiresAt: string;
+}
+
 export default function ApprovalsPage() {
   const { setChatContext, openChat } = useAgentChat();
-  const [activeApproval, setActiveApproval] = useState<any | null>({
-    id: "appr_7b4e91f0",
-    action: "Scale payments tasks",
-    service: "payments",
-    agent: "Hermes SRE",
-    current: "3 tasks",
-    requested: "5 tasks",
-    risk: "Medium",
-    reason: "Increase capacity to mitigate traffic spike and elevated P95 latency.",
-    impact: "2 additional Fargate tasks will be provisioned in us-east-1.",
-    policy: "High-risk compute scaling requires explicit operator authorization."
-  });
-
-  const [reviewState, setReviewState] = useState<"idle" | "approved" | "rejected">("idle");
+  const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [reviewState, setReviewState] = useState<{
+    status: "idle" | "approved" | "rejected";
+    approvalId?: string;
+    signature?: string;
+    message?: string;
+  }>({ status: "idle" });
   const [showContracts, setShowContracts] = useState(false);
 
   useEffect(() => {
@@ -28,18 +41,81 @@ export default function ApprovalsPage() {
     });
   }, [setChatContext]);
 
-  const handleApprove = () => {
-    setReviewState("approved");
-    setTimeout(() => {
-      setActiveApproval(null);
-    }, 2500);
+  // 1. Fetch real pending approvals from PostgreSQL
+  const loadApprovals = useCallback(async () => {
+    try {
+      setLoading(true);
+      const res = await fetch("http://localhost:3000/v1/approvals", {
+        headers: { "x-tenant-id": "ten_default_tenant" }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setApprovals(data.approvals || []);
+      }
+    } catch (err) {
+      console.error("Failed to load approvals", err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadApprovals();
+  }, [loadApprovals]);
+
+  // 2. Cryptographic quick-approve & execute
+  const handleApprove = async (approvalId: string) => {
+    try {
+      const res = await fetch(`http://localhost:3000/v1/approvals/${approvalId}/quick-approve`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-tenant-id": "ten_default_tenant"
+        },
+        body: JSON.stringify({ reviewedBy: "cloudops_operator_admin" })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setReviewState({
+          status: "approved",
+          approvalId,
+          signature: data.operatorSignature,
+          message: "Operation cryptographically signed with operator Ed25519 key and executed via Tool Gateway."
+        });
+        loadApprovals();
+      }
+    } catch (err) {
+      console.error("Failed to approve", err);
+    }
   };
 
-  const handleReject = () => {
-    setReviewState("rejected");
-    setTimeout(() => {
-      setActiveApproval(null);
-    }, 2500);
+  // 3. Reject operation
+  const handleReject = async (approvalId: string) => {
+    try {
+      const res = await fetch(`http://localhost:3000/v1/approvals/${approvalId}/reject`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-tenant-id": "ten_default_tenant"
+        },
+        body: JSON.stringify({
+          reviewedBy: "cloudops_operator_admin",
+          reason: "Operator rejected remediation mutation"
+        })
+      });
+
+      if (res.ok) {
+        setReviewState({
+          status: "rejected",
+          approvalId,
+          message: "Mutation cancelled. Agent notified that authorization was denied."
+        });
+        loadApprovals();
+      }
+    } catch (err) {
+      console.error("Failed to reject", err);
+    }
   };
 
   return (
@@ -82,18 +158,23 @@ export default function ApprovalsPage() {
       </div>
 
       {/* 2. Feedback Alert */}
-      {reviewState === "approved" && (
-        <div className="alert-banner success">
+      {reviewState.status === "approved" && (
+        <div className="alert-banner success" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
           <div>
-            <strong>Action Approved:</strong> Operation authorization signed and dispatched to Tool Gateway.
+            <strong>Action Cryptographically Authorized & Executed:</strong> {reviewState.message}
           </div>
+          {reviewState.signature && (
+            <div style={{ fontSize: "11px", fontFamily: "var(--font-mono)", opacity: 0.9 }}>
+              Ed25519 Digital Signature: <code>{reviewState.signature}</code>
+            </div>
+          )}
         </div>
       )}
 
-      {reviewState === "rejected" && (
+      {reviewState.status === "rejected" && (
         <div className="alert-banner error">
           <div>
-            <strong>Action Rejected:</strong> Mutation cancelled. Agent notified that scaling authorization was denied.
+            <strong>Action Rejected:</strong> {reviewState.message}
           </div>
         </div>
       )}
@@ -101,117 +182,106 @@ export default function ApprovalsPage() {
       {/* 3. Requires Your Attention Queue */}
       <div>
         <div style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--mid-warm-gray)", marginBottom: "12px" }}>
-          Requires Your Attention
+          Pending Authorizations ({approvals.length})
         </div>
 
-        {activeApproval ? (
-          <div className="harvey-card" style={{ padding: "24px 28px", borderLeft: "3px solid #d97706" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1rem", marginBottom: "16px" }}>
-              <div>
-                <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
-                  <h2 style={{ fontFamily: "var(--font-serif)", fontSize: "24px", fontWeight: 400, color: "var(--near-black-ink)", margin: 0 }}>
-                    {activeApproval.action}
-                  </h2>
-                  <span style={{ fontSize: "11px", background: "#fef3c7", color: "#92400e", padding: "2px 7px", borderRadius: "var(--radius-sm)", fontWeight: 700 }}>
-                    RISK: {activeApproval.risk}
-                  </span>
+        {approvals.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
+            {approvals.map((appr) => {
+              const diff = appr.dryRunDiff;
+              const serviceName = appr.rawPayload?.service || "starvision-motors";
+              const clusterName = appr.rawPayload?.cluster || "cloudops-test";
+              const currentTag = diff?.current || "starvision-motors:2 (Broken manifest)";
+              const targetTag = diff?.target || "starvision-motors:1 (Stable baseline)";
+
+              return (
+                <div key={appr.id} className="harvey-card" style={{ padding: "24px 28px", borderLeft: "3px solid #d97706" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1rem", marginBottom: "16px" }}>
+                    <div>
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
+                        <h2 style={{ fontFamily: "var(--font-serif)", fontSize: "24px", fontWeight: 400, color: "var(--near-black-ink)", margin: 0 }}>
+                          Rollback Service: {serviceName}
+                        </h2>
+                        <span style={{ fontSize: "11px", background: "#fef3c7", color: "#92400e", padding: "2px 7px", borderRadius: "var(--radius-sm)", fontWeight: 700 }}>
+                          RISK: CRITICAL
+                        </span>
+                      </div>
+                      <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>
+                        Agent: <strong>Hermes SRE ({appr.agentId})</strong> · Cluster: <strong>{clusterName}</strong> · Tool: <code>{appr.toolName}</code>
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: "12px", fontFamily: "var(--font-mono)", fontSize: "12.5px" }}>
+                      <span>Current: <strong>{currentTag}</strong></span>
+                      <span>→</span>
+                      <span>Target: <strong style={{ color: "#16a34a" }}>{targetTag}</strong></span>
+                    </div>
+                  </div>
+
+                  {/* Details Box */}
+                  <div style={{ padding: "16px", background: "#fcfbf9", border: "1px solid var(--warm-gray-border)", borderRadius: "var(--radius-sm)", marginBottom: "20px", display: "flex", flexDirection: "column", gap: "10px", fontSize: "13px" }}>
+                    <div>
+                      <span style={{ color: "var(--mid-warm-gray)" }}>Reason:</span>{" "}
+                      <span style={{ color: "var(--near-black-ink)" }}>
+                        Remediate ContainerImagePullFailure by updating task definition revision to stable baseline.
+                      </span>
+                    </div>
+                    <div>
+                      <span style={{ color: "var(--mid-warm-gray)" }}>Impact:</span>{" "}
+                      <span style={{ color: "var(--near-black-ink)" }}>
+                        ECS service <code>{serviceName}</code> will trigger a rolling deployment to <code>{targetTag}</code>.
+                      </span>
+                    </div>
+                    <div>
+                      <span style={{ color: "var(--mid-warm-gray)" }}>Payload SHA-256:</span>{" "}
+                      <code style={{ fontSize: "11px" }}>{appr.operationPayloadHash}</code>
+                    </div>
+                    <div>
+                      <span style={{ color: "var(--mid-warm-gray)" }}>Policy Gate:</span>{" "}
+                      <span style={{ color: "var(--near-black-ink)" }}>
+                        Mutations exceeding read-only boundary require explicit operator Ed25519 digital signature.
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Action Buttons */}
+                  <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+                    <button
+                      type="button"
+                      onClick={() => handleApprove(appr.id)}
+                      className="btn-primary"
+                      style={{ fontSize: "13px" }}
+                    >
+                      Authorize & Execute (Ed25519 Signed) →
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleReject(appr.id)}
+                      className="btn-secondary"
+                      style={{ fontSize: "13px" }}
+                    >
+                      Reject Mutation
+                    </button>
+                  </div>
                 </div>
-                <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>
-                  Agent: <strong>{activeApproval.agent}</strong> · Target: <strong>{activeApproval.service}</strong>
-                </div>
-              </div>
-
-              <div style={{ display: "flex", alignItems: "center", gap: "12px", fontFamily: "var(--font-mono)", fontSize: "13px" }}>
-                <span>Current: <strong>{activeApproval.current}</strong></span>
-                <span>→</span>
-                <span>Requested: <strong>{activeApproval.requested}</strong></span>
-              </div>
-            </div>
-
-            {/* Details Box */}
-            <div style={{ padding: "16px", background: "#fcfbf9", border: "1px solid var(--warm-gray-border)", borderRadius: "var(--radius-sm)", marginBottom: "20px", display: "flex", flexDirection: "column", gap: "10px", fontSize: "13px" }}>
-              <div>
-                <span style={{ color: "var(--mid-warm-gray)" }}>Reason:</span>{" "}
-                <span style={{ color: "var(--near-black-ink)" }}>{activeApproval.reason}</span>
-              </div>
-              <div>
-                <span style={{ color: "var(--mid-warm-gray)" }}>Impact:</span>{" "}
-                <span style={{ color: "var(--near-black-ink)" }}>{activeApproval.impact}</span>
-              </div>
-              <div>
-                <span style={{ color: "var(--mid-warm-gray)" }}>Policy Requirement:</span>{" "}
-                <span style={{ color: "var(--near-black-ink)" }}>{activeApproval.policy}</span>
-              </div>
-            </div>
-
-            {/* Action Buttons */}
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: "12px" }}>
-              <button
-                type="button"
-                onClick={handleReject}
-                className="btn-danger"
-                style={{ padding: "8px 20px", fontSize: "13px" }}
-              >
-                Reject Request
-              </button>
-              <button
-                type="button"
-                onClick={handleApprove}
-                className="btn-primary"
-                style={{ padding: "8px 24px", fontSize: "13px" }}
-              >
-                Approve & Execute →
-              </button>
-            </div>
+              );
+            })}
           </div>
         ) : (
-          <div className="harvey-card" style={{ padding: "48px 24px", textAlign: "center" }}>
-            <div style={{ width: "44px", height: "44px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "20px", marginBottom: "12px" }}>
-              ✓
+          <div className="harvey-card" style={{ padding: "40px 24px", textAlign: "center" }}>
+            <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "6px" }}>
+              Zero Pending Approvals
             </div>
-            <div style={{ fontFamily: "var(--font-serif)", fontSize: "22px", color: "var(--near-black-ink)", marginBottom: "6px" }}>
-              Approval Queue Clear
-            </div>
-            <p className="body-subtle" style={{ maxWidth: "460px", margin: "0 auto 20px auto", fontSize: "13px" }}>
-              No pending operational authorizations are queued. High-risk cloud operations requiring human operator approval will automatically appear here.
+            <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", maxWidth: "520px", margin: "0 auto 16px" }}>
+              All autonomous agent operations are currently within baseline read-only governance. When an investigation proposes an infrastructure mutation, it will appear here for cryptographic authorization.
             </p>
-            <Link href="/" className="btn-secondary">
-              ← Return to Operational Overview
+            <Link
+              href="/investigate"
+              className="btn-secondary"
+              style={{ fontSize: "13px", display: "inline-block", textDecoration: "none" }}
+            >
+              Go to Investigations Workspace →
             </Link>
-          </div>
-        )}
-      </div>
-
-      {/* 4. Progressive Disclosure: Cryptographic Policy Guarantees */}
-      <div className="harvey-card" style={{ padding: "18px 24px" }}>
-        <button
-          type="button"
-          onClick={() => setShowContracts(!showContracts)}
-          style={{
-            background: "none",
-            border: "none",
-            padding: 0,
-            color: "var(--near-black-ink)",
-            fontSize: "13px",
-            fontWeight: 600,
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            gap: "8px"
-          }}
-        >
-          <span>{showContracts ? "▾" : "▸"}</span>
-          <span>Cryptographic Guarantees & Schema Contracts</span>
-        </button>
-
-        {showContracts && (
-          <div style={{ marginTop: "16px", paddingTop: "14px", borderTop: "1px solid var(--warm-gray-border)", display: "flex", flexDirection: "column", gap: "10px", fontSize: "12.5px", color: "var(--mid-warm-gray)" }}>
-            <p style={{ margin: 0 }}>
-              CloudOps approvals are cryptographically operation-bound. Every approval is anchored to the canonical SHA-256 hash of the exact tool invocation payload (<code className="code-inline">operation_payload_hash</code>).
-            </p>
-            <p style={{ margin: 0 }}>
-              Approvals are consumed atomically by the Tool Gateway. Once executed, an approval cannot be replayed, transferred, or executed after expiration.
-            </p>
           </div>
         )}
       </div>

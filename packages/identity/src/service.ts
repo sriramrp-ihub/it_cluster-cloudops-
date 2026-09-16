@@ -56,4 +56,13 @@ export class AgentService {
     await this.getAgent(tenantId, id);
     await this.repo.updateStatus(tenantId, id, status);
   }
+
+  async deleteAgent(tenantId: string, id: AgentId): Promise<{ id: AgentId; name: string }> {
+    const agent = await this.getAgent(tenantId, id);
+    const deleted = await this.repo.delete(tenantId, id);
+    if (!deleted) {
+      throw new NotFoundError(`Agent ${id} could not be deleted or was not found for tenant ${tenantId}`);
+    }
+    return { id: agent.id, name: agent.name };
+  }
 }

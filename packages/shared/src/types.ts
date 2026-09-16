@@ -188,3 +188,123 @@ export const CloudAccountStatus = {
   DISCONNECTED: "DISCONNECTED"
 } as const;
 export type CloudAccountStatus = (typeof CloudAccountStatus)[keyof typeof CloudAccountStatus];
+
+/**
+ * CO-010: Formal Incident Input Contract
+ */
+export interface IncidentContext {
+  incidentId: string;
+  provider: CloudProvider | "AWS" | "AZURE" | "GCP" | "aws" | "azure" | "gcp";
+  accountId: string;
+  region: string;
+  service: string;
+  resourceId: string;
+  severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+  title: string;
+  alertDescription: string;
+  sourceMetadata: {
+    monitorId?: string;
+    triggerMetric?: string;
+    threshold?: string;
+    startedAt: string;
+  };
+  status?: "OPEN" | "INVESTIGATING" | "IDENTIFIED" | "REMEDIATING" | "RESOLVED" | "CLOSED";
+}
+
+/**
+ * Validates incident context and fails closed on any missing or invalid field.
+ */
+export function validateIncidentContext(input: unknown): {
+  valid: boolean;
+  errors?: string[];
+  context?: IncidentContext;
+} {
+  if (!input || typeof input !== "object") {
+    return { valid: false, errors: ["Incident context must be a non-null object"] };
+  }
+
+  const candidate = input as Record<string, unknown>;
+  const errors: string[] = [];
+
+  const requiredFields = [
+    "incidentId",
+    "provider",
+    "accountId",
+    "region",
+    "service",
+    "resourceId",
+    "severity",
+    "alertDescription"
+  ] as const;
+
+  for (const field of requiredFields) {
+    if (!candidate[field] || typeof candidate[field] !== "string" || (candidate[field] as string).trim() === "") {
+      errors.push(`Missing or invalid required string field: ${field}`);
+    }
+  }
+
+  if (candidate.severity && !["CRITICAL", "HIGH", "MEDIUM", "LOW"].includes(candidate.severity as string)) {
+    errors.push(`Invalid severity: ${candidate.severity}. Must be CRITICAL, HIGH, MEDIUM, or LOW`);
+  }
+
+  if (candidate.sourceMetadata && typeof candidate.sourceMetadata !== "object") {
+    errors.push("sourceMetadata must be an object if provided");
+  }
+
+  if (errors.length > 0) {
+    return { valid: false, errors };
+  }
+
+  return {
+    valid: true,
+    context: {
+      incidentId: String(candidate.incidentId),
+      provider: candidate.provider as IncidentContext["provider"],
+      accountId: String(candidate.accountId),
+      region: String(candidate.region),
+      service: String(candidate.service),
+      resourceId: String(candidate.resourceId),
+      severity: candidate.severity as IncidentContext["severity"],
+      title: candidate.title ? String(candidate.title) : `Incident ${candidate.incidentId} - ${candidate.service}`,
+      alertDescription: String(candidate.alertDescription),
+      sourceMetadata: (candidate.sourceMetadata as IncidentContext["sourceMetadata"]) || {
+        startedAt: new Date().toISOString()
+      },
+      status: (candidate.status as IncidentContext["status"]) || "OPEN"
+    }
+  };
+}
+
+/**
+ * CO-012: Normalized Evidence Schema
+ */
+export interface IncidentEvidence {
+  id: string;
+  incidentId: string;
+  source: "ECS" | "CLOUDWATCH_METRICS" | "CLOUDWATCH_LOGS" | "ALB" | "ECR" | "IAM" | string;
+  resource: string;
+  timestamp: string;
+  observation: string;
+  severity?: "INFO" | "WARNING" | "CRITICAL";
+  rawPayload?: Record<string, unknown>;
+}
+
+/**
+ * CO-012: Machine-Checkable Root Cause Schema
+ */
+export interface RootCauseConclusion {
+  incidentId: string;
+  cause: string;
+  summary: string;
+  confidence: number;
+  evidenceIds: string[];
+  affectedResources: string[];
+  alternativeHypotheses?: Array<{ hypothesis: string; eliminatedReason: string }>;
+  recommendedRemediation?: {
+    action: string;
+    target: string;
+    proposedPayload: Record<string, unknown>;
+    riskLevel: RiskLevel;
+  };
+}
+

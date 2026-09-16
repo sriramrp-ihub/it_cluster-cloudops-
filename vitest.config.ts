@@ -8,6 +8,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
+    setupFiles: ["dotenv/config"],
     fileParallelism: false,
     include: [
       "tests/**/*.test.ts",

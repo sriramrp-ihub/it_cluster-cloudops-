@@ -8,6 +8,9 @@ export * from "./types.js";
 export * from "./credentialService.js";
 export * from "./sessionService.js";
 export * from "./audit.js";
+export * from "./agentAdapter.js";
+export * from "./mockAgentAdapter.js";
+export * from "./hermesAgentAdapter.js";
 
 export interface RuntimeAdapter {
   readonly runtimeType: string;

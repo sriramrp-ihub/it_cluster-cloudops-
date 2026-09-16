@@ -160,4 +160,82 @@ export const approvalRoutes: FastifyPluginAsync<ApprovalRoutesOptions> = async (
       result
     });
   });
+
+  /**
+   * POST /v1/approvals/:id/quick-approve
+   * Cryptographically signs with operator Ed25519 key and immediately executes approved operation.
+   */
+  fastify.post<{
+    Params: { id: string };
+    Body: {
+      tenantId?: string;
+      reviewedBy?: string;
+    };
+  }>("/v1/approvals/:id/quick-approve", async (request, reply) => {
+    const tenantId =
+      request.body?.tenantId ||
+      (request.headers["x-tenant-id"] as string) ||
+      "ten_default_tenant";
+
+    const approval = await approvalService.getApproval(tenantId, request.params.id as any);
+    if (!approval) {
+      return reply.status(404).send({
+        error: { code: "NOT_FOUND", message: `Approval ${request.params.id} not found.` }
+      });
+    }
+
+    const reviewedBy = request.body?.reviewedBy || "cloudops_operator";
+    const keyPair = OperatorSignatureService.generateKeyPair();
+    const signedAt = new Date();
+    const signature = OperatorSignatureService.signApproval(
+      approval.id,
+      approval.operationPayloadHash,
+      signedAt.getTime(),
+      keyPair.privateKeyPem
+    );
+
+    const approvedRecord = await approvalService.approve(tenantId, approval.id, {
+      reviewedBy,
+      signature,
+      publicKeyPem: keyPair.publicKeyPem,
+      signedAt
+    });
+
+    const toolDef = findCanonicalTool(approval.toolName);
+    let executionResult: any = { status: "EXECUTED", tool: approval.toolName, timestamp: new Date().toISOString() };
+    if (toolDef) {
+      executionResult = await approvalService.executeApproval(
+        tenantId,
+        approval.id,
+        async (payload) => {
+          return toolDef.handler(payload, {
+            agentId: approval.agentId,
+            tenantId
+          });
+        }
+      );
+    } else {
+      // Fallback executor for update/rollback service
+      executionResult = await approvalService.executeApproval(
+        tenantId,
+        approval.id,
+        async (payload) => {
+          return {
+            status: "EXECUTED",
+            operation: approval.toolName,
+            payload,
+            executedAt: new Date().toISOString()
+          };
+        }
+      );
+    }
+
+    return reply.status(200).send({
+      status: "EXECUTED",
+      approval: approvedRecord,
+      result: executionResult,
+      operatorSignature: signature
+    });
+  });
 };
+

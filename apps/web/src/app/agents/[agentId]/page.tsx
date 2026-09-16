@@ -2,11 +2,13 @@
 
 import React, { useState, useEffect, use } from "react";
 import Link from "next/link";
-import { fetchAgent, AgentItem } from "../../../lib/api";
+import { useRouter } from "next/navigation";
+import { fetchAgent, deleteAgent, AgentItem } from "../../../lib/api";
 import { useOperator } from "../../../auth/OperatorContext";
 import { useAgentChat } from "../../../context/AgentChatContext";
 
 export default function AgentDossierPage({ params }: { params: Promise<{ agentId: string }> }) {
+  const router = useRouter();
   const resolvedParams = use(params);
   const agentId = resolvedParams.agentId;
 
@@ -17,9 +19,24 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "capabilities" | "activity" | "runs" | "diagnostics">("overview");
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   const tenantId = session?.tenantId || "ten_default_tenant";
   const operatorId = session?.operatorId || "op_admin_operator";
+
+  async function handleConfirmDelete() {
+    setIsDeleting(true);
+    setErrorMsg(null);
+    try {
+      await deleteAgent(agentId, tenantId, operatorId);
+      router.push("/agents");
+    } catch (err: any) {
+      setErrorMsg(`Failed to delete agent: ${err.message}`);
+      setShowDeleteModal(false);
+      setIsDeleting(false);
+    }
+  }
 
   async function loadAgentData() {
     setLoading(true);
@@ -99,6 +116,14 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
             style={{ fontSize: "13px" }}
           >
             Inquire with Agent →
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowDeleteModal(true)}
+            className="btn-danger"
+            style={{ fontSize: "13px" }}
+          >
+            Delete Agent
           </button>
         </div>
       </div>
@@ -223,6 +248,28 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
               <div style={{ fontWeight: 500, marginTop: "4px" }}>
                 {isConnected ? "Standby — Ready to receive operational investigation tasks" : "Offline — Daemon process not connected to Gateway WebSocket"}
               </div>
+            </div>
+          </div>
+
+          {/* Danger Zone: Agent Decommissioning */}
+          <div className="harvey-card" style={{ padding: "20px 24px", border: "1px solid #fecaca", background: "#fffafa" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1rem" }}>
+              <div>
+                <h3 style={{ fontFamily: "var(--font-serif)", fontSize: "18px", color: "#991b1b", margin: "0 0 4px 0" }}>
+                  Danger Zone: Decommission Agent
+                </h3>
+                <p className="body-subtle" style={{ fontSize: "13px", margin: 0, maxWidth: "540px", color: "#7f1d1d" }}>
+                  Permanently remove this agent identity from CloudOps. Active WebSocket sessions will be terminated, bootstrap credentials revoked, and investigation references unlinked.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDeleteModal(true)}
+                className="btn-danger"
+                style={{ fontSize: "13px", padding: "6px 14px" }}
+              >
+                Delete Agent
+              </button>
             </div>
           </div>
         </div>
@@ -354,6 +401,88 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
 [WS_IN]  {"type":"HEARTBEAT","sequence":1}
 [WS_OUT] {"type":"HEARTBEAT_ACK","sequence":1}`}
             </pre>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Agent Confirmation Modal */}
+      {showDeleteModal && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            backgroundColor: "rgba(0, 0, 0, 0.45)",
+            backdropFilter: "blur(2px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+            padding: "1rem"
+          }}
+          onClick={() => !isDeleting && setShowDeleteModal(false)}
+        >
+          <div
+            className="harvey-card"
+            style={{
+              maxWidth: "480px",
+              width: "100%",
+              padding: "24px 28px",
+              backgroundColor: "#ffffff",
+              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)"
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
+              <span style={{ fontSize: "20px" }}>⚠️</span>
+              <h3 style={{ fontFamily: "var(--font-serif)", fontSize: "20px", margin: 0, color: "var(--near-black-ink)" }}>
+                Delete Operational Agent?
+              </h3>
+            </div>
+
+            <div
+              style={{
+                background: "#fef2f2",
+                border: "1px solid #fecaca",
+                borderRadius: "var(--radius-sm)",
+                padding: "12px 14px",
+                fontSize: "13px",
+                color: "#991b1b",
+                marginBottom: "16px",
+                lineHeight: 1.5
+              }}
+            >
+              You are about to permanently delete <strong>{agent.name}</strong> (<code>{agent.id}</code>).
+            </div>
+
+            <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)", marginBottom: "20px", lineHeight: 1.6 }}>
+              <ul style={{ margin: 0, paddingLeft: "18px" }}>
+                <li>All active sessions and bootstrap credentials will be revoked immediately.</li>
+                <li>The agent runtime will be disconnected from the Gateway WebSocket transport.</li>
+                <li>Incident investigation records will be unlinked (audit events remain cryptographically chained).</li>
+                <li>This action <strong>cannot be undone</strong>.</li>
+              </ul>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+              <button
+                type="button"
+                onClick={() => setShowDeleteModal(false)}
+                disabled={isDeleting}
+                className="btn-secondary"
+                style={{ fontSize: "13px" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                disabled={isDeleting}
+                className="btn-danger"
+                style={{ fontSize: "13px", padding: "6px 16px" }}
+              >
+                {isDeleting ? "Deleting Agent..." : "Confirm & Delete Agent"}
+              </button>
+            </div>
           </div>
         </div>
       )}
