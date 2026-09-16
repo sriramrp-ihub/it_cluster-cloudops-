@@ -94,6 +94,7 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
   fastify.post<{
     Body: {
       prompt: string;
+      agentId?: string;
       context?: {
         environment?: string;
         service?: string;
@@ -103,7 +104,7 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
     };
   }>("/v1/agent/chat", { preHandler: [requireOperatorAuth] }, async (request, reply) => {
     const operator = request.operator!;
-    const { prompt, context } = request.body || {};
+    const { prompt, agentId, context } = request.body || {};
 
     if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
       return reply.status(400).send({
@@ -113,7 +114,7 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
 
     // 1. DefenseClaw Pre-execution Guardrail Analysis
     const verdict = await defenseClaw.inspectToolCall({
-      agentId: "hermes-live-chat",
+      agentId: agentId || "agent-live-chat",
       tenantId: operator.tenantId,
       toolName: "operator_chat_query",
       arguments: { prompt, context }
@@ -129,12 +130,47 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
       });
     }
 
-    // 2. Build contextual prompt for Hermes
+    // 2. Resolve Agent and Model dynamically
+    let agentName = "CloudOps Autonomous SRE Agent";
+    let agentType = "hermes";
+    if (agentId) {
+      try {
+        const ag = await agentService.getAgent(operator.tenantId, agentId as any);
+        if (ag) {
+          agentName = ag.name;
+          agentType = ag.type;
+        }
+      } catch {
+        // Fallback
+      }
+    } else {
+      const agents = await agentService.listAgents(operator.tenantId);
+      const active = agents.find((a) => a.status === "CONNECTED") || agents[0];
+      if (active) {
+        agentName = active.name;
+        agentType = active.type;
+      }
+    }
+
+    const localAdapter = agentAdapter || new HermesAgentAdapter();
+    let discoveredModel = "agent-runtime";
+    let discoveredProvider = "local-daemon";
+    if (typeof (localAdapter as any).checkHermesHealth === "function") {
+      try {
+        const health = await (localAdapter as any).checkHermesHealth();
+        if (health?.model) discoveredModel = health.model;
+        if (health?.provider) discoveredProvider = health.provider;
+      } catch {
+        // use defaults
+      }
+    }
+
+    // 3. Build contextual prompt dynamically
     const ctxString = context?.service
       ? `\nActive Operational Context: Workload '${context.service}', Cluster '${context.cluster || "default"}', Region '${context.region || "us-east-1"}', Env '${context.environment || "production"}'.`
       : "";
 
-    const hermesPrompt = `You are CloudOps Autonomous SRE Agent powered by Hermes and Nemotron-3.
+    const hermesPrompt = `You are ${agentName} (${discoveredModel}).
 You assist Site Reliability Engineers and Cloud Platform Operators with real-time AWS troubleshooting, architecture guidance, ECS failure diagnostics, CloudWatch alarms, and governance policies.
 ${ctxString}
 
@@ -145,17 +181,18 @@ Provide an authoritative, concise, and structured SRE response (maximum 2-3 shor
 
     try {
       let responseText = "";
-      if (agentAdapter && typeof (agentAdapter as any).executeHermesInference === "function") {
-        responseText = await (agentAdapter as any).executeHermesInference(hermesPrompt, 45000);
+      if (typeof (localAdapter as any).executeHermesInference === "function") {
+        responseText = await (localAdapter as any).executeHermesInference(hermesPrompt, 45000);
       } else {
-        const localAdapter = new HermesAgentAdapter();
-        responseText = await localAdapter.executeHermesInference(hermesPrompt, 45000);
+        const fallbackAdapter = new HermesAgentAdapter();
+        responseText = await fallbackAdapter.executeHermesInference(hermesPrompt, 45000);
       }
 
       return reply.status(200).send({
         response: responseText.trim(),
-        model: "nemotron-3-ultra",
-        provider: "ollama-cloud",
+        model: discoveredModel,
+        provider: discoveredProvider,
+        agentName,
         timestamp: new Date().toISOString()
       });
     } catch (err: any) {

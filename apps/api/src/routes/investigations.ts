@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { IncidentService } from "@cloudops/adapters";
 import { HermesAgentAdapter, type AgentAdapter } from "@cloudops/runtime";
 import { ApprovalService } from "@cloudops/approvals";
+import { AgentService } from "@cloudops/identity";
 import { CANONICAL_TOOLS } from "@cloudops/tools";
 import { ValidationError, NotFoundError } from "@cloudops/shared";
 import { randomUUID } from "node:crypto";
@@ -10,6 +11,7 @@ export interface InvestigationRoutesOptions {
   incidentService?: IncidentService | undefined;
   agentAdapter?: AgentAdapter | undefined;
   approvalService?: ApprovalService | undefined;
+  agentService?: AgentService | undefined;
 }
 
 export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions> = async (
@@ -19,7 +21,36 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
   const incidentService = opts.incidentService || new IncidentService();
   const agentAdapter = opts.agentAdapter || new HermesAgentAdapter({ enableLiveInference: true });
   const approvalService = opts.approvalService || new ApprovalService();
+  const agentService = opts.agentService || new AgentService();
   const awsAccountId = process.env.AWS_ACCOUNT_ID || "265766933076";
+
+  /**
+   * Dynamically resolves the effective agent to dispatch for this investigation session
+   */
+  async function resolveEffectiveAgent(tenantId: string, requestedAgentId?: string): Promise<{ id: string; name: string; type: string }> {
+    if (requestedAgentId) {
+      try {
+        const agent = await agentService.getAgent(tenantId, requestedAgentId as any);
+        if (agent) {
+          return { id: agent.id, name: agent.name, type: agent.type };
+        }
+      } catch {
+        // Fall back to tenant agent discovery
+      }
+    }
+
+    const agents = await agentService.listAgents(tenantId);
+    const active = agents.find((a) => a.status === "CONNECTED") || agents[0];
+    if (active) {
+      return { id: active.id, name: active.name, type: active.type };
+    }
+
+    return {
+      id: requestedAgentId || "ag_autonomous_sre",
+      name: "CloudOps Autonomous SRE",
+      type: "hermes"
+    };
+  }
 
   /**
    * Helper to extract tenantId from request header or default
@@ -161,7 +192,12 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       status: "OPEN"
     });
 
-    const effectiveAgentId = "ag_d14df3f8-4ed6-4e77-9c36-090214504123";
+    const effectiveAgent = await resolveEffectiveAgent(tenantId, body.agentId);
+    const effectiveAgentId = effectiveAgent.id;
+    if (typeof (agentAdapter as any).agentName !== "undefined") {
+      (agentAdapter as any).agentName = effectiveAgent.name;
+    }
+
     const { investigation, session } = await incidentService.startInvestigation({
       tenantId,
       incidentId: createdIncident.id,
@@ -273,7 +309,11 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       throw new ValidationError("Missing required body parameter: incidentId");
     }
 
-    const effectiveAgentId = agentId || "ag_d14df3f8-4ed6-4e77-9c36-090214504123";
+    const effectiveAgent = await resolveEffectiveAgent(tenantId, agentId);
+    const effectiveAgentId = effectiveAgent.id;
+    if (typeof (agentAdapter as any).agentName !== "undefined") {
+      (agentAdapter as any).agentName = effectiveAgent.name;
+    }
 
     const incDetails = await incidentService.getIncident(tenantId, incidentId);
     let cluster = "cloudops-test";

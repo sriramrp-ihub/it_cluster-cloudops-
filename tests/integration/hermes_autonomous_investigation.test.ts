@@ -185,7 +185,7 @@ describe("Autonomous Hermes Investigation & Gated Remediation (PRD Feature Compl
     // 1. Verify that Hermes dynamically deduced the root cause using neural inference
     expect(result.status).toBe("WAITING_APPROVAL");
     expect(result.approvalId).toBeDefined();
-    expect(result.rootCause.dataSource).toBe("live:hermes:nemotron-3");
+    expect(result.rootCause.dataSource).toMatch(/^live:hermes:/);
     expect(result.rootCause.finding).toBeDefined();
     expect(typeof result.rootCause.finding).toBe("string");
     expect(result.rootCause.rootCause).toBeDefined();
@@ -275,7 +275,7 @@ describe("Autonomous Hermes Investigation & Gated Remediation (PRD Feature Compl
     expect(chatJson.response).toBeDefined();
     expect(typeof chatJson.response).toBe("string");
     expect(chatJson.response.length).toBeGreaterThan(20);
-    expect(chatJson.model).toBe("nemotron-3-ultra");
+    expect(chatJson.model).toBeDefined();
 
     // 2. Adversarial destructive injection: DefenseClaw must block it
     const maliciousRes = await app.inject({

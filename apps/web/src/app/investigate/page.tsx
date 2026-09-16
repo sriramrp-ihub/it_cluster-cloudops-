@@ -26,6 +26,16 @@ interface LiveStep {
   evidenceId?: string;
 }
 
+interface OnboardedAgent {
+  id: string;
+  tenantId: string;
+  name: string;
+  type: string;
+  version: string;
+  runtimeProtocol: string;
+  status: string;
+}
+
 interface RootCause {
   finding: string;
   rootCause: string;
@@ -62,8 +72,10 @@ export default function InvestigatePage() {
   );
   const [showConfigPanel, setShowConfigPanel] = useState(false);
   const [discoveredWorkloads, setDiscoveredWorkloads] = useState<{ name: string; cluster?: string; region?: string }[]>([]);
+  const [availableAgents, setAvailableAgents] = useState<OnboardedAgent[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string>("");
 
-  // 1. Fetch real incidents and connected workloads from PostgreSQL API
+  // 1. Fetch real incidents, connected workloads, and onboarded agents from PostgreSQL API
   const loadIncidents = useCallback(async () => {
     try {
       setLoading(true);
@@ -102,12 +114,30 @@ export default function InvestigatePage() {
           }
         }
       } catch {}
+
+      // Query registered agents dynamically
+      try {
+        const agRes = await fetch("http://localhost:3000/v1/agents", {
+          headers: { "x-tenant-id": "ten_default_tenant", "x-operator-id": "op_admin" }
+        });
+        if (agRes.ok) {
+          const agData = await agRes.json();
+          const items = agData.items || [];
+          setAvailableAgents(items);
+          if (items.length > 0 && !selectedAgentId) {
+            const connected = items.find((a: OnboardedAgent) => a.status === "CONNECTED") || items[0];
+            setSelectedAgentId(connected.id);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to load onboarded agents", err);
+      }
     } catch (err) {
       console.error("Failed to load incidents", err);
     } finally {
       setLoading(false);
     }
-  }, [selectedIncidentId]);
+  }, [selectedIncidentId, selectedAgentId]);
 
   useEffect(() => {
     loadIncidents();
@@ -125,19 +155,21 @@ export default function InvestigatePage() {
     }
   }, [selectedIncidentId, incidents, targetService, setChatContext]);
 
-  // 2. Trigger dynamic autonomous Hermes investigation
+  // 2. Trigger dynamic autonomous investigation
   const handleTriggerInvestigation = async (overrideParams?: {
     service?: string;
     cluster?: string;
     region?: string;
     severity?: string;
     alertDescription?: string;
+    agentId?: string;
   }) => {
     const sName = overrideParams?.service || targetService;
     const cName = overrideParams?.cluster || targetCluster;
     const reg = overrideParams?.region || targetRegion;
     const sev = overrideParams?.severity || targetSeverity;
     const alertDesc = overrideParams?.alertDescription || targetAlertDesc;
+    const agId = overrideParams?.agentId || selectedAgentId || undefined;
 
     setIsInvestigating(true);
     setLiveSteps([]);
@@ -156,7 +188,8 @@ export default function InvestigatePage() {
           cluster: cName,
           region: reg,
           severity: sev,
-          alertDescription: alertDesc
+          alertDescription: alertDesc,
+          agentId: agId
         })
       });
 
@@ -197,7 +230,10 @@ export default function InvestigatePage() {
           "Content-Type": "application/json",
           "x-tenant-id": "ten_default_tenant"
         },
-        body: JSON.stringify({ incidentId: selectedIncidentId })
+        body: JSON.stringify({
+          incidentId: selectedIncidentId,
+          agentId: selectedAgentId || undefined
+        })
       });
 
       if (res.ok) {
@@ -322,19 +358,20 @@ export default function InvestigatePage() {
   };
 
   const selectedIncident = incidents.find((i) => i.id === selectedIncidentId);
+  const selectedAgent = availableAgents.find((a) => a.id === selectedAgentId) || availableAgents[0];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "2rem" }}>
       {/* 1. Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1rem" }}>
         <div>
-          <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", marginBottom: "0.5rem" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "0.5rem" }}>
             <span
               style={{
                 fontSize: "11px",
                 fontFamily: "var(--font-mono)",
                 color: "var(--near-black-ink)",
-                background: "#edece9",
+                background: "var(--light-warm-gray)",
                 border: "1px solid var(--warm-gray-border)",
                 padding: "2px 7px",
                 borderRadius: "var(--radius-sm)",
@@ -347,15 +384,15 @@ export default function InvestigatePage() {
               style={{
                 fontSize: "11px",
                 fontFamily: "var(--font-mono)",
-                color: "#16a34a",
-                background: "#ecfdf5",
-                border: "1px solid #bbf7d0",
+                color: selectedAgent?.status === "CONNECTED" ? "#16a34a" : "#ca8a04",
+                background: selectedAgent?.status === "CONNECTED" ? "#ecfdf5" : "#fefce8",
+                border: selectedAgent?.status === "CONNECTED" ? "1px solid #bbf7d0" : "1px solid #fef08a",
                 padding: "2px 7px",
                 borderRadius: "var(--radius-sm)",
                 textTransform: "uppercase"
               }}
             >
-              Agent: cloud-hermes · Live
+              Agent: {selectedAgent ? `${selectedAgent.name} (${selectedAgent.type}) · ${selectedAgent.status}` : "Dynamic Agent"}
             </span>
           </div>
           <h1 className="hero-title" style={{ fontSize: "36px", marginBottom: "0.25rem" }}>
@@ -383,7 +420,7 @@ export default function InvestigatePage() {
             className="btn-primary"
             style={{ fontSize: "13px", background: "#b91c1c", borderColor: "#991b1b" }}
           >
-            {isInvestigating ? "Investigating Real Workload..." : "🚀 Launch Live Hermes SRE"}
+            {isInvestigating ? "Investigating Real Workload..." : `🚀 Launch ${selectedAgent?.name || "Agent"}`}
           </button>
 
           {selectedIncident && (
@@ -404,9 +441,32 @@ export default function InvestigatePage() {
       {showConfigPanel && (
         <div className="harvey-card" style={{ padding: "20px", background: "#fdfdfc", border: "1px solid var(--warm-gray-border)" }}>
           <div style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--near-black-ink)", marginBottom: "12px" }}>
-            Dynamic Target Workload Configuration
+            Dynamic Target Workload & Agent Configuration
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "12px", marginBottom: "12px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 1fr 1fr", gap: "12px", marginBottom: "12px" }}>
+            <div>
+              <label style={{ display: "block", fontSize: "11.5px", fontWeight: 500, color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
+                Assigned Agent ({availableAgents.length})
+              </label>
+              {availableAgents.length > 0 ? (
+                <select
+                  value={selectedAgentId}
+                  onChange={(e) => setSelectedAgentId(e.target.value)}
+                  style={{ width: "100%", padding: "8px 10px", fontSize: "13px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warm-gray-border)", background: "#ffffff" }}
+                >
+                  {availableAgents.map((ag) => (
+                    <option key={ag.id} value={ag.id}>
+                      {ag.name} ({ag.type} · {ag.status})
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <div style={{ fontSize: "12px", color: "var(--mid-warm-gray)", padding: "8px 0" }}>
+                  Discovering agents...
+                </div>
+              )}
+            </div>
+
             <div>
               <label style={{ display: "block", fontSize: "11.5px", fontWeight: 500, color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
                 Target Service
@@ -562,7 +622,7 @@ export default function InvestigatePage() {
               No Active Incidents Logged Yet
             </div>
             <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", maxWidth: "560px", margin: "0 auto 16px" }}>
-              The PostgreSQL incident database is clean. Launch an autonomous SRE investigation on workload <strong>{targetService}</strong> ({targetCluster} / {targetRegion}) to dispatch the live <strong>cloud-hermes</strong> agent with real-time AWS telemetry correlation.
+              The PostgreSQL incident database is clean. Launch an autonomous SRE investigation on workload <strong>{targetService}</strong> ({targetCluster} / {targetRegion}) to dispatch <strong>{selectedAgent?.name || "the autonomous agent"}</strong> with real-time AWS telemetry correlation.
             </p>
             <div style={{ display: "flex", gap: "10px", justifyContent: "center" }}>
               <button
@@ -601,7 +661,7 @@ export default function InvestigatePage() {
           </div>
 
           <p style={{ fontSize: "12.5px", color: "var(--mid-warm-gray)", marginBottom: "16px" }}>
-            Real-time diagnostic steps executed by <strong>cloud-hermes</strong> via Server-Sent Events. Diagnostic observations are persisted to PostgreSQL <code>incident_evidence</code>.
+            Real-time diagnostic steps executed by <strong>{selectedAgent?.name || "autonomous agent"}</strong> via Server-Sent Events. Diagnostic observations are persisted to PostgreSQL <code>incident_evidence</code>.
           </p>
 
           {liveSteps.length > 0 ? (

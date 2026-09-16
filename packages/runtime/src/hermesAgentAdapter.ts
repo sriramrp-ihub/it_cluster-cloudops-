@@ -14,8 +14,20 @@ import {
   logger
 } from "@cloudops/shared";
 
+export function cleanLlmOutput(output: string): string {
+  return output
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      return !trimmed.startsWith("[") && !trimmed.startsWith("DEBUG:") && !trimmed.startsWith("INFO:");
+    })
+    .join("\n")
+    .trim();
+}
+
 export function extractJsonFromLlmOutput(output: string): any {
-  const trimmed = output.trim();
+  const cleaned = cleanLlmOutput(output);
+  const trimmed = cleaned.trim();
   try {
     return JSON.parse(trimmed);
   } catch {}
@@ -25,6 +37,30 @@ export function extractJsonFromLlmOutput(output: string): any {
     try {
       return JSON.parse(fenceMatch[1]);
     } catch {}
+  }
+
+  const findingIdx = trimmed.indexOf('"finding"');
+  if (findingIdx !== -1) {
+    const startBrace = trimmed.lastIndexOf("{", findingIdx);
+    if (startBrace !== -1) {
+      let depth = 0;
+      let closingBrace = -1;
+      for (let i = startBrace; i < trimmed.length; i++) {
+        if (trimmed[i] === "{") depth++;
+        else if (trimmed[i] === "}") {
+          depth--;
+          if (depth === 0) {
+            closingBrace = i;
+            break;
+          }
+        }
+      }
+      if (closingBrace !== -1) {
+        try {
+          return JSON.parse(trimmed.substring(startBrace, closingBrace + 1));
+        } catch {}
+      }
+    }
   }
 
   const firstBrace = trimmed.indexOf("{");
@@ -45,6 +81,9 @@ export interface HermesAgentConfig {
   timeoutMs?: number | undefined;
   hermesBin?: string | undefined;
   enableLiveInference?: boolean | undefined;
+  agentName?: string | undefined;
+  model?: string | undefined;
+  provider?: string | undefined;
 }
 
 export class HermesAgentAdapter implements AgentAdapter {
@@ -63,6 +102,9 @@ export class HermesAgentAdapter implements AgentAdapter {
   private timeoutMs: number;
   private hermesBin: string;
   private enableLiveInference: boolean;
+  public agentName?: string | undefined;
+  public activeModel?: string | undefined;
+  public activeProvider?: string | undefined;
 
   constructor(config: HermesAgentConfig = {}) {
     this.endpoint = config.endpoint || process.env.HERMES_URL || "http://127.0.0.1:8080";
@@ -77,10 +119,13 @@ export class HermesAgentAdapter implements AgentAdapter {
       "/Users/user/Desktop/hermes/hermes-agent/hermes";
     this.enableLiveInference =
       config.enableLiveInference ?? (process.env.HERMES_LIVE_INFERENCE !== "false");
+    this.agentName = config.agentName;
+    this.activeModel = config.model;
+    this.activeProvider = config.provider;
   }
 
   /**
-   * Probes the live Hermes daemon for health and active model metadata
+   * Probes the live Hermes daemon for health and active model metadata dynamically
    */
   async checkHermesHealth(): Promise<{
     connected: boolean;
@@ -103,11 +148,15 @@ export class HermesAgentAdapter implements AgentAdapter {
 
       if (res.ok) {
         const data = (await res.json()) as any;
+        const discoveredModel = data?.main?.model || this.activeModel || "agent-runtime";
+        const discoveredProvider = data?.main?.provider || this.activeProvider || "local-daemon";
+        this.activeModel = discoveredModel;
+        this.activeProvider = discoveredProvider;
         return {
           connected: true,
           endpoint: this.endpoint,
-          model: data?.main?.model || "nemotron-3-ultra",
-          provider: data?.main?.provider || "ollama-cloud"
+          model: discoveredModel,
+          provider: discoveredProvider
         };
       }
 
@@ -144,7 +193,8 @@ export class HermesAgentAdapter implements AgentAdapter {
       }
     );
 
-    return stdout.trim();
+    const cleaned = cleanLlmOutput(stdout);
+    return cleaned || stdout.trim();
   }
 
   async start(context: AgentExecutionContext): Promise<AgentSession> {
@@ -192,8 +242,8 @@ export class HermesAgentAdapter implements AgentAdapter {
       data: {
         status: "ACTIVE",
         agentType: "hermes",
-        model: health.model || "nemotron-3-ultra",
-        provider: health.provider || "ollama-cloud",
+        model: health.model || this.activeModel || "agent-runtime",
+        provider: health.provider || this.activeProvider || "local-daemon",
         message: `Hermes Live Agent connected on ${this.endpoint}`
       }
     });
@@ -480,7 +530,13 @@ export class HermesAgentAdapter implements AgentAdapter {
 
     if (this.enableLiveInference || incidentContext?.liveInference) {
       try {
-        const inferencePrompt = `You are CloudOps Autonomous SRE Agent powered by Hermes and Nemotron-3.
+        if (!this.activeModel) {
+          await this.checkHermesHealth();
+        }
+        const effectiveModel = this.activeModel || "agent-runtime";
+        const effectiveAgentName = this.agentName || "CloudOps Autonomous SRE Agent";
+
+        const inferencePrompt = `You are ${effectiveAgentName} (${effectiveModel}).
 Analyze the following telemetry collected for service "${targetService}" in cluster "${targetCluster}" (${targetRegion}):
 Alert: ${incidentContext?.alertDescription || "ECS service health anomaly"}
 
@@ -532,7 +588,7 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
               riskLevel = "HIGH";
             }
           }
-          dataSource = "live:hermes:nemotron-3";
+          dataSource = `live:${this.adapterType}:${effectiveModel}`;
           hermesInferenceSucceeded = true;
 
           this.emitEvent(sessionId, {
@@ -541,9 +597,9 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
             timestamp: new Date(),
             data: {
               step: 4,
-              toolName: "hermes_neural_reasoning",
-              observation: `Hermes Agent synthesized root cause: ${finding}`,
-              model: "nemotron-3-ultra"
+              toolName: `${this.adapterType}_neural_reasoning`,
+              observation: `${effectiveAgentName} synthesized root cause: ${finding}`,
+              model: effectiveModel
             }
           });
         }
