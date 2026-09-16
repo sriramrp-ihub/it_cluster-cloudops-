@@ -120,7 +120,7 @@ export default function JoinRequestsPage() {
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
           <button onClick={loadRequests} disabled={loading} className="btn-secondary" style={{ fontSize: "13px" }}>
-            {loading ? "Refreshing..." : "↻ Refresh Queue"}
+            {loading ? "Refreshing..." : "Refresh Queue"}
           </button>
           <Link href="/agents/add" className="btn-primary" style={{ fontSize: "13px" }}>
             + Onboard Agent
@@ -198,7 +198,12 @@ export default function JoinRequestsPage() {
         </div>
       ) : filteredRequests.length === 0 ? (
         <div className="harvey-card" style={{ padding: "48px 24px", textAlign: "center", border: "1px dashed var(--warm-gray-border)" }}>
-          <div style={{ fontSize: "28px", marginBottom: "8px" }}>📬</div>
+          <div style={{ width: "44px", height: "44px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px", color: "var(--mid-warm-gray)" }}>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+              <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+              <polyline points="22,6 12,13 2,6" />
+            </svg>
+          </div>
           <div style={{ fontWeight: 600, fontSize: "16px", color: "var(--near-black-ink)", marginBottom: "4px" }}>
             No Join Requests Found
           </div>
@@ -283,28 +288,30 @@ export default function JoinRequestsPage() {
                             className="btn-primary"
                             style={{ fontSize: "12px", padding: "4px 10px" }}
                           >
-                            Review Request →
+                            Review Request
                           </Link>
                           <button
                             onClick={() => handleQuickApprove(req.id)}
                             className="btn-secondary"
                             style={{ fontSize: "12px", padding: "4px 8px" }}
+                            title="Approve"
                           >
-                            ✓
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
                           </button>
                           <button
                             onClick={() => handleQuickReject(req.id)}
                             className="btn-secondary"
                             style={{ fontSize: "12px", padding: "4px 8px", color: "var(--status-danger-text)" }}
+                            title="Reject"
                           >
-                            ✕
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
                           </button>
                         </div>
                       ) : req.status === "APPROVED" ? (
                         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                           {req.agentId ? (
                             <Link href={`/agents/${req.agentId}`} className="btn-secondary" style={{ fontSize: "11px", padding: "3px 8px" }}>
-                              View Dossier ({req.agentId.slice(0, 10)}...) →
+                              View Dossier ({req.agentId.slice(0, 10)}...)
                             </Link>
                           ) : (
                             <span style={{ fontSize: "12px", color: "#16a34a" }}>Approved</span>
@@ -326,7 +333,11 @@ export default function JoinRequestsPage() {
 
       {/* Security Invariant Callout */}
       <div className="alert-banner info">
-        <div style={{ fontSize: "18px" }}>🛡️</div>
+        <div style={{ display: "flex", alignItems: "center", color: "var(--near-black-ink)" }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+          </svg>
+        </div>
         <div>
           <div style={{ fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "3px" }}>
             Operational Security Principle: Declared Capabilities ≠ Authorized Privileges

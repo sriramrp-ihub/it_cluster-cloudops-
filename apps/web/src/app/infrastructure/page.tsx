@@ -146,8 +146,9 @@ export default function InfrastructurePage() {
             justifyContent: "space-between"
           }}
         >
+          {/* Control plane reachability error banner */}
           <span>
-            ⚠️ <strong>Control Plane API Offline:</strong> Could not connect to API server at http://localhost:3000. Start it with <code>npm run dev:api</code>.
+            <strong>Connection Notice:</strong> Unable to reach the CloudOps control plane service.
           </span>
           <button
             type="button"
@@ -213,7 +214,7 @@ export default function InfrastructurePage() {
             className="btn-secondary"
             style={{ fontSize: "13px" }}
           >
-            Ask CloudOps about Infrastructure →
+            Ask CloudOps about Infrastructure
           </button>
           <button
             type="button"
@@ -231,7 +232,6 @@ export default function InfrastructurePage() {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1.5rem", marginBottom: "16px" }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "6px" }}>
-              <span style={{ fontSize: "20px" }}>☁️</span>
               <h2 style={{ fontFamily: "var(--font-serif)", fontSize: "22px", fontWeight: 400, color: "var(--near-black-ink)", margin: 0 }}>
                 Cloud Environments
               </h2>
@@ -242,7 +242,7 @@ export default function InfrastructurePage() {
           </div>
 
           <Link href="/cloud/connect" className="btn-secondary" style={{ fontSize: "12px" }}>
-            Configure Providers →
+            Configure Providers
           </Link>
         </div>
 
@@ -265,7 +265,9 @@ export default function InfrastructurePage() {
           >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                <span style={{ fontSize: "24px" }}>☁️</span>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--muted-gray)" }}>
+                  <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+                </svg>
                 <div>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                     <span style={{ fontWeight: 700, fontSize: "16px", color: "var(--near-black-ink)" }}>
@@ -303,7 +305,7 @@ export default function InfrastructurePage() {
                   className="btn-secondary"
                   style={{ fontSize: "12px", padding: "6px 12px" }}
                 >
-                  {loadingWorkloads ? "Scanning..." : "↻ Refresh Discovery"}
+                  {loadingWorkloads ? "Scanning..." : "Refresh Discovery"}
                 </button>
                 <Link
                   href="/cloud/connect"
@@ -375,8 +377,10 @@ export default function InfrastructurePage() {
               textAlign: "center"
             }}
           >
-            <div style={{ width: "40px", height: "40px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "18px", marginBottom: "12px" }}>
-              ☁️
+            <div style={{ width: "40px", height: "40px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: "12px" }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--muted-gray)" }}>
+                <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+              </svg>
             </div>
             <div style={{ fontSize: "16px", fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "4px" }}>
               No Cloud Environments Connected Yet
@@ -391,7 +395,7 @@ export default function InfrastructurePage() {
                 className="btn-primary"
                 style={{ fontSize: "13px" }}
               >
-                Connect Cloud Account →
+                Connect Cloud Account
               </button>
               <button
                 type="button"
@@ -399,7 +403,7 @@ export default function InfrastructurePage() {
                 className="btn-secondary"
                 style={{ fontSize: "13px" }}
               >
-                Ask Agent to Verify →
+                Ask Agent to Verify
               </button>
             </div>
           </div>
@@ -501,12 +505,11 @@ export default function InfrastructurePage() {
         {/* Workload Content Area */}
         {loadingWorkloads ? (
           <div style={{ textAlign: "center", padding: "40px 16px", color: "var(--mid-warm-gray)" }}>
-            <div style={{ fontSize: "20px", marginBottom: "8px" }}>⚡</div>
             <div style={{ fontSize: "14px", fontWeight: 500, color: "var(--near-black-ink)" }}>
-              Scanning AWS {connectedAccount?.region} across ECS, EC2, RDS, and S3...
+              Scanning {connectedAccount?.region} across ECS, EC2, RDS, and S3...
             </div>
             <div style={{ fontSize: "12.5px", color: "var(--mid-warm-gray)", marginTop: "4px" }}>
-              Executing bounded discovery queries via active temporary STS session.
+              Executing bounded discovery queries via active session.
             </div>
           </div>
         ) : !connectedAccount ? (
@@ -542,7 +545,7 @@ export default function InfrastructurePage() {
               className="btn-primary"
               style={{ fontSize: "13px" }}
             >
-              Reconnect AWS Session →
+              Reconnect AWS Session
             </button>
           </div>
         ) : filteredWorkloads.length > 0 ? (
@@ -649,7 +652,7 @@ export default function InfrastructurePage() {
                         className="btn-secondary"
                         style={{ fontSize: "11.5px", padding: "4px 8px" }}
                       >
-                        Inspect →
+                        Inspect
                       </Link>
                     </td>
                   </tr>
@@ -668,12 +671,11 @@ export default function InfrastructurePage() {
               borderRadius: "var(--radius-sm)"
             }}
           >
-            <div style={{ fontSize: "18px", marginBottom: "8px" }}>🔍</div>
             <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "4px" }}>
               No Workloads Discovered in {connectedAccount.region}
             </div>
             <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", maxWidth: "520px", margin: "0 auto 16px auto", lineHeight: 1.5 }}>
-              Connected to AWS Account <span className="mono">{connectedAccount.accountId}</span>. No active or paused ECS services, EC2 compute instances, or RDS databases were found in region <span className="mono">{connectedAccount.region}</span>.
+              Connected to Account <span className="mono">{connectedAccount.accountId}</span>. No active or paused ECS services, EC2 compute instances, or RDS databases were found in region <span className="mono">{connectedAccount.region}</span>.
             </p>
             <div style={{ display: "flex", justifyContent: "center", gap: "10px" }}>
               <button
@@ -682,7 +684,7 @@ export default function InfrastructurePage() {
                 className="btn-secondary"
                 style={{ fontSize: "13px" }}
               >
-                ↻ Re-scan {connectedAccount.region}
+                Rescan {connectedAccount.region}
               </button>
               <Link href="/cloud/connect" className="btn-primary" style={{ fontSize: "13px" }}>
                 Switch Region / Settings

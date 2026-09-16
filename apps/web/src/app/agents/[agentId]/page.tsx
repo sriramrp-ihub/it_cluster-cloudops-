@@ -86,7 +86,7 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
           <div>{errorMsg || "Agent not found"}</div>
         </div>
         <Link href="/agents" className="btn-secondary" style={{ width: "fit-content" }}>
-          ← Return to Fleet Directory
+          Return to Fleet Directory
         </Link>
       </div>
     );
@@ -108,14 +108,14 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
           <button onClick={loadAgentData} className="btn-secondary" style={{ fontSize: "13px" }}>
-            ↻ Refresh
+            Refresh
           </button>
           <button
             onClick={() => openChat(`Ask ${agent.name} to report operational status`)}
             className="btn-primary"
             style={{ fontSize: "13px" }}
           >
-            Inquire with Agent →
+            Inquire with Agent
           </button>
           <button
             type="button"
@@ -155,7 +155,7 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
                   className="btn-secondary"
                   style={{ padding: "2px 6px", fontSize: "11px" }}
                 >
-                  {copied ? "✓ Copied" : "Copy"}
+                  {copied ? "Copied" : "Copy"}
                 </button>
               </div>
               <span style={{ color: "var(--warm-gray-border)" }}>•</span>
@@ -348,7 +348,7 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
             className="btn-secondary"
             style={{ fontSize: "12.5px" }}
           >
-            Launch Investigation with Agent →
+            Launch Investigation with Agent
           </button>
         </div>
       )}
@@ -377,7 +377,9 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}>
                 <span style={{ color: "var(--mid-warm-gray)" }}>Protocol Handshake:</span>
-                <span style={{ color: "#16a34a", fontWeight: 500 }}>AUTH → AUTH_ACK (Nonce Exchanged)</span>
+                <span style={{ color: "#16a34a", fontWeight: 500, display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                  AUTH <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg> AUTH_ACK (Nonce Exchanged)
+                </span>
               </div>
             </div>
           </div>
@@ -433,7 +435,11 @@ export default function AgentDossierPage({ params }: { params: Promise<{ agentId
             onClick={(e) => e.stopPropagation()}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
-              <span style={{ fontSize: "20px" }}>⚠️</span>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/>
+                <line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
               <h3 style={{ fontFamily: "var(--font-serif)", fontSize: "20px", margin: 0, color: "var(--near-black-ink)" }}>
                 Delete Operational Agent?
               </h3>

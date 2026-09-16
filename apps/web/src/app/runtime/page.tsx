@@ -17,7 +17,7 @@ export default function RuntimeRedirect() {
         Redirecting to Agent Diagnostics at <code className="code-inline">/agents/diagnostics</code>...
       </p>
       <Link href="/agents/diagnostics" className="btn-primary">
-        Go to Diagnostics →
+        Go to Diagnostics
       </Link>
     </div>
   );

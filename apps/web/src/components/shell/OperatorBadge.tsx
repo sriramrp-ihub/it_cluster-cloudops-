@@ -29,7 +29,7 @@ export function OperatorBadge() {
       >
         <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: "#60a5fa" }} />
         <span>{session.operatorName}</span>
-        <span style={{ fontSize: "10px", color: "#a8a29e" }}>▼</span>
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#a8a29e" strokeWidth="2.5"><polyline points="6 9 12 15 18 9" /></svg>
       </button>
 
       {open && (

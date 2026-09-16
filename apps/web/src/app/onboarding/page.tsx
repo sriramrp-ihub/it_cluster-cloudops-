@@ -17,7 +17,7 @@ export default function OnboardingRedirect() {
         Redirecting to the new DevOps Agent Onboarding flow at <code className="code-inline">/agents/add</code>...
       </p>
       <Link href="/agents/add" className="btn-primary">
-        Go to Add Agent →
+        Go to Add Agent
       </Link>
     </div>
   );

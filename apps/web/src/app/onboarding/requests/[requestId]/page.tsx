@@ -19,7 +19,7 @@ export default function OnboardingRequestRedirect({ params }: { params: Promise<
         Redirecting to Join Request review at <code className="code-inline">/agents/join-requests/{requestId}</code>...
       </p>
       <Link href={`/agents/join-requests/${requestId}`} className="btn-primary">
-        Go to Review →
+        Go to Review
       </Link>
     </div>
   );

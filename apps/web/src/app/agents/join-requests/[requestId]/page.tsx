@@ -93,7 +93,7 @@ export default function AgentJoinRequestReviewPage({ params }: { params: Promise
           <div>{errorMsg}</div>
         </div>
         <Link href="/agents/join-requests" className="btn-secondary" style={{ width: "fit-content" }}>
-          ← Return to Join Requests
+          Return to Join Requests
         </Link>
       </div>
     );
@@ -116,7 +116,7 @@ export default function AgentJoinRequestReviewPage({ params }: { params: Promise
         </div>
 
         <Link href="/agents/join-requests" className="btn-secondary" style={{ fontSize: "13px", padding: "4px 12px" }}>
-          ← Back to Requests
+          Back to Requests
         </Link>
       </div>
 
@@ -211,7 +211,7 @@ export default function AgentJoinRequestReviewPage({ params }: { params: Promise
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                    <span style={{ color: "#16a34a", fontSize: "15px", fontWeight: 700 }}>✓</span>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
                     <span className="code-inline" style={{ fontSize: "13px", fontWeight: 500 }}>
                       {cap}
                     </span>
@@ -240,7 +240,7 @@ export default function AgentJoinRequestReviewPage({ params }: { params: Promise
                   className="btn-primary"
                   style={{ padding: "10px 24px", fontSize: "14px" }}
                 >
-                  {submitting ? "Approving..." : "✓ Approve Agent"}
+                  {submitting ? "Approving..." : "Approve Agent"}
                 </button>
                 <button
                   onClick={() => setShowRejectForm(true)}
@@ -290,13 +290,13 @@ export default function AgentJoinRequestReviewPage({ params }: { params: Promise
           <div style={{ borderTop: "1px solid var(--warm-gray-border)", paddingTop: "18px" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "1rem" }}>
               <div style={{ color: "#16a34a", fontWeight: 600, fontSize: "14px", display: "flex", alignItems: "center", gap: "6px" }}>
-                <span>✓</span>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
                 <span>Request Approved. Sovereign identity minted:</span>
                 <span className="code-inline">{request.agentId}</span>
               </div>
               {request.agentId && (
                 <Link href={`/agents/${request.agentId}`} className="btn-secondary" style={{ fontSize: "13px" }}>
-                  Open Agent Dossier →
+                  Open Agent Dossier
                 </Link>
               )}
             </div>
@@ -310,7 +310,11 @@ export default function AgentJoinRequestReviewPage({ params }: { params: Promise
 
       {/* Invariant Footer */}
       <div className="alert-banner info">
-        <div style={{ fontSize: "18px" }}>🛡️</div>
+        <div style={{ display: "flex", alignItems: "center", color: "var(--near-black-ink)" }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+          </svg>
+        </div>
         <div>
           <div style={{ fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "3px" }}>
             Operator Governance: Declared ≠ Authorized

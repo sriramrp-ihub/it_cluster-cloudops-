@@ -94,7 +94,7 @@ export default async function HomePage() {
           <div style={{ marginTop: "8px", fontSize: "12.5px" }}>
             {cloudWorkloadCount > 0 ? (
               <Link href="/infrastructure" style={{ color: "var(--near-black-ink)", textDecoration: "underline" }}>
-                View Discovered Workloads ({cloudWorkloadCount}) →
+                View Discovered Workloads ({cloudWorkloadCount})
               </Link>
             ) : (
               <Link href="/cloud/connect" style={{ color: "var(--near-black-ink)", textDecoration: "underline" }}>
@@ -117,7 +117,7 @@ export default async function HomePage() {
           </div>
           <div style={{ marginTop: "8px", fontSize: "12.5px" }}>
             <Link href="/agents" style={{ color: "var(--near-black-ink)", textDecoration: "underline" }}>
-              Manage Fleet ({agents.length}) →
+              Manage Fleet ({agents.length})
             </Link>
           </div>
         </div>
@@ -135,7 +135,7 @@ export default async function HomePage() {
           </div>
           <div style={{ marginTop: "8px", fontSize: "12.5px" }}>
             <Link href="/approvals" style={{ color: "var(--near-black-ink)", textDecoration: "underline" }}>
-              View Approvals & Queue →
+              View Approvals & Queue
             </Link>
           </div>
         </div>
@@ -180,7 +180,7 @@ export default async function HomePage() {
                   className="btn-primary"
                   style={{ fontSize: "12.5px", padding: "6px 14px" }}
                 >
-                  Review Access Request →
+                  Review Access Request
                 </Link>
               </div>
             ))}
@@ -198,7 +198,9 @@ export default async function HomePage() {
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <span style={{ color: "#16a34a", fontSize: "16px" }}>✓</span>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
               <div>
                 <div style={{ fontWeight: 600, fontSize: "14px", color: "var(--near-black-ink)" }}>
                   All systems operational
@@ -210,7 +212,7 @@ export default async function HomePage() {
             </div>
 
             <Link href="/infrastructure" className="btn-secondary" style={{ fontSize: "12px" }}>
-              Inspect Infrastructure →
+              Inspect Infrastructure
             </Link>
           </div>
         )}
@@ -245,7 +247,7 @@ export default async function HomePage() {
               Connect an autonomous CloudOps agent (e.g. Hermes SRE or OpenClaw) to begin autonomous investigation and monitoring.
             </p>
             <Link href="/agents/add" className="btn-primary" style={{ fontSize: "13px" }}>
-              Onboard First Agent →
+              Onboard First Agent
             </Link>
           </div>
         ) : (
@@ -303,7 +305,7 @@ export default async function HomePage() {
                     </td>
                     <td style={{ textAlign: "right" }}>
                       <Link href={`/agents/${agent.id}`} className="btn-secondary" style={{ fontSize: "11px", padding: "3px 8px" }}>
-                        View Dossier →
+                        View Dossier
                       </Link>
                     </td>
                   </tr>

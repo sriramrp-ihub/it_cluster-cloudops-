@@ -410,7 +410,7 @@ export default function InvestigatePage() {
             className="btn-secondary"
             style={{ fontSize: "13px" }}
           >
-            {showConfigPanel ? "Hide Target Settings" : "⚙ Target Settings"}
+            {showConfigPanel ? "Hide Settings" : "Target Settings"}
           </button>
 
           <button
@@ -420,7 +420,7 @@ export default function InvestigatePage() {
             className="btn-primary"
             style={{ fontSize: "13px", background: "#b91c1c", borderColor: "#991b1b" }}
           >
-            {isInvestigating ? "Investigating Real Workload..." : `🚀 Launch ${selectedAgent?.name || "Agent"}`}
+            {isInvestigating ? "Investigating..." : `Launch ${selectedAgent?.name || "Investigation"}`}
           </button>
 
           {selectedIncident && (
@@ -431,7 +431,7 @@ export default function InvestigatePage() {
               className="btn-secondary"
               style={{ fontSize: "13px" }}
             >
-              ▶ Re-investigate Selected
+              Re-investigate Selected
             </button>
           )}
         </div>
@@ -621,8 +621,9 @@ export default function InvestigatePage() {
             <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "6px" }}>
               No Active Incidents Logged Yet
             </div>
+            {/* Database empty state: incidents stored in postgresql incident table */}
             <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", maxWidth: "560px", margin: "0 auto 16px" }}>
-              The PostgreSQL incident database is clean. Launch an autonomous SRE investigation on workload <strong>{targetService}</strong> ({targetCluster} / {targetRegion}) to dispatch <strong>{selectedAgent?.name || "the autonomous agent"}</strong> with real-time AWS telemetry correlation.
+              No active incidents recorded for this workspace. Select a workload and launch an investigation to inspect runtime diagnostics.
             </p>
             <div style={{ display: "flex", gap: "10px", justifyContent: "center" }}>
               <button
@@ -631,7 +632,7 @@ export default function InvestigatePage() {
                 className="btn-secondary"
                 style={{ fontSize: "13px" }}
               >
-                {showConfigPanel ? "Hide Target Settings" : "⚙ Target Settings"}
+                {showConfigPanel ? "Hide Settings" : "Target Settings"}
               </button>
               <button
                 type="button"
@@ -640,7 +641,7 @@ export default function InvestigatePage() {
                 className="btn-primary"
                 style={{ fontSize: "13px" }}
               >
-                🚀 Launch Autonomous SRE Investigation
+                Launch Investigation
               </button>
             </div>
           </div>
@@ -656,12 +657,13 @@ export default function InvestigatePage() {
               Live Agent Execution Stream
             </div>
             <span className="status-pill active" style={{ fontSize: "10.5px" }}>
-              {isInvestigating ? "● Live SSE Connected" : "Stream Idle"}
+              {isInvestigating ? "Live Stream Active" : "Stream Idle"}
             </span>
           </div>
 
+          {/* Real-time diagnostic steps stream; observations persisted to incident_evidence */}
           <p style={{ fontSize: "12.5px", color: "var(--mid-warm-gray)", marginBottom: "16px" }}>
-            Real-time diagnostic steps executed by <strong>{selectedAgent?.name || "autonomous agent"}</strong> via Server-Sent Events. Diagnostic observations are persisted to PostgreSQL <code>incident_evidence</code>.
+            Real-time diagnostic events and telemetry correlation for active workloads.
           </p>
 
           {liveSteps.length > 0 ? (
@@ -683,7 +685,7 @@ export default function InvestigatePage() {
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "12.5px", fontWeight: 600 }}>
                         <span style={{ color: step.status === "running" ? "#d97706" : "#16a34a" }}>
-                          {step.status === "running" ? "⏳ Running Step " + step.step + ":" : "✓ Step " + step.step + ":"}
+                          {step.status === "running" ? "Running Step " + step.step + ":" : "Step " + step.step + ":"}
                         </span>
                         <code>{step.toolName}</code>
                       </div>
@@ -714,7 +716,7 @@ export default function InvestigatePage() {
             <div style={{ textAlign: "center", padding: "40px 20px", color: "var(--mid-warm-gray)", fontSize: "13px" }}>
               {isInvestigating
                 ? "Connecting to live agent session stream..."
-                : "No investigation running. Click 'Trigger Failure & Run Hermes SRE' above to launch."}
+                : "No active investigation session in progress."}
             </div>
           )}
         </div>
@@ -780,7 +782,7 @@ export default function InvestigatePage() {
                         cursor: "pointer"
                       }}
                     >
-                      🔗 {evId}
+                      {evId}
                     </button>
                   ))}
                 </div>
@@ -823,7 +825,7 @@ export default function InvestigatePage() {
                     className="btn-primary"
                     style={{ fontSize: "12.5px", display: "inline-block", textDecoration: "none" }}
                   >
-                    Authorize Remediation in Approvals Queue →
+                    Authorize Remediation in Approvals Queue
                   </Link>
                 </div>
               )}

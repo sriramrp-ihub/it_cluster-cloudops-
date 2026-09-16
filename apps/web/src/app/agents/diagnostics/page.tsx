@@ -123,7 +123,7 @@ export default function AgentDiagnosticsPage() {
     const frame = {
       type: "AUTH",
       authType: authTypeInput,
-      credential: authCredentialInput || (authTypeInput === "RUNTIME" && runtimeSecret ? runtimeSecret : "co_agent_mock_test_token"),
+      credential: authCredentialInput || (authTypeInput === "RUNTIME" && runtimeSecret ? runtimeSecret : ""),
       runtimeInfo: {
         name: "diagnostics-console-harness",
         version: "1.0.0",
@@ -339,11 +339,11 @@ export default function AgentDiagnosticsPage() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
             <h3 className="panel-title">Active Gateway Sessions</h3>
             <button onClick={loadAgents} className="btn-secondary" style={{ fontSize: "11px", padding: "3px 8px" }}>
-              ↻ Refresh
+              Refresh
             </button>
           </div>
           <p className="body-subtle" style={{ marginBottom: "16px" }}>
-            Agents currently holding verified live sessions in PostgreSQL table <code className="code-inline">agent_sessions</code>.
+            Agents currently holding verified active sessions with the gateway control plane.
           </p>
 
           {connectedAgents.length === 0 ? (

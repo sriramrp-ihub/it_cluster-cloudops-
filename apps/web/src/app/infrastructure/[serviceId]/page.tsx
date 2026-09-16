@@ -87,7 +87,7 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
         </div>
 
         <Link href="/infrastructure" className="btn-secondary" style={{ fontSize: "12.5px" }}>
-          ← Back to Services
+          Back to Services
         </Link>
       </div>
 
@@ -127,7 +127,7 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
               className="btn-primary"
               style={{ fontSize: "13px", textDecoration: "none" }}
             >
-              Open in Investigations Dashboard →
+              Open in Investigations Dashboard
             </Link>
           </div>
         </div>
@@ -228,7 +228,7 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
                     className="btn-secondary"
                     style={{ fontSize: "13px", textDecoration: "none" }}
                   >
-                    🔍 Investigate Incident
+                    Investigate Incident
                   </Link>
                   <button
                     type="button"
@@ -236,7 +236,7 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
                     className="btn-secondary"
                     style={{ fontSize: "13px" }}
                   >
-                    📊 Check Real Telemetry
+                    Inspect Telemetry
                   </button>
                 </div>
               </div>

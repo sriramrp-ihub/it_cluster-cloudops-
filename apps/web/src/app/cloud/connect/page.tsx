@@ -129,7 +129,9 @@ export default function ConnectCloudPage() {
                 Active in-memory STS session verified via GetCallerIdentity. Zero credentials stored in database.
               </p>
             </div>
-            <span style={{ fontSize: "24px" }}>☁️</span>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--muted-gray)" }}>
+              <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+            </svg>
           </div>
 
           <div
@@ -228,7 +230,9 @@ export default function ConnectCloudPage() {
                   <h4 style={{ fontSize: "17px", fontWeight: 700, margin: 0, color: "var(--near-black-ink)" }}>
                     Amazon Web Services
                   </h4>
-                  <span style={{ fontSize: "20px" }}>☁️</span>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--muted-gray)" }}>
+                    <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+                  </svg>
                 </div>
                 <div style={{ fontSize: "12px", color: "var(--mid-warm-gray)", marginBottom: "12px" }}>
                   ECS, EKS, RDS, S3, CloudWatch
@@ -343,7 +347,11 @@ export default function ConnectCloudPage() {
           alignItems: "flex-start"
         }}
       >
-        <span style={{ fontSize: "20px", marginTop: "2px" }}>🛡️</span>
+        <div style={{ marginTop: "2px", color: "var(--muted-gray)" }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+          </svg>
+        </div>
         <div>
           <div style={{ fontWeight: 600, color: "var(--near-black-ink)", fontSize: "14px", marginBottom: "4px" }}>
             Zero Credential Persistence Security Boundary

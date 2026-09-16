@@ -208,7 +208,10 @@ export function AwsConnectModal({
               padding: "4px 8px"
             }}
           >
-            ✕
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
           </button>
         </div>
 
@@ -224,7 +227,11 @@ export function AwsConnectModal({
             borderRadius: "var(--radius-sm)"
           }}
         >
-          <div style={{ fontSize: "16px", marginTop: "1px" }}>🛡️</div>
+          <div style={{ color: "var(--muted-gray)", marginTop: "1px" }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+            </svg>
+          </div>
           <div style={{ fontSize: "12px", color: "var(--near-black-ink)", lineHeight: 1.45 }}>
             Credentials are used strictly in-memory by the backend to establish a temporary STS session and are never stored in your browser or local storage.
           </div>
@@ -244,7 +251,9 @@ export function AwsConnectModal({
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "#166534", fontWeight: 600 }}>
-              <span>✓</span>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#166534" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
               <span>AWS Account Connected Successfully</span>
             </div>
             <div style={{ fontSize: "13px", color: "var(--near-black-ink)" }}>

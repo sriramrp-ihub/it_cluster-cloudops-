@@ -129,7 +129,7 @@ export default function LoginPage() {
             className="btn-primary"
             style={{ width: "100%", padding: "10px", fontSize: "15px" }}
           >
-            {submitting ? "Authenticating Operator..." : "Authenticate & Enter Control Plane →"}
+            {submitting ? "Authenticating Operator..." : "Authenticate & Enter Control Plane"}
           </button>
         </form>
 

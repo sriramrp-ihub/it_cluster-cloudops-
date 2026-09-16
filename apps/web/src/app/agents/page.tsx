@@ -96,7 +96,7 @@ export default function AgentsFleetPage() {
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
           <Link href="/agents/join-requests" className="btn-secondary" style={{ fontSize: "13px" }}>
-            Join Requests Queue →
+            Join Requests Queue
           </Link>
           <Link href="/agents/add" className="btn-primary" style={{ fontSize: "13px" }}>
             + Add Agent
@@ -112,7 +112,10 @@ export default function AgentsFleetPage() {
       )}
       {successMsg && (
         <div className="alert-banner" style={{ background: "#ecfdf5", border: "1px solid #6ee7b7", color: "#065f46" }}>
-          <div>✓ {successMsg}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+            <span>{successMsg}</span>
+          </div>
         </div>
       )}
 
@@ -155,7 +158,7 @@ export default function AgentsFleetPage() {
                     className="btn-primary"
                     style={{ flex: 1, fontSize: "12.5px", justifyContent: "center" }}
                   >
-                    View Agent Dossier →
+                    View Agent Dossier
                   </Link>
                   <button
                     type="button"
@@ -208,15 +211,26 @@ export default function AgentsFleetPage() {
               className="btn-secondary"
               style={{ fontSize: "13px", padding: "6px 12px" }}
             >
-              {loading ? "..." : "↻ Refresh"}
+              {loading ? "..." : "Refresh"}
             </button>
           </div>
         </div>
 
         {agents.length === 0 ? (
           <div style={{ textAlign: "center", padding: "48px 24px" }}>
-            <div style={{ width: "44px", height: "44px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "20px", marginBottom: "12px" }}>
-              🤖
+            <div style={{ width: "44px", height: "44px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: "12px", color: "var(--mid-warm-gray)" }}>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                <rect x="4" y="4" width="16" height="16" rx="2" />
+                <rect x="9" y="9" width="6" height="6" />
+                <line x1="9" y1="1" x2="9" y2="4" />
+                <line x1="15" y1="1" x2="15" y2="4" />
+                <line x1="9" y1="20" x2="9" y2="23" />
+                <line x1="15" y1="20" x2="15" y2="23" />
+                <line x1="20" y1="9" x2="23" y2="9" />
+                <line x1="20" y1="14" x2="23" y2="14" />
+                <line x1="1" y1="9" x2="4" y2="9" />
+                <line x1="1" y1="14" x2="4" y2="14" />
+              </svg>
             </div>
             <div style={{ fontFamily: "var(--font-serif)", fontSize: "20px", color: "var(--near-black-ink)", marginBottom: "6px" }}>
               No agents connected yet.
@@ -288,7 +302,7 @@ export default function AgentsFleetPage() {
                           className="btn-secondary"
                           style={{ padding: "4px 10px", fontSize: "12px" }}
                         >
-                          View Dossier →
+                          View Dossier
                         </Link>
                         <button
                           type="button"
@@ -337,7 +351,11 @@ export default function AgentsFleetPage() {
             onClick={(e) => e.stopPropagation()}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
-              <span style={{ fontSize: "20px" }}>⚠️</span>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/>
+                <line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
               <h3 style={{ fontFamily: "var(--font-serif)", fontSize: "20px", margin: 0, color: "var(--near-black-ink)" }}>
                 Delete Operational Agent?
               </h3>

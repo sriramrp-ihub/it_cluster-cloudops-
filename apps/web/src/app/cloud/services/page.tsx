@@ -38,8 +38,10 @@ export default function ServicesCatalogPage() {
 
       {/* Honest Empty State */}
       <div className="harvey-card" style={{ padding: "48px 24px", textAlign: "center" }}>
-        <div style={{ width: "48px", height: "48px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "20px", marginBottom: "16px" }}>
-          ☁️
+        <div style={{ width: "48px", height: "48px", borderRadius: "50%", background: "#edece9", display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: "16px" }}>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--muted-gray)" }}>
+            <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+          </svg>
         </div>
         <h2 style={{ fontFamily: "var(--font-serif)", fontSize: "24px", color: "var(--near-black-ink)", marginBottom: "8px", fontWeight: 400 }}>
           No Cloud Infrastructure Connected Yet
@@ -50,7 +52,7 @@ export default function ServicesCatalogPage() {
 
         <div style={{ display: "flex", justifyContent: "center", gap: "12px" }}>
           <Link href="/cloud/connect" className="btn-primary">
-            Connect Cloud Account →
+            Connect Cloud Account
           </Link>
           <Link href="/agents" className="btn-secondary">
             View Operational Agents

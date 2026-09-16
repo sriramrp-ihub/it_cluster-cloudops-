@@ -109,7 +109,10 @@ export function CloudOpsAgentChat() {
               title="Close drawer (Esc)"
               aria-label="Close drawer"
             >
-              ✕
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
             </button>
           </div>
         </div>
@@ -141,14 +144,14 @@ export function CloudOpsAgentChat() {
 
               {/* Suggested Prompts */}
               <div className="suggested-prompts-container">
-                <div className="suggested-prompt-category">Infrastructure & Health</div>
+                <div className="suggested-prompt-category">Health & Outages</div>
                 <button
                   type="button"
                   onClick={() => handleSelectPrompt("What services are unhealthy?")}
                   className="suggested-prompt-btn"
                 >
                   <span>"What services are unhealthy?"</span>
-                  <span className="arrow">→</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="arrow"><polyline points="9 18 15 12 9 6" /></svg>
                 </button>
 
                 <div className="suggested-prompt-category">Deployments & Readiness</div>
@@ -158,7 +161,7 @@ export function CloudOpsAgentChat() {
                   className="suggested-prompt-btn"
                 >
                   <span>"Give me a Fargate deployment checklist."</span>
-                  <span className="arrow">→</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="arrow"><polyline points="9 18 15 12 9 6" /></svg>
                 </button>
 
                 <div className="suggested-prompt-category">Investigation</div>
@@ -168,7 +171,7 @@ export function CloudOpsAgentChat() {
                   className="suggested-prompt-btn"
                 >
                   <span>"Is starvision-motors healthy?"</span>
-                  <span className="arrow">→</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="arrow"><polyline points="9 18 15 12 9 6" /></svg>
                 </button>
 
                 <div className="suggested-prompt-category">Operations & Changes</div>
@@ -178,7 +181,7 @@ export function CloudOpsAgentChat() {
                   className="suggested-prompt-btn"
                 >
                   <span>"What changed in production recently?"</span>
-                  <span className="arrow">→</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="arrow"><polyline points="9 18 15 12 9 6" /></svg>
                 </button>
 
                 <div className="suggested-prompt-category">Security & Compliance</div>
@@ -188,7 +191,7 @@ export function CloudOpsAgentChat() {
                   className="suggested-prompt-btn"
                 >
                   <span>"Find production resources with public access."</span>
-                  <span className="arrow">→</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="arrow"><polyline points="9 18 15 12 9 6" /></svg>
                 </button>
               </div>
             </div>
@@ -225,7 +228,7 @@ export function CloudOpsAgentChat() {
                   ) : (
                     currentSteps.map((step) => (
                       <div key={step.id} className={`operational-step ${step.status === "completed" ? "done" : "active"}`}>
-                        <span>{step.status === "completed" ? "✓" : "●"}</span>
+                        <span style={{ fontSize: "11px", fontWeight: 600 }}>{step.status === "completed" ? "Done:" : "Active:"}</span>
                         <span>{step.label}</span>
                       </div>
                     ))
@@ -256,7 +259,7 @@ export function CloudOpsAgentChat() {
               className="btn-primary"
               style={{ padding: "0 18px", fontSize: "13px" }}
             >
-              Send →
+              Send
             </button>
           </form>
 
@@ -311,7 +314,7 @@ function StructuredCardView({ card, onCloseDrawer }: { card: StructuredAgentCard
           className="btn-secondary"
           style={{ width: "100%", fontSize: "12px", justifyContent: "center" }}
         >
-          View Service Dossier →
+          View Service Dossier
         </Link>
       </div>
     );
@@ -358,7 +361,7 @@ function StructuredCardView({ card, onCloseDrawer }: { card: StructuredAgentCard
           className="btn-secondary"
           style={{ width: "100%", fontSize: "12px", justifyContent: "center" }}
         >
-          View Full Evidence & Timeline →
+          View Full Evidence & Timeline
         </Link>
       </div>
     );
@@ -374,12 +377,12 @@ function StructuredCardView({ card, onCloseDrawer }: { card: StructuredAgentCard
 
         <div style={{ margin: "10px 0" }}>
           <div style={{ fontSize: "11px", fontWeight: 600, color: "#16a34a", textTransform: "uppercase", marginBottom: "6px" }}>
-            ✓ Automatically Verified ({card.automatedChecks.length})
+            Automatically Verified ({card.automatedChecks.length})
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", color: "var(--mid-warm-gray)" }}>
             {card.automatedChecks.map((chk, i) => (
               <div key={i} style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                <span style={{ color: "#16a34a" }}>✓</span>
+                <span style={{ color: "#16a34a", fontWeight: 700 }}>•</span>
                 <span>{chk}</span>
               </div>
             ))}
@@ -388,12 +391,12 @@ function StructuredCardView({ card, onCloseDrawer }: { card: StructuredAgentCard
 
         <div style={{ margin: "12px 0 8px 0" }}>
           <div style={{ fontSize: "11px", fontWeight: 600, color: "#d97706", textTransform: "uppercase", marginBottom: "6px" }}>
-            ⚠ Requires Manual Verification ({card.manualChecks.length})
+            Requires Manual Verification ({card.manualChecks.length})
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", color: "var(--mid-warm-gray)" }}>
             {card.manualChecks.map((chk, i) => (
               <div key={i} style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                <span style={{ color: "#d97706" }}>□</span>
+                <span style={{ color: "#d97706", fontWeight: 700 }}>•</span>
                 <span>{chk}</span>
               </div>
             ))}
@@ -425,7 +428,7 @@ function StructuredCardView({ card, onCloseDrawer }: { card: StructuredAgentCard
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--border-subtle)", fontSize: "12.5px" }}>
           <span style={{ color: "var(--mid-warm-gray)" }}>Scaling Change:</span>
-          <span>{card.currentValue} → <strong>{card.requestedValue} tasks</strong></span>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>{card.currentValue} <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg> <strong>{card.requestedValue} tasks</strong></span>
         </div>
 
         <div style={{ padding: "8px 0", fontSize: "12px", color: "var(--mid-warm-gray)" }}>
@@ -440,7 +443,7 @@ function StructuredCardView({ card, onCloseDrawer }: { card: StructuredAgentCard
             className="btn-primary"
             style={{ width: "100%", fontSize: "12px", justifyContent: "center" }}
           >
-            Review in Approvals Queue →
+            Review in Approvals Queue
           </Link>
         </div>
       </div>

@@ -22,14 +22,11 @@ export function OverviewChatComposer() {
     <div className="harvey-card" style={{ padding: "24px 28px", border: "1px solid var(--warm-gray-border)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1rem", marginBottom: "16px" }}>
         <div>
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
-            <span style={{ fontSize: "14px" }}>⚡</span>
-            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: "22px", fontWeight: 400, color: "var(--near-black-ink)", margin: 0 }}>
-              CloudOps Operational Command
-            </h2>
-          </div>
+          <h2 style={{ fontFamily: "var(--font-serif)", fontSize: "22px", fontWeight: 400, color: "var(--near-black-ink)", margin: "0 0 4px 0" }}>
+            Operational Command
+          </h2>
           <p className="body-subtle" style={{ margin: 0, fontSize: "13.5px" }}>
-            Ask about your infrastructure, deployments, incidents, security, or cloud operations.
+            Query infrastructure, active deployments, incident state, and cloud operations.
           </p>
         </div>
 
@@ -39,7 +36,7 @@ export function OverviewChatComposer() {
           className="btn-secondary"
           style={{ fontSize: "12px", padding: "4px 10px" }}
         >
-          Expand Agent Workspace ↗
+          Expand Workspace
         </button>
       </div>
 
@@ -48,7 +45,7 @@ export function OverviewChatComposer() {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder='Ask CloudOps anything... e.g. "Is starvision-motors healthy?"'
+          placeholder='Query operations... e.g. "Is starvision-motors healthy?"'
           className="form-input"
           style={{ flex: 1, padding: "12px 16px", fontSize: "14px" }}
         />
@@ -57,7 +54,7 @@ export function OverviewChatComposer() {
           className="btn-primary"
           style={{ padding: "12px 24px", fontSize: "14px" }}
         >
-          Send →
+          Send
         </button>
       </form>
 

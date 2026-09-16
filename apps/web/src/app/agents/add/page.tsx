@@ -212,21 +212,39 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
       {/* 2. Wizard Step Navigation Bar */}
       <div className="wizard-steps-header">
         <div className={`wizard-step-item ${currentStep === 1 ? "active" : currentStep > 1 ? "completed" : ""}`}>
-          <div className="wizard-step-number">{currentStep > 1 ? "✓" : "1"}</div>
+          <div className="wizard-step-number">
+            {currentStep > 1 ? (
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
+            ) : (
+              "1"
+            )}
+          </div>
           <span>Name & Role</span>
         </div>
 
         <span style={{ color: "var(--warm-gray-border)" }}>—</span>
 
         <div className={`wizard-step-item ${currentStep === 2 ? "active" : currentStep > 2 ? "completed" : ""}`}>
-          <div className="wizard-step-number">{currentStep > 2 ? "✓" : "2"}</div>
+          <div className="wizard-step-number">
+            {currentStep > 2 ? (
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
+            ) : (
+              "2"
+            )}
+          </div>
           <span>Runtime</span>
         </div>
 
         <span style={{ color: "var(--warm-gray-border)" }}>—</span>
 
         <div className={`wizard-step-item ${currentStep === 3 ? "active" : currentStep > 3 ? "completed" : ""}`}>
-          <div className="wizard-step-number">{currentStep > 3 ? "✓" : "3"}</div>
+          <div className="wizard-step-number">
+            {currentStep > 3 ? (
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
+            ) : (
+              "3"
+            )}
+          </div>
           <span>Capabilities</span>
         </div>
 
@@ -292,7 +310,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
                 className="btn-primary"
                 style={{ padding: "10px 24px" }}
               >
-                Continue to Runtime →
+                Continue to Runtime
               </button>
             </div>
           </div>
@@ -341,7 +359,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
               onClick={() => setCurrentStep(1)}
               className="btn-secondary"
             >
-              ← Back
+              Back
             </button>
             <button
               type="button"
@@ -349,7 +367,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
               className="btn-primary"
               style={{ padding: "10px 24px" }}
             >
-              Continue to Capabilities →
+              Continue to Capabilities
             </button>
           </div>
         </div>
@@ -371,10 +389,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
             Define the Model Context Protocol (MCP) toolsets and operational boundaries for this agent.
           </p>
 
-          {/* Architecture info callout */}
-          <div style={{ padding: "12px 16px", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: "var(--radius-sm)", marginBottom: "20px", fontSize: "12.5px", color: "#334155" }}>
-            <strong>⚡ Zero-Code MCP Governance:</strong> CloudOps does not require hardcoding cloud APIs. Agents invoke tools dynamically via standardized MCP servers while CloudOps enforces policy, human-in-the-loop approvals, and audit logging.
-          </div>
+          {/* Zero-Code MCP Governance: CloudOps invokes tools dynamically via standardized MCP servers while enforcing policy, human-in-the-loop approvals, and audit logging. */}
 
           {/* Role Presets */}
           <div style={{ marginBottom: "20px" }}>
@@ -725,7 +740,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
               onClick={() => setCurrentStep(2)}
               className="btn-secondary"
             >
-              ← Back
+              Back
             </button>
             <button
               type="button"
@@ -734,7 +749,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
               className="btn-primary"
               style={{ padding: "10px 24px" }}
             >
-              {generating ? "Generating..." : "Generate Invitation Prompt →"}
+              {generating ? "Generating..." : "Generate Invitation Prompt"}
             </button>
           </div>
         </div>
@@ -747,7 +762,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "1rem", marginBottom: "16px" }}>
               <div>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
-                  <span style={{ color: "#16a34a", fontSize: "18px" }}>✓</span>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
                   <h2 style={{ fontFamily: "var(--font-serif)", fontSize: "24px", fontWeight: 400, color: "var(--near-black-ink)", margin: 0 }}>
                     Invitation Ready
                   </h2>
@@ -763,22 +778,11 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
                 className="btn-primary"
                 style={{ padding: "8px 20px", fontSize: "13px" }}
               >
-                {copiedPrompt ? "✓ Prompt Copied" : "Copy Prompt"}
+                {copiedPrompt ? "Prompt Copied" : "Copy Prompt"}
               </button>
             </div>
 
-            {/* Network Architecture clarification */}
-            <div style={{ padding: "10px 14px", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: "var(--radius-sm)", marginBottom: "14px", fontSize: "12px", color: "#334155", display: "flex", gap: "16px", flexWrap: "wrap", alignItems: "center" }}>
-              <div>
-                <strong>🔌 Control Plane API & Gateway:</strong> <code style={{ fontFamily: "var(--font-mono)", background: "#e2e8f0", padding: "2px 5px", borderRadius: "3px" }}>http://localhost:3000</code>
-              </div>
-              <div>
-                <strong>🖥️ Operator Web UI:</strong> <code style={{ fontFamily: "var(--font-mono)", background: "#e2e8f0", padding: "2px 5px", borderRadius: "3px" }}>http://localhost:3001</code>
-              </div>
-              <div style={{ color: "#64748b", fontSize: "11.5px" }}>
-                (Web dashboard port 3001 also reverse-proxies <code>/v1/*</code> to port 3000)
-              </div>
-            </div>
+            {/* Architecture note: Control Plane API runs on port 3000, Operator Web UI runs on port 3001 */}
 
             {/* Prompt Pre Box */}
             <pre
@@ -810,7 +814,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px", marginBottom: "14px" }}>
               <div>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
-                  <span style={{ fontSize: "16px" }}>⚡</span>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" /></svg>
                   <h3 style={{ fontFamily: "var(--font-serif)", fontSize: "20px", fontWeight: 400, color: "var(--near-black-ink)", margin: 0 }}>
                     Governed Model Context Protocol (MCP) Setup
                   </h3>
@@ -826,7 +830,7 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
                 className="btn-primary"
                 style={{ padding: "6px 16px", fontSize: "12.5px" }}
               >
-                {copiedMcp ? "✓ Config Copied" : "Copy Configuration"}
+                {copiedMcp ? "Config Copied" : "Copy Configuration"}
               </button>
             </div>
 
@@ -881,45 +885,20 @@ curl -N -H "Accept: text/event-stream" "${apiBase}/v1/mcp/sse?agentId=${agentIdP
               {getMcpConfigSnippet(mcpTab)}
             </pre>
 
-            {/* Security Guarantee callout */}
+            {/* Security Invariant */}
             <div style={{ marginTop: "12px", fontSize: "12px", color: "#475569", display: "flex", alignItems: "center", gap: "6px" }}>
-              <span>🛡️</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>
               <span><strong>Zero Root Cloud Keys:</strong> The agent never holds cloud credentials. Mutations pause for Human-in-the-Loop operator sign-off.</span>
             </div>
           </div>
 
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ display: "flex", justifyContent: "flex-start", alignItems: "center" }}>
             <Link href="/agents/join-requests" className="btn-secondary">
-              Go to Join Requests Queue →
+              Go to Join Requests Queue
             </Link>
-            <button
-              type="button"
-              onClick={() => setShowTestHarness(!showTestHarness)}
-              className="btn-secondary"
-              style={{ fontSize: "12px" }}
-            >
-              {showTestHarness ? "Hide Local Test Harness" : "Local Test Harness"}
-            </button>
           </div>
 
-          {/* Test Harness */}
-          {showTestHarness && (
-            <div className="harvey-card" style={{ padding: "16px 20px", background: "#fcfbf9" }}>
-              <div style={{ fontWeight: 600, fontSize: "13px", marginBottom: "4px" }}>Local Test Harness</div>
-              <p style={{ fontSize: "12px", color: "var(--mid-warm-gray)", marginBottom: "12px" }}>
-                Simulate an agent submitting this join request locally.
-              </p>
-              {simSuccessMsg && <div className="alert-banner success" style={{ marginBottom: "10px" }}>{simSuccessMsg}</div>}
-              <button
-                type="button"
-                onClick={handleSimulateJoin}
-                className="btn-secondary"
-                style={{ fontSize: "12px" }}
-              >
-                Simulate Agent Join Request
-              </button>
-            </div>
-          )}
+          {/* Note: Local simulation test harness omitted from production operator interface */}
         </div>
       )}
     </div>
