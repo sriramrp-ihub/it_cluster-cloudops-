@@ -21,6 +21,11 @@ if [ -n "$HERMES_URL" ]; then
   echo "[CloudOps Entrypoint] HERMES_URL target: $HERMES_URL"
 fi
 
+if [ -n "$DEFENSECLAW_ENDPOINT" ]; then
+  export DEFENSECLAW_ENDPOINT=$(echo "$DEFENSECLAW_ENDPOINT" | sed -E 's/([@\/])localhost:/\1host.docker.internal:/g' | sed -E 's/([@\/])127\.0\.0\.1:/\1host.docker.internal:/g')
+  echo "[CloudOps Entrypoint] DEFENSECLAW_ENDPOINT target: $DEFENSECLAW_ENDPOINT"
+fi
+
 # Ensure API_HOST binds to 0.0.0.0 for container networking
 export API_HOST="${API_HOST:-0.0.0.0}"
 export API_PORT="${API_PORT:-3000}"

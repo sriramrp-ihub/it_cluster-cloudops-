@@ -1,0 +1,37 @@
+# Stage 1: Build the DefenseClaw Go Gateway binary
+FROM golang:1.24-bookworm AS builder
+
+WORKDIR /src
+
+# Copy go.mod and go.sum for layer caching
+COPY defence_claw/defenseclaw/go.mod defence_claw/defenseclaw/go.sum ./
+RUN go mod download
+
+# Copy DefenseClaw source tree
+COPY defence_claw/defenseclaw/ .
+
+# Build statically linked binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/defenseclaw-gateway ./cmd/defenseclaw
+
+# Stage 2: Minimal runtime container
+FROM debian:bookworm-slim AS runner
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /bin/defenseclaw-gateway /usr/local/bin/defenseclaw-gateway
+
+# Copy Rego policy bundles
+COPY defence_claw/defenseclaw/policies/rego /app/policies/rego
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=5s --timeout=5s --retries=5 \
+  CMD curl -f http://127.0.0.1:8080/health || exit 1
+
+ENTRYPOINT ["defenseclaw-gateway", "serve", "--host", "0.0.0.0", "--port", "8080", "--policy-bundles", "/app/policies/rego/cloudops", "--connectors", "cloudops"]
