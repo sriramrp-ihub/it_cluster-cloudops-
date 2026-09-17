@@ -445,3 +445,95 @@ export async function fetchInvestigation(
 
   return res.json();
 }
+
+export interface CapabilityItem {
+  id: string;
+  name: string;
+  description: string;
+  tier: "read" | "mutate" | "deploy";
+  category: string;
+  provider: "aws" | "gcp" | "azure";
+}
+
+export interface SkillItem {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  builtIn: boolean;
+}
+
+export async function fetchCapabilities(tenantId?: string, operatorId?: string): Promise<CapabilityItem[]> {
+  const res = await fetch(`${API_BASE}/v1/capabilities`, {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data.capabilities || [];
+}
+
+export async function fetchSkills(tenantId?: string, operatorId?: string): Promise<SkillItem[]> {
+  const res = await fetch(`${API_BASE}/v1/skills`, {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data.skills || [];
+}
+
+export async function connectAgent(
+  id: string,
+  autoApprove: boolean = true,
+  tenantId?: string,
+  operatorId?: string
+): Promise<{ mcpSseUrl: string; connectorPid: number; status: string }> {
+  const res = await fetch(`${API_BASE}/v1/agents/${id}/connect`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(tenantId, operatorId)
+    },
+    body: JSON.stringify({ autoApprove })
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export async function testAgent(
+  id: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<{ success: boolean; mcpTools?: string[]; error?: string }> {
+  const res = await fetch(`${API_BASE}/v1/agents/${id}/test`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(tenantId, operatorId)
+    }
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+

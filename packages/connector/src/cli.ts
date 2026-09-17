@@ -1,6 +1,10 @@
 #!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
 import { CloudOpsConnector } from "./connector.js";
 import type { ConnectorConfig } from "./types.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { CloudOpsMcpServer } from "@cloudops/tools";
 
 interface ParsedCliArgs {
   inviteToken?: string | undefined;
@@ -11,6 +15,10 @@ interface ParsedCliArgs {
   isMcp?: boolean | undefined;
   agentId?: string | undefined;
   tenantId?: string | undefined;
+  daemon?: boolean | undefined;
+  mcpPort?: number | undefined;
+  pidFile?: string | undefined;
+  runtimeCredential?: string | undefined;
 }
 
 function parseArgs(args: string[]): ParsedCliArgs {
@@ -29,6 +37,14 @@ function parseArgs(args: string[]): ParsedCliArgs {
       config.agentType = args[++i];
     } else if (arg === "--mcp") {
       config.isMcp = true;
+    } else if (arg === "--daemon") {
+      config.daemon = true;
+    } else if (arg === "--mcp-port" && i + 1 < args.length) {
+      config.mcpPort = parseInt(args[++i] || "0", 10);
+    } else if (arg === "--pid-file" && i + 1 < args.length) {
+      config.pidFile = args[++i];
+    } else if (arg === "--runtime-credential" && i + 1 < args.length) {
+      config.runtimeCredential = args[++i];
     } else if (arg === "--agent-id" && i + 1 < args.length) {
       config.agentId = args[++i];
     } else if (arg === "--tenant-id" && i + 1 < args.length) {
@@ -41,7 +57,8 @@ function parseArgs(args: string[]): ParsedCliArgs {
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
 
-  if (parsed.isMcp) {
+  // 1. Standalone stdio MCP bridge mode
+  if (parsed.isMcp && !parsed.daemon) {
     const { runMcpStdioBridge } = await import("./mcpStdioBridge.js");
     const mcpOpts: { agentId?: string | undefined; tenantId?: string | undefined } = {};
     if (parsed.agentId !== undefined) mcpOpts.agentId = parsed.agentId;
@@ -50,9 +67,135 @@ async function main() {
     return;
   }
 
+  // 2. Daemon Mode: Host MCP SSE server + background sidecar
+  if (parsed.daemon) {
+    const portToListen = parsed.mcpPort !== undefined && !isNaN(parsed.mcpPort) ? parsed.mcpPort : 0;
+    const activeTransports = new Map<string, SSEServerTransport>();
+
+    const server = http.createServer(async (req, res) => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-agent-id, x-tenant-id");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+      if (req.method === "GET" && (url.pathname === "/sse" || url.pathname === "/v1/mcp/sse")) {
+        const sseTransport = new SSEServerTransport("/messages", res);
+        const mcpServer = new CloudOpsMcpServer({
+          agentId: parsed.agentId || "ag_mcp_standalone",
+          tenantId: parsed.tenantId || "ten_default_tenant"
+        });
+        activeTransports.set(sseTransport.sessionId, sseTransport);
+        sseTransport.onclose = () => {
+          activeTransports.delete(sseTransport.sessionId);
+        };
+        await mcpServer.connect(sseTransport);
+        return;
+      }
+
+      if (req.method === "POST" && (url.pathname === "/messages" || url.pathname === "/v1/mcp/messages")) {
+        const sessionId = url.searchParams.get("sessionId");
+        const sseTransport = sessionId ? activeTransports.get(sessionId) : Array.from(activeTransports.values())[0];
+        if (sseTransport) {
+          await sseTransport.handlePostMessage(req, res);
+          return;
+        }
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Session not found" }));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", pid: process.pid, agentId: parsed.agentId }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end("Not Found");
+    });
+
+    server.listen(portToListen, () => {
+      const addr = server.address();
+      const actualPort = typeof addr === "object" && addr ? addr.port : portToListen;
+      const mcpSseUrl = `http://localhost:${actualPort}/sse`;
+
+      if (parsed.pidFile) {
+        try {
+          fs.writeFileSync(parsed.pidFile, String(process.pid), "utf-8");
+        } catch (err) {
+          console.error(`[CloudOps Connector Daemon] Failed to write PID file: ${err}`);
+        }
+      }
+
+      // Output JSON to stdout for process coordinator
+      console.log(JSON.stringify({ mcpSseUrl, pid: process.pid, port: actualPort }));
+    });
+
+    let connector: CloudOpsConnector | null = null;
+    const inviteToken = parsed.inviteToken || process.env.CLOUDOPS_INVITE_TOKEN;
+    if (inviteToken) {
+      const apiBaseUrl = parsed.apiBaseUrl || process.env.CLOUDOPS_URL || "http://localhost:3000";
+      const wsBaseUrl = parsed.wsBaseUrl || apiBaseUrl.replace(/^http/, "ws");
+      const agentName = parsed.agentName || process.env.AGENT_NAME || "hermes-agent";
+      const agentType = parsed.agentType || process.env.AGENT_TYPE || "hermes";
+
+      connector = new CloudOpsConnector({
+        apiBaseUrl,
+        wsBaseUrl,
+        inviteToken,
+        agentName,
+        agentType,
+        autoReconnect: true
+      });
+
+      connector.on("state_changed", (state) => {
+        console.error(`[CloudOps Connector Daemon] State -> ${state}`);
+      });
+      connector.on("error", (err) => {
+        console.error(`[CloudOps Connector Daemon] Error: ${err.message}`);
+      });
+
+      connector.startOnboardingAndConnect().catch((err) => {
+        console.error(`[CloudOps Connector Daemon] Onboarding warning: ${err.message}`);
+      });
+    }
+
+    const shutdown = async () => {
+      console.error("\n[CloudOps Connector Daemon] Shutting down...");
+      if (parsed.pidFile && fs.existsSync(parsed.pidFile)) {
+        try {
+          fs.unlinkSync(parsed.pidFile);
+        } catch {
+          // ignore
+        }
+      }
+      server.close();
+      if (connector) {
+        try {
+          await connector.disconnect("PROCESS_SHUTDOWN");
+        } catch {
+          // ignore
+        }
+      }
+      process.exit(0);
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    return;
+  }
+
+  // 3. Normal CLI Connector Execution
   const inviteToken = parsed.inviteToken || process.env.CLOUDOPS_INVITE_TOKEN;
   if (!inviteToken) {
-    console.error("Error: Missing invite token. Specify --invite <token> or set CLOUDOPS_INVITE_TOKEN. (Or run with --mcp for MCP Server mode)");
+    console.error("Error: Missing invite token. Specify --invite <token> or set CLOUDOPS_INVITE_TOKEN. (Or run with --mcp or --daemon)");
     process.exit(1);
   }
 
@@ -90,15 +233,10 @@ async function main() {
     console.log(`[CloudOps Connector] Connected to Gateway! Session: ${d.sessionId}`);
   });
 
-  connector.on("heartbeat_ack", (d) => {
-    // Heartbeat received
-  });
-
   connector.on("error", (err) => {
     console.error(`[CloudOps Connector] Error: ${err.message}`);
   });
 
-  // Handle graceful shutdown
   const shutdown = async () => {
     console.log("\n[CloudOps Connector] Shutting down...");
     try {

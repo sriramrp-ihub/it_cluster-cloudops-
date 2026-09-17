@@ -274,6 +274,19 @@ export interface IncidentEvidenceTable {
   created_at: Generated<Date>;
 }
 
+export interface AgentConnectorTable {
+  id: Generated<string>;
+  agent_id: string;
+  tenant_id: string;
+  pid: number | null;
+  mcp_port: number | null;
+  mcp_sse_url: string | null;
+  status: Generated<string>; // starting, connected, stopped, error
+  error_message: string | null;
+  started_at: Generated<Date>;
+  stopped_at: Date | null;
+}
+
 export interface DatabaseSchema {
   tenants: TenantTable;
   agents: AgentTable;
@@ -282,6 +295,7 @@ export interface DatabaseSchema {
   agent_invites: AgentInviteTable;
   agent_join_requests: AgentJoinRequestTable;
   agent_claim_credentials: AgentClaimCredentialTable;
+  agent_connectors: AgentConnectorTable;
   runtimes: RuntimeTable;
   runtime_sessions: RuntimeSessionTable;
   capabilities: CapabilityTable;
@@ -297,4 +311,5 @@ export interface DatabaseSchema {
   investigations: InvestigationTable;
   incident_evidence: IncidentEvidenceTable;
 }
+
 

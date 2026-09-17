@@ -14,6 +14,8 @@ import { cloudAccountRoutes } from "./routes/cloudAccounts.js";
 import { mcpRoutes } from "./routes/mcp.js";
 import { approvalRoutes } from "./routes/approvals.js";
 import { investigationRoutes } from "./routes/investigations.js";
+import { capabilityRoutes } from "./routes/capabilities.js";
+import { skillRoutes } from "./routes/skills.js";
 import { CloudAccountService, IncidentService } from "@cloudops/adapters";
 import { GatewayHandler } from "@cloudops/gateway";
 import { ApprovalService } from "@cloudops/approvals";
@@ -81,6 +83,8 @@ export function buildApp(opts: BuildAppOptions = {}) {
   app.register(cloudAccountRoutes, { cloudAccountService: opts.cloudAccountService });
   app.register(mcpRoutes, { approvalService });
   app.register(approvalRoutes, { approvalService });
+  app.register(capabilityRoutes);
+  app.register(skillRoutes);
   app.register(investigationRoutes, {
     incidentService: opts.incidentService,
     agentAdapter,

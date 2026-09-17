@@ -1,7 +1,13 @@
 import type { FastifyPluginAsync } from "fastify";
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { getDatabase } from "@cloudops/database";
+import { InviteService } from "@cloudops/onboarding";
 import { AgentService } from "@cloudops/identity";
 import { DefenseClawGuardrailService } from "@cloudops/security";
 import { HermesAgentAdapter, type AgentAdapter } from "@cloudops/runtime";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { requireOperatorAuth } from "../middleware/auth.js";
 
 export interface AgentRoutesOptions {
@@ -76,6 +82,36 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
       const operator = request.operator!;
       const { id } = request.params;
 
+      // Stop any active connector child processes
+      const db = getDatabase();
+      try {
+        const connectors = await db
+          .selectFrom("agent_connectors")
+          .selectAll()
+          .where("agent_id", "=", id)
+          .where("tenant_id", "=", operator.tenantId)
+          .execute();
+
+        for (const c of connectors) {
+          if (c.pid) {
+            try {
+              process.kill(c.pid, "SIGTERM");
+            } catch {
+              // ignore
+            }
+          }
+        }
+
+        await db
+          .updateTable("agent_connectors")
+          .set({ status: "stopped", stopped_at: new Date() })
+          .where("agent_id", "=", id)
+          .where("tenant_id", "=", operator.tenantId)
+          .execute();
+      } catch {
+        // non-fatal
+      }
+
       const result = await agentService.deleteAgent(operator.tenantId, id as any);
 
       return reply.status(200).send({
@@ -85,6 +121,231 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
       });
     }
   );
+
+  /**
+   * POST /v1/agents/:id/connect
+   * Auto-spawns connector sidecar process, tracks in agent_connectors, and updates status to CONNECTED.
+   */
+  fastify.post<{
+    Params: { id: string };
+    Body?: { autoApprove?: boolean };
+  }>(
+    "/v1/agents/:id/connect",
+    { preHandler: [requireOperatorAuth] },
+    async (request, reply) => {
+      const operator = request.operator!;
+      const { id } = request.params;
+
+      const agent = await agentService.getAgent(operator.tenantId, id as any);
+      const db = getDatabase();
+
+      // 1. Check for existing alive connector
+      const existing = await db
+        .selectFrom("agent_connectors")
+        .selectAll()
+        .where("agent_id", "=", agent.id)
+        .where("tenant_id", "=", operator.tenantId)
+        .where("status", "in", ["starting", "connected"])
+        .orderBy("started_at", "desc")
+        .executeTakeFirst();
+
+      if (existing && existing.pid) {
+        let isAlive = false;
+        try {
+          process.kill(existing.pid, 0);
+          isAlive = true;
+        } catch {
+          isAlive = false;
+        }
+
+        if (isAlive && existing.mcp_sse_url) {
+          if (agent.status !== "CONNECTED") {
+            await agentService.updateStatus(operator.tenantId, agent.id as any, "CONNECTED");
+          }
+          return reply.status(200).send({
+            mcpSseUrl: existing.mcp_sse_url,
+            connectorPid: existing.pid,
+            status: "connected"
+          });
+        }
+      }
+
+      // 2. Generate invite token for connector onboarding
+      const inviteService = new InviteService();
+      const port = Number(process.env.API_PORT || 3000);
+      const invite = await inviteService.createInvite(
+        operator.tenantId,
+        operator.operatorId,
+        86400,
+        {
+          agentName: agent.name,
+          agentType: agent.type as any,
+          apiBaseUrl: `http://localhost:${port}`
+        }
+      );
+
+      // 3. Resolve connector CLI script path
+      const cliPath = path.resolve(process.cwd(), "packages/connector/dist/cli.js");
+
+      // 4. Spawn connector daemon child process
+      const child = spawn("node", [
+        cliPath,
+        "--daemon",
+        "--agent-id", agent.id,
+        "--tenant-id", operator.tenantId,
+        "--invite", invite.inviteToken,
+        "--url", `http://localhost:${port}`,
+        "--mcp-port", "0"
+      ], {
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, NODE_ENV: process.env.NODE_ENV || "development" }
+      });
+
+      child.unref();
+
+      // 5. Wait for stdout JSON: { mcpSseUrl, pid, port }
+      const connectorReadyPromise = new Promise<{ mcpSseUrl: string; pid: number; port: number }>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("Connector daemon did not report MCP ready within 10 seconds"));
+        }, 10000);
+
+        let buffer = "";
+        child.stdout?.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split("\n");
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith("{") && trimmed.includes("mcpSseUrl")) {
+              clearTimeout(timeout);
+              try {
+                const parsed = JSON.parse(trimmed);
+                resolve(parsed);
+                return;
+              } catch {
+                // keep reading
+              }
+            }
+          }
+        });
+
+        child.on("error", (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+
+        child.on("exit", (code) => {
+          clearTimeout(timeout);
+          reject(new Error(`Connector daemon exited prematurely with code ${code}`));
+        });
+      });
+
+      try {
+        const result = await connectorReadyPromise;
+
+        // 6. Record in agent_connectors
+        await db
+          .insertInto("agent_connectors")
+          .values({
+            agent_id: agent.id,
+            tenant_id: operator.tenantId,
+            pid: result.pid,
+            mcp_port: result.port,
+            mcp_sse_url: result.mcpSseUrl,
+            status: "connected",
+            started_at: new Date()
+          })
+          .execute();
+
+        // 7. Update agent status to CONNECTED
+        await agentService.updateStatus(operator.tenantId, agent.id as any, "CONNECTED");
+
+        return reply.status(200).send({
+          mcpSseUrl: result.mcpSseUrl,
+          connectorPid: result.pid,
+          status: "connected"
+        });
+      } catch (err: any) {
+        request.log.error({ err }, "Failed to auto-spawn connector daemon");
+        return reply.status(500).send({
+          error: {
+            code: "CONNECTOR_SPAWN_FAILED",
+            message: err?.message || "Failed to start connector daemon"
+          }
+        });
+      }
+    }
+  );
+
+  /**
+   * POST /v1/agents/:id/test
+   * Validates agent connection by connecting to its MCP SSE endpoint, listing tools, and probing a read capability.
+   */
+  fastify.post<{
+    Params: { id: string };
+  }>(
+    "/v1/agents/:id/test",
+    { preHandler: [requireOperatorAuth] },
+    async (request, reply) => {
+      const operator = request.operator!;
+      const { id } = request.params;
+
+      const agent = await agentService.getAgent(operator.tenantId, id as any);
+      const db = getDatabase();
+
+      // 1. Get agent's MCP SSE URL
+      const conn = await db
+        .selectFrom("agent_connectors")
+        .selectAll()
+        .where("agent_id", "=", agent.id)
+        .where("tenant_id", "=", operator.tenantId)
+        .where("status", "=", "connected")
+        .orderBy("started_at", "desc")
+        .executeTakeFirst();
+
+      const port = Number(process.env.API_PORT || 3000);
+      const sseUrl = conn?.mcp_sse_url || `http://localhost:${port}/v1/mcp/sse?agentId=${agent.id}&tenantId=${operator.tenantId}`;
+
+      // 2. Connect via MCP client
+      try {
+        const transport = new SSEClientTransport(new URL(sseUrl));
+        const client = new Client(
+          { name: "cloudops-verifier", version: "1.0.0" },
+          { capabilities: {} }
+        );
+
+        await client.connect(transport);
+        const toolsList = await client.listTools();
+        const mcpTools = toolsList.tools.map((t) => t.name);
+
+        // 3. Call read-only capability (e.g. aws_ecs_describe_clusters)
+        if (mcpTools.includes("aws_ecs_describe_clusters")) {
+          try {
+            await client.callTool({
+              name: "aws_ecs_describe_clusters",
+              arguments: { region: "us-east-1" }
+            });
+          } catch {
+            // Read-only probe call non-fatal
+          }
+        }
+
+        await client.close();
+
+        return reply.status(200).send({
+          success: true,
+          mcpTools
+        });
+      } catch (err: any) {
+        request.log.warn({ err, sseUrl }, "Agent test connection probe failed");
+        return reply.status(200).send({
+          success: false,
+          error: err?.message || "Failed to connect to agent MCP endpoint"
+        });
+      }
+    }
+  );
+
 
   /**
    * GET /v1/agents/runtime-endpoint
