@@ -16,7 +16,7 @@
     "dev": "concurrently -k -p \"[{name}]\" -n \"api,web\" -c \"magenta,blue\" \"npm run dev:api\" \"npm run dev:web\"",
     "dev:api": "npm run dev --workspace=@cloudops/api",
     "dev:web": "npm run dev --workspace=@cloudops/web",
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build --workspace=@cloudops/shared && npm run build --workspace=@cloudops/database --workspace=@cloudops/security --workspace=@cloudops/events --workspace=@cloudops/capabilities && npm run build --workspace=@cloudops/audit --workspace=@cloudops/identity --workspace=@cloudops/policy --workspace=@cloudops/runtime && npm run build --workspace=@cloudops/approvals --workspace=@cloudops/onboarding --workspace=@cloudops/adapters --workspace=@cloudops/gateway && npm run build --workspace=@cloudops/tools && npm run build --workspace=@cloudops/connector && npm run build --workspace=@cloudops/api --workspace=@cloudops/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "vitest run",
     "test:watch": "vitest",

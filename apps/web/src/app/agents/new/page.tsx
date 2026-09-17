@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { AgentWizard, WizardStepMeta } from "../../../components/agents/AgentWizard";
+import { StepInvite } from "./step-invite";
 import { StepBasic } from "./step-basic";
 import { StepAdapter } from "./step-adapter";
 import { StepTrust } from "./step-trust";
@@ -23,6 +24,7 @@ import { useOperator } from "../../../auth/OperatorContext";
 import { connectAgent, testAgent } from "../../../lib/api";
 
 const WIZARD_STEPS: WizardStepMeta[] = [
+  { number: 0, title: "Invite Token", description: "Paste operator token" },
   { number: 1, title: "Basic Info", description: "Identity & Type" },
   { number: 2, title: "Adapter", description: "Runtime Protocol" },
   { number: 3, title: "Trust", description: "Fences & Scopes" },
@@ -37,8 +39,11 @@ export default function NewAgentWizardPage() {
   const { capabilities, loading: loadingCaps } = useCapabilities();
   const { skills, loading: loadingSkills } = useSkills();
 
-  const [currentStep, setCurrentStep] = useState(1);
+  const [currentStep, setCurrentStep] = useState(0); // Start at Step 0 (Invite Token)
   const [basicErrors, setBasicErrors] = useState<Record<string, string>>({});
+  const [inviteToken, setInviteToken] = useState("");
+  const [inviteValidated, setInviteValidated] = useState(false);
+  const [inviteData, setInviteData] = useState<{ tenantId: string; expiresAt: string; joinRequestId?: string } | null>(null);
 
   // Form State
   const [basicInfo, setBasicInfo] = useState<AgentBasicFormValues>({
@@ -49,7 +54,7 @@ export default function NewAgentWizardPage() {
 
   const [hermesConfig, setHermesConfig] = useState<HermesAdapterFormValues>({
     gatewayUrl: "http://host.docker.internal:8642",
-    apiKey: "sk_hermes_live_key_dev",
+    apiKey: "",
     paperclipUrl: "http://host.docker.internal:3100",
     sessionKeyStrategy: "scoped",
     timeoutSeconds: 1800,
@@ -60,7 +65,7 @@ export default function NewAgentWizardPage() {
 
   const [openclawConfig, setOpenclawConfig] = useState<OpenClawAdapterFormValues>({
     openclawUrl: "http://localhost:8080",
-    apiKey: "oc_live_dev_token",
+    apiKey: "",
     wsUrl: "ws://localhost:8080/ws",
     timeoutSeconds: 1800
   });
@@ -75,13 +80,12 @@ export default function NewAgentWizardPage() {
 
   // Auto-Provision State
   const [provisionSteps, setProvisionSteps] = useState<ProvisionStep[]>([
-    { id: 1, label: "Creating invite token...", status: "pending" },
-    { id: 2, label: "Submitting join request...", status: "pending" },
-    { id: 3, label: "Waiting for operator approval...", status: "pending" },
-    { id: 4, label: "Claiming bootstrap credential...", status: "pending" },
-    { id: 5, label: "Starting connector sidecar...", status: "pending" },
-    { id: 6, label: "Registering MCP endpoint...", status: "pending" },
-    { id: 7, label: "Testing connection...", status: "pending" }
+    { id: 1, label: "Submitting join request...", status: "pending" },
+    { id: 2, label: "Waiting for operator approval...", status: "pending" },
+    { id: 3, label: "Claiming bootstrap credential...", status: "pending" },
+    { id: 4, label: "Starting connector sidecar...", status: "pending" },
+    { id: 5, label: "Registering MCP endpoint...", status: "pending" },
+    { id: 6, label: "Testing connection...", status: "pending" }
   ]);
   const [isProvisionComplete, setIsProvisionComplete] = useState(false);
   const [createdAgentId, setCreatedAgentId] = useState<string | undefined>(undefined);
@@ -103,6 +107,16 @@ export default function NewAgentWizardPage() {
 
   // Step Navigation Validation
   const handleNext = () => {
+    if (currentStep === 0) {
+      if (!inviteToken || inviteToken.trim().length === 0) {
+        setBasicErrors({ invite: "Invite token is required" });
+        return;
+      }
+      setBasicErrors({});
+      // Validate invite token
+      validateInviteToken();
+      return;
+    }
     if (currentStep === 1) {
       if (!basicInfo.name || basicInfo.name.trim().length === 0) {
         setBasicErrors({ name: "Agent name is required" });
@@ -114,7 +128,34 @@ export default function NewAgentWizardPage() {
   };
 
   const handleBack = () => {
-    setCurrentStep((prev) => Math.max(prev - 1, 1));
+    setCurrentStep((prev) => Math.max(prev - 1, 0));
+  };
+
+  const validateInviteToken = async () => {
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
+    setBasicErrors({});
+    try {
+      const res = await fetch(`${apiBase}/v1/onboarding/${inviteToken.trim()}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setBasicErrors({ invite: err?.error?.message || "Invalid invite token" });
+        return;
+      }
+      const data = await res.json();
+      if (data.lifecycleState !== "INVITE_ACTIVE") {
+        setBasicErrors({ invite: `Invite is ${data.lifecycleState.toLowerCase()}, expected ACTIVE` });
+        return;
+      }
+      setInviteValidated(true);
+      setInviteData({
+        tenantId: data.tenantId,
+        expiresAt: data.expiresAt || "",
+        joinRequestId: data.joinRequestId
+      });
+      setCurrentStep(1);
+    } catch (err: any) {
+      setBasicErrors({ invite: err?.message || "Failed to validate invite token" });
+    }
   };
 
   // Execution: End-to-end Auto-Provisioning Flow
@@ -129,42 +170,17 @@ export default function NewAgentWizardPage() {
       );
     };
 
-    const tenantId = session?.tenantId || "ten_default_tenant";
+    const tenantId = inviteData?.tenantId || session?.tenantId || "ten_default_tenant";
     const operatorId = session?.operatorId || "op_admin_operator";
     const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
 
     try {
-      // Step 1: Creating invite token
-      updateStep(1, "running", "Generating cryptographic invite token...");
-      const inviteRes = await fetch(`${apiBase}/v1/onboarding/invites`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-tenant-id": tenantId,
-          "x-operator-id": operatorId
-        },
-        body: JSON.stringify({
-          agentName: basicInfo.name,
-          agentType: basicInfo.type,
-          instructions: basicInfo.description
-        })
-      });
-
-      if (!inviteRes.ok) {
-        const err = await inviteRes.json().catch(() => ({}));
-        throw new Error(err?.error?.message || "Failed to create invite token");
-      }
-      const inviteData = await inviteRes.json();
-      const inviteToken = inviteData.inviteToken;
-      updateStep(1, "completed", `Invite token: ${inviteToken.substring(0, 14)}...`);
-
-      // Step 2: Submitting join request
-      updateStep(2, "running", "Submitting ACP join request with declared capabilities...");
-      const joinRes = await fetch(`${apiBase}/v1/onboarding/join`, {
+      // Step 1: Submitting join request
+      updateStep(1, "running", "Submitting ACP join request with declared capabilities...");
+      const joinRes = await fetch(`${apiBase}/v1/onboarding/${inviteToken.trim()}/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          inviteToken,
           agent: {
             name: basicInfo.name,
             type: basicInfo.type,
@@ -185,11 +201,11 @@ export default function NewAgentWizardPage() {
       }
       const joinData = await joinRes.json();
       const joinRequestId = joinData.joinRequestId;
-      updateStep(2, "completed", `Request ID: ${joinRequestId}`);
+      updateStep(1, "completed", `Request ID: ${joinRequestId}`);
 
-      // Step 3: Waiting for operator approval (Operator auto-approval)
-      updateStep(3, "running", "Auto-approving join request under active operator authority...");
-      const approveRes = await fetch(`${apiBase}/v1/agent-join-requests/${joinRequestId}/review`, {
+      // Step 2: Waiting for operator approval (Operator auto-approval)
+      updateStep(2, "running", "Auto-approving join request under active operator authority...");
+      const approveRes = await fetch(`${apiBase}/v1/agent-join-requests/${joinRequestId}/approve`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -209,10 +225,10 @@ export default function NewAgentWizardPage() {
       const approveData = await approveRes.json();
       const agentId = approveData.agentId || joinData.agentId;
       setCreatedAgentId(agentId);
-      updateStep(3, "completed", `Approved by ${operatorId} -> Agent ${agentId}`);
+      updateStep(2, "completed", `Approved by ${operatorId} -> Agent ${agentId}`);
 
-      // Step 4: Claiming bootstrap credential
-      updateStep(4, "running", "Exchanging approval token for bootstrap credential...");
+      // Step 3: Claiming bootstrap credential
+      updateStep(3, "running", "Exchanging approval token for bootstrap credential...");
       const claimRes = await fetch(`${apiBase}/v1/onboarding/claim`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -224,27 +240,27 @@ export default function NewAgentWizardPage() {
         throw new Error(err?.error?.message || "Failed to claim bootstrap credential");
       }
       const claimData = await claimRes.json();
-      updateStep(4, "completed", `Credential issued for ${claimData.agentId}`);
+      updateStep(3, "completed", `Credential issued for ${claimData.agentId}`);
 
-      // Step 5: Starting connector sidecar
-      updateStep(5, "running", "Spawning connector daemon process (--daemon --mcp-port 0)...");
+      // Step 4: Starting connector sidecar
+      updateStep(4, "running", "Spawning connector daemon process (--daemon --mcp-port 0)...");
       const connectData = await connectAgent(agentId, true, tenantId, operatorId);
       setCreatedMcpSseUrl(connectData.mcpSseUrl);
       setCreatedConnectorPid(connectData.connectorPid);
-      updateStep(5, "completed", `Daemon active: PID ${connectData.connectorPid}`);
+      updateStep(4, "completed", `Daemon active: PID ${connectData.connectorPid}`);
 
-      // Step 6: Registering MCP endpoint
-      updateStep(6, "running", "Exposing isolated MCP SSE stream...");
-      updateStep(6, "completed", `Bound to ${connectData.mcpSseUrl}`);
+      // Step 5: Registering MCP endpoint
+      updateStep(5, "running", "Exposing isolated MCP SSE stream...");
+      updateStep(5, "completed", `Bound to ${connectData.mcpSseUrl}`);
 
-      // Step 7: Testing connection
-      updateStep(7, "running", "Connecting MCP verifier and probing read capability...");
+      // Step 6: Testing connection
+      updateStep(6, "running", "Connecting MCP verifier and probing read capability...");
       const testData = await testAgent(agentId, tenantId, operatorId);
       if (testData.success && testData.mcpTools) {
         setDiscoveredTools(testData.mcpTools);
-        updateStep(7, "completed", `Discovered ${testData.mcpTools.length} governed MCP tools`);
+        updateStep(6, "completed", `Discovered ${testData.mcpTools.length} governed MCP tools`);
       } else {
-        updateStep(7, "completed", `Connected (warning: ${testData.error || "no tools discovered"})`);
+        updateStep(6, "completed", `Connected (warning: ${testData.error || "no tools discovered"})`);
       }
 
       setIsProvisionComplete(true);
@@ -276,10 +292,24 @@ export default function NewAgentWizardPage() {
         steps={WIZARD_STEPS}
         onNext={handleNext}
         onBack={handleBack}
-        canGoNext={currentStep === 1 ? Boolean(basicInfo.name.trim()) : true}
+        canGoNext={
+          currentStep === 0 ? inviteValidated :
+          currentStep === 1 ? Boolean(basicInfo.name.trim()) : true
+        }
         nextLabel={currentStep === 4 ? "Review Spec" : "Continue"}
         hideFooter={currentStep >= 5}
       >
+        {currentStep === 0 && (
+          <StepInvite
+            inviteToken={inviteToken}
+            onChange={setInviteToken}
+            errors={basicErrors}
+            validated={inviteValidated}
+            inviteData={inviteData}
+            onValidate={validateInviteToken}
+          />
+        )}
+
         {currentStep === 1 && (
           <StepBasic values={basicInfo} onChange={setBasicInfo} errors={basicErrors} />
         )}

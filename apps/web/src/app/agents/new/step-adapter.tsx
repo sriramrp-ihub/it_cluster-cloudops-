@@ -31,7 +31,7 @@ export const StepAdapter: React.FC<StepAdapterProps> = ({
     <div style={{ display: "flex", flexDirection: "column", gap: "1.25rem" }}>
       <div>
         <h4 style={{ fontSize: "16px", fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "4px" }}>
-          {agentType === "hermes" ? "Hermes Engine & Paperclip Integration" : agentType === "openclaw" ? "OpenClaw Bridge Settings" : "Custom Protocol Settings"}
+          {agentType === "hermes" ? "Hermes Runtime & Gateway Configuration" : agentType === "openclaw" ? "OpenClaw Bridge Settings" : "Custom Protocol Settings"}
         </h4>
         <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>
           Configure connection endpoints, API tokens, timeouts, and cryptographic session isolation parameters.

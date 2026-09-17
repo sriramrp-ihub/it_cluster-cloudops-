@@ -51,40 +51,40 @@ export const AdapterConfig: React.FC<AdapterConfigProps> = ({
     return (
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "1.25rem" }}>
         <div style={groupStyle}>
-          <label style={labelStyle}>Hermes Gateway URL</label>
-          <input
-            type="text"
-            value={hermesConfig.gatewayUrl}
-            onChange={(e) => onHermesChange({ ...hermesConfig, gatewayUrl: e.target.value })}
-            placeholder="http://host.docker.internal:8642"
-            style={inputStyle}
-          />
-          <span style={{ fontSize: "11px", color: "var(--muted-gray)" }}>Internal Hermes gateway endpoint</span>
-        </div>
+                  <label style={labelStyle}>Hermes Gateway URL</label>
+                  <input
+                    type="text"
+                    value={hermesConfig.gatewayUrl}
+                    onChange={(e) => onHermesChange({ ...hermesConfig, gatewayUrl: e.target.value })}
+                    placeholder="http://host.docker.internal:8642"
+                    style={inputStyle}
+                  />
+                  <span style={{ fontSize: "11px", color: "var(--muted-gray)" }}>Internal Hermes gateway endpoint</span>
+                </div>
 
-        <div style={groupStyle}>
-          <label style={labelStyle}>API Key (API_SERVER_KEY) *</label>
-          <input
-            type="password"
-            value={hermesConfig.apiKey}
-            onChange={(e) => onHermesChange({ ...hermesConfig, apiKey: e.target.value })}
-            placeholder="sk_hermes_live_..."
-            style={inputStyle}
-          />
-          <span style={{ fontSize: "11px", color: "var(--muted-gray)" }}>Secret token authenticating with Hermes runtime</span>
-        </div>
+                <div style={groupStyle}>
+                  <label style={labelStyle}>API Key (API_SERVER_KEY) *</label>
+                  <input
+                    type="password"
+                    value={hermesConfig.apiKey}
+                    onChange={(e) => onHermesChange({ ...hermesConfig, apiKey: e.target.value })}
+                    placeholder="sk_hermes_live_..."
+                    style={inputStyle}
+                  />
+                  <span style={{ fontSize: "11px", color: "var(--muted-gray)" }}>Secret token authenticating with Hermes runtime</span>
+                </div>
 
-        <div style={groupStyle}>
-          <label style={labelStyle}>Paperclip API URL</label>
-          <input
-            type="text"
-            value={hermesConfig.paperclipUrl}
-            onChange={(e) => onHermesChange({ ...hermesConfig, paperclipUrl: e.target.value })}
-            placeholder="http://host.docker.internal:3100"
-            style={inputStyle}
-          />
-          <span style={{ fontSize: "11px", color: "var(--muted-gray)" }}>Paperclip orchestration endpoint</span>
-        </div>
+                <div style={groupStyle}>
+                  <label style={labelStyle}>Control Plane API URL</label>
+                  <input
+                    type="text"
+                    value={hermesConfig.paperclipUrl}
+                    onChange={(e) => onHermesChange({ ...hermesConfig, paperclipUrl: e.target.value })}
+                    placeholder="http://host.docker.internal:3100"
+                    style={inputStyle}
+                  />
+                  <span style={{ fontSize: "11px", color: "var(--muted-gray)" }}>CloudOps control plane orchestration endpoint</span>
+                </div>
 
         <div style={groupStyle}>
           <label style={labelStyle}>Session Key Strategy</label>

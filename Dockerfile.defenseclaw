@@ -1,5 +1,7 @@
 # Stage 1: Build the DefenseClaw Go Gateway binary
-FROM golang:1.24-bookworm AS builder
+FROM golang:bookworm AS builder
+
+ENV GOTOOLCHAIN=auto
 
 WORKDIR /src
 
