@@ -136,7 +136,7 @@ export const AgentWizard: React.FC<AgentWizardProps> = ({
               borderTop: "1px solid var(--border-subtle)"
             }}
           >
-            {currentStep > 1 ? (
+            {currentStep > 0 ? (
               <button
                 type="button"
                 onClick={onBack}

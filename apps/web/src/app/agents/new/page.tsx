@@ -35,7 +35,8 @@ const WIZARD_STEPS: WizardStepMeta[] = [
 
 export default function NewAgentWizardPage() {
   const router = useRouter();
-  const { session } = useOperator();
+  const { session, isOperator: contextIsOperator } = useOperator();
+  const isOperator = contextIsOperator ?? Boolean(session?.operatorId);
   const { capabilities, loading: loadingCaps } = useCapabilities();
   const { skills, loading: loadingSkills } = useSkills();
 
@@ -44,6 +45,7 @@ export default function NewAgentWizardPage() {
   const [inviteToken, setInviteToken] = useState("");
   const [inviteValidated, setInviteValidated] = useState(false);
   const [inviteData, setInviteData] = useState<{ tenantId: string; expiresAt: string; joinRequestId?: string } | null>(null);
+  const [loadingInvite, setLoadingInvite] = useState(false);
 
   // Form State
   const [basicInfo, setBasicInfo] = useState<AgentBasicFormValues>({
@@ -131,14 +133,19 @@ export default function NewAgentWizardPage() {
     setCurrentStep((prev) => Math.max(prev - 1, 0));
   };
 
-  const validateInviteToken = async () => {
+  const validateInviteToken = async (tokenOverride?: string) => {
+    const token = (tokenOverride !== undefined ? tokenOverride : inviteToken).trim();
+    if (!token) {
+      setBasicErrors({ invite: "Invite token is required" });
+      return;
+    }
     const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
     setBasicErrors({});
     try {
-      const res = await fetch(`${apiBase}/v1/onboarding/${inviteToken.trim()}`);
+      const res = await fetch(`${apiBase}/v1/onboarding/${token}`);
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        setBasicErrors({ invite: err?.error?.message || "Invalid invite token" });
+        setBasicErrors({ invite: err?.error?.message || err?.message || "Invalid invite token" });
         return;
       }
       const data = await res.json();
@@ -155,6 +162,47 @@ export default function NewAgentWizardPage() {
       setCurrentStep(1);
     } catch (err: any) {
       setBasicErrors({ invite: err?.message || "Failed to validate invite token" });
+    }
+  };
+
+  const handleCreateInvite = async () => {
+    setLoadingInvite(true);
+    setBasicErrors({});
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
+    const tenantId = session?.tenantId || "ten_default_tenant";
+    const operatorId = session?.operatorId || "op_admin_operator";
+
+    try {
+      const res = await fetch(`${apiBase}/v1/agent-invites`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-tenant-id": tenantId,
+          "x-operator-id": operatorId
+        },
+        body: JSON.stringify({
+          ttlSeconds: 86400,
+          expiresInSeconds: 86400,
+          agentName: basicInfo.name || undefined,
+          agentType: basicInfo.type || undefined
+        })
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err?.error?.message || err?.message || "Failed to generate invite token");
+      }
+
+      const data = await res.json();
+      const token = data.inviteToken;
+      setInviteToken(token);
+
+      // Auto-validate and auto-advance to Step 1
+      await validateInviteToken(token);
+    } catch (err: any) {
+      setBasicErrors({ invite: err?.message || "Failed to generate invite token" });
+    } finally {
+      setLoadingInvite(false);
     }
   };
 
@@ -302,11 +350,21 @@ export default function NewAgentWizardPage() {
         {currentStep === 0 && (
           <StepInvite
             inviteToken={inviteToken}
-            onChange={setInviteToken}
+            onChange={(val) => {
+              setInviteToken(val);
+              if (inviteValidated) {
+                setInviteValidated(false);
+                setInviteData(null);
+              }
+            }}
             errors={basicErrors}
             validated={inviteValidated}
             inviteData={inviteData}
-            onValidate={validateInviteToken}
+            onValidate={() => validateInviteToken()}
+            onContinue={() => setCurrentStep(1)}
+            isOperator={isOperator}
+            loadingInvite={loadingInvite}
+            onCreateInvite={handleCreateInvite}
           />
         )}
 

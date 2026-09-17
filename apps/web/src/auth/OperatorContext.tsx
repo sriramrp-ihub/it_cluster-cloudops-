@@ -12,6 +12,7 @@ import {
 interface OperatorContextType {
   session: OperatorSession | null;
   isAuthenticated: boolean;
+  isOperator: boolean;
   isLoading: boolean;
   availableTenants: TenantOption[];
   availableOperators: OperatorOption[];
@@ -103,6 +104,7 @@ export function OperatorProvider({ children }: { children: React.ReactNode }) {
       value={{
         session,
         isAuthenticated: !!session,
+        isOperator: !!session?.operatorId,
         isLoading,
         availableTenants,
         availableOperators,

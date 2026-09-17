@@ -68,8 +68,34 @@ describe("Onboarding Prompt API & Lifecycle Integration", () => {
     expect(body.onboardingPrompt).toContain("Declared Capabilities ≠ Authorized Privileges");
 
     // Security check: ensure no hash is exposed in prompt
-    expect(body.onboardingPrompt).not.toContain("token_hash");
+    expect(body.onboardingPrompt).not.toContain("tokenHash");
     expect(body.onboardingPrompt).not.toContain("agent_invites");
+  });
+
+  it("POST /v1/agent-invites supports ttlSeconds parameter from web onboarding wizard", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/agent-invites",
+      headers: operatorHeaders,
+      payload: {
+        ttlSeconds: 86400,
+        agentName: "wizard-worker-01",
+        agentType: "hermes"
+      }
+    });
+
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body);
+
+    expect(body.id).toMatch(/^inv_/);
+    expect(body.inviteToken).toMatch(/^co_inv_/);
+    expect(body.tenantId).toBe(tenantId);
+    expect(body.status).toBe("ACTIVE");
+    expect(body.expiresAt).toBeDefined();
+
+    const expiresAt = new Date(body.expiresAt).getTime();
+    const expectedApprox = Date.now() + 86400 * 1000;
+    expect(Math.abs(expiresAt - expectedApprox)).toBeLessThan(10000);
   });
 
   it("full onboarding handshake succeeds using information from onboarding prompt", async () => {

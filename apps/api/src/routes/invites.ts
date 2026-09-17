@@ -6,11 +6,17 @@ import { ValidationError } from "@cloudops/shared";
 import { config } from "../config.js";
 
 const CreateInviteBodySchema = z.object({
-  expiresInSeconds: z.number().int().positive().optional().default(86400),
+  expiresInSeconds: z.number().int().positive().optional(),
+  ttlSeconds: z.number().int().positive().optional(),
   agentName: z.string().trim().min(1).max(128).optional(),
   agentType: z.enum(["hermes", "openclaw", "custom"]).or(z.string().trim().min(1).max(64)).optional().default("hermes"),
   instructions: z.string().trim().max(4000).optional()
-});
+}).transform((data) => ({
+  expiresInSeconds: data.ttlSeconds ?? data.expiresInSeconds ?? 86400,
+  agentName: data.agentName,
+  agentType: data.agentType,
+  instructions: data.instructions
+}));
 
 export const inviteRoutes: FastifyPluginAsync = async (fastify) => {
   const inviteService = new InviteService();
