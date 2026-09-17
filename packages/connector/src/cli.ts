@@ -19,6 +19,7 @@ interface ParsedCliArgs {
   mcpPort?: number | undefined;
   pidFile?: string | undefined;
   runtimeCredential?: string | undefined;
+  hermesUrl?: string | undefined;
 }
 
 function parseArgs(args: string[]): ParsedCliArgs {
@@ -49,6 +50,8 @@ function parseArgs(args: string[]): ParsedCliArgs {
       config.agentId = args[++i];
     } else if (arg === "--tenant-id" && i + 1 < args.length) {
       config.tenantId = args[++i];
+    } else if (arg === "--hermes-url" && i + 1 < args.length) {
+      config.hermesUrl = args[++i];
     }
   }
   return config;
@@ -56,6 +59,8 @@ function parseArgs(args: string[]): ParsedCliArgs {
 
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
+  const hermesUrl = parsed.hermesUrl || process.env.HERMES_URL || "http://host.docker.internal:8080";
+  process.env.HERMES_URL = hermesUrl;
 
   // 1. Standalone stdio MCP bridge mode
   if (parsed.isMcp && !parsed.daemon) {
