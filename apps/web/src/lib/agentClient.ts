@@ -183,6 +183,14 @@ export class CloudOpsAgentClient {
     // 1. Fetch real discovered workloads from connected cloud accounts
     const workloads = await this.getDiscoveredWorkloads();
 
+    // Get cloud account ID from first connected account for investigation triggers
+    let cloudAccountId: string | undefined;
+    try {
+      const accounts = await fetchCloudAccounts();
+      const connected = accounts.filter((a) => a.status === "CONNECTED");
+      if (connected.length > 0) cloudAccountId = connected[0].id;
+    } catch {}
+
     // 2. Fetch real active incidents from the control plane
     let incidents: IncidentItem[] = [];
     try {
@@ -267,7 +275,7 @@ export class CloudOpsAgentClient {
               "Content-Type": "application/json",
               "x-tenant-id": "ten_default_tenant"
             },
-            body: JSON.stringify({ service: target, cluster, region: reg })
+            body: JSON.stringify({ service: target, cluster, region: reg, accountId: cloudAccountId })
           });
 
           if (simRes.ok) {

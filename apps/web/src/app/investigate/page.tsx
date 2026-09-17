@@ -74,6 +74,7 @@ export default function InvestigatePage() {
   const [discoveredWorkloads, setDiscoveredWorkloads] = useState<{ name: string; cluster?: string; region?: string }[]>([]);
   const [availableAgents, setAvailableAgents] = useState<OnboardedAgent[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string>("");
+  const [cloudAccountId, setCloudAccountId] = useState<string>("");
 
   // 1. Fetch real incidents, connected workloads, and onboarded agents from PostgreSQL API
   const loadIncidents = useCallback(async () => {
@@ -100,6 +101,7 @@ export default function InvestigatePage() {
           const accs = await accRes.json();
           if (Array.isArray(accs) && accs.length > 0 && accs[0].region) {
             setTargetRegion(accs[0].region);
+            setCloudAccountId(accs[0].id);
             const wlRes = await fetch(`http://localhost:3000/v1/cloud-accounts/${accs[0].id}/workloads`, {
               headers: { "x-tenant-id": "ten_default_tenant", "x-operator-id": "op_admin" }
             });
@@ -189,7 +191,8 @@ export default function InvestigatePage() {
           region: reg,
           severity: sev,
           alertDescription: alertDesc,
-          agentId: agId
+          agentId: agId,
+          accountId: cloudAccountId
         })
       });
 

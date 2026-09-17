@@ -133,7 +133,8 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
         try {
           const toolResult = await toolDef.handler(call.arguments || {}, {
             agentId: effectiveAgentId,
-            tenantId
+            tenantId,
+            credentials: { cloudAccountId: effectiveAccountId }
           });
           return {
             callId: call.callId,

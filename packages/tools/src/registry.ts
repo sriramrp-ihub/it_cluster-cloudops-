@@ -15,7 +15,7 @@ export interface ToolExecutionContext {
   agentId: string;
   tenantId: string;
   runId?: string;
-  credentials?: unknown;
+  credentials?: { cloudAccountId?: string } | unknown;
 }
 
 export interface CanonicalToolDefinition<TInput = any, TOutput = any> {
@@ -35,11 +35,16 @@ export interface CanonicalToolDefinition<TInput = any, TOutput = any> {
  * Resolves an ECSClient using live in-memory AWS session credentials.
  * Falls back to environment-level credentials (e.g. instance profile, ~/.aws/credentials)
  * if no explicit session is stored for this tenant — so local dev and CI still work.
+ * Returns null if no credentials are available for the tenant (caller should handle this).
  */
-function resolveEcsClient(tenantId: string, region: string, cloudAccountId?: string): ECSClient {
+function resolveEcsClient(tenantId: string, region: string, cloudAccountId?: string, contextCredentials?: { cloudAccountId?: string }): ECSClient | null {
+  // Priority 1: explicit cloudAccountId from input
+  // Priority 2: cloudAccountId from context.credentials
+  const effectiveCloudAccountId = cloudAccountId || contextCredentials?.cloudAccountId;
+
   // Try to find an active cloud account session for this tenant
-  if (cloudAccountId) {
-    const creds = defaultAwsSessionManager.getCredentials(tenantId, cloudAccountId);
+  if (effectiveCloudAccountId) {
+    const creds = defaultAwsSessionManager.getCredentials(tenantId, effectiveCloudAccountId);
     if (creds) {
       return new ECSClient({
         region,
@@ -72,8 +77,8 @@ function resolveEcsClient(tenantId: string, region: string, cloudAccountId?: str
     }
   }
 
-  // Fallback: use ambient credentials (env vars, ~/.aws/credentials, EC2 instance profile)
-  return new ECSClient({ region });
+  // No in-memory session found for this tenant
+  return null;
 }
 
 /**
@@ -98,8 +103,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional().describe("Cloud account ID for credential resolution"),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
         const res = await client.send(new DescribeClustersCommand({
           clusters: input.clusters && input.clusters.length > 0 ? input.clusters : undefined,
         }));
@@ -148,8 +163,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
         const res = await client.send(new DescribeServicesCommand({
           cluster: input.cluster,
           services: input.services,
@@ -227,8 +252,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
 
         // List stopped tasks for the service
         const listRes = await client.send(new ListTasksCommand({
@@ -324,8 +359,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
         const res = await client.send(new ListTasksCommand({
           cluster: input.cluster,
           serviceName: input.serviceName,
@@ -378,8 +423,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       // CloudWatch SDK not installed — derive health signals from ECS DescribeServices
       // This gives real, live signal (not fabricated) without needing a separate SDK package
       if (input.cluster && input.service) {
+        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+        if (!client) {
+          return {
+            provider: "aws",
+            region: input.region,
+            error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+            code: "NO_AWS_CREDENTIALS",
+            source: "live:aws:ecs",
+            timestamp: new Date().toISOString(),
+          };
+        }
         try {
-          const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
           const res = await client.send(new DescribeServicesCommand({
             cluster: input.cluster,
             services: [input.service],
@@ -458,8 +513,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
         const res = await client.send(new UpdateServiceCommand({
           cluster: input.cluster,
           service: input.service,
@@ -507,8 +572,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
 
         // First describe the current service to get active task definition
         const svcRes = await client.send(new DescribeServicesCommand({
@@ -598,8 +673,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       budgetOverride: z.boolean().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
         const res = await client.send(new UpdateServiceCommand({
           cluster: input.cluster,
           service: input.service,
@@ -649,8 +734,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
         const res = await client.send(new UpdateServiceCommand({
           cluster: input.cluster,
           service: input.service,
@@ -699,8 +794,18 @@ export const CANONICAL_TOOLS: CanonicalToolDefinition[] = [
       cloudAccountId: z.string().optional(),
     }),
     handler: async (input, ctx) => {
+      const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId, ctx.credentials as { cloudAccountId?: string } | undefined);
+      if (!client) {
+        return {
+          provider: "aws",
+          region: input.region,
+          error: "No AWS account connected for this tenant. Connect an AWS account via POST /v1/cloud-accounts first.",
+          code: "NO_AWS_CREDENTIALS",
+          source: "live:aws:ecs",
+          timestamp: new Date().toISOString(),
+        };
+      }
       try {
-        const client = resolveEcsClient(ctx.tenantId, input.region, input.cloudAccountId);
         const res = await client.send(new RegisterTaskDefinitionCommand({
           family: input.family,
           containerDefinitions: [

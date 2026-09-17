@@ -169,7 +169,8 @@ export class HermesAgentAdapter implements AgentAdapter {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 2500);
 
-        const res = await fetch(`${candidate}/api/model/auxiliary`, {
+        // Use /api/model/info which works without authentication
+        const res = await fetch(`${candidate}/api/model/info`, {
           headers: {
             "X-Hermes-Session-Token": this.sessionToken
           },
@@ -179,8 +180,8 @@ export class HermesAgentAdapter implements AgentAdapter {
 
         if (res.ok) {
           const data = (await res.json()) as any;
-          const discoveredModel = data?.main?.model || this.activeModel || "agent-runtime";
-          const discoveredProvider = data?.main?.provider || this.activeProvider || "local-daemon";
+          const discoveredModel = data?.model || this.activeModel || "agent-runtime";
+          const discoveredProvider = data?.provider || this.activeProvider || "local-daemon";
           this.activeModel = discoveredModel;
           this.activeProvider = discoveredProvider;
           this.endpoint = candidate; // Dynamically adopt working endpoint
