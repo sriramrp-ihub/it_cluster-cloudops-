@@ -70,6 +70,16 @@ cloudops/
 - **npm**: `>= 11.0.0`
 - **PostgreSQL**: `>= 15.0` (running on localhost:5432)
 
+### Hermes Daemon (Required for LLM Operations)
+
+Before using the onboarding wizard or connecting agents, start the Hermes daemon:
+
+```bash
+hermes serve --port 8080
+```
+
+This runs the LLM + investigation engine that the CloudOps connector bridges to via MCP.
+
 ---
 
 ## Getting Started
@@ -145,3 +155,22 @@ CloudOps enforces strict credential separation across four distinct categories:
 2. **Claim Credential (`co_agent_...`)**: 256-bit cryptographically random token used once to bootstrap agent identity upon human approval.
 3. **Runtime Agent Credential (`cred_...`)**: Replaceable credential for Agent Gateway authentication. Rotatable without altering the agent's immutable identity (`ag_<uuid>`).
 4. **JIT Cloud Credentials**: Temporary, scoped AWS STS AssumeRole credentials generated server-side for authorized operations. **Never exposed to agents, prompts, logs, or UI.**
+
+---
+
+## Docker Deployment & Rebuild
+
+After code changes, rebuild the Docker containers:
+
+```bash
+cd /Users/itcluster/cloudops/it_cluster-cloudops-
+docker-compose build --no-cache cloudops && docker-compose up -d
+```
+
+Wait 2-3 minutes for the rebuild to complete, then verify:
+
+```bash
+curl -s http://localhost:3001/agents/new | grep -c "Invite Token"
+curl -s http://localhost:3001/agents/new | grep -c "Hermes Runtime"
+curl -s http://localhost:3001/agents/new | grep -c "Control Plane"
+```

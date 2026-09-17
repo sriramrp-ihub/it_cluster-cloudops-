@@ -280,7 +280,10 @@ export default function NewAgentWizardPage() {
       const claimRes = await fetch(`${apiBase}/v1/onboarding/claim`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ joinRequestId })
+        body: JSON.stringify({
+          joinRequestId,
+          inviteToken: inviteToken.trim()
+        })
       });
 
       if (!claimRes.ok) {
