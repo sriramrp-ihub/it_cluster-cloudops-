@@ -8,6 +8,7 @@ import type {
 import { OnboardingClient } from "./onboardingClient.js";
 import { GatewayClient } from "./gatewayClient.js";
 import type { AgentId, SessionId } from "@cloudops/shared";
+import type { CapabilityResponseMessage } from "@cloudops/gateway";
 
 export class CloudOpsConnector extends EventEmitter {
   private _state: ConnectorState = "INITIALIZING";
@@ -218,4 +219,24 @@ export class CloudOpsConnector extends EventEmitter {
     await this.gatewayClient.connectWithRuntime();
     this.setState("CONNECTED");
   }
+
+  /**
+   * Invoke a capability through the connected CloudOps Gateway.
+   */
+  async invokeCapability(
+    capability: string,
+    args: Record<string, unknown> = {},
+    options?: {
+      traceparent?: string;
+      approvalId?: string;
+      budgetOverride?: boolean;
+      timeoutMs?: number;
+    }
+  ): Promise<CapabilityResponseMessage> {
+    if (!this.gatewayClient || !this.gatewayClient.isConnected) {
+      throw new Error("Cannot invoke capability: Gateway client not connected");
+    }
+    return this.gatewayClient.invokeCapability(capability, args, options);
+  }
 }
+

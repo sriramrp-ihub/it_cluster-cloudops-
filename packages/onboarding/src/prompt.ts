@@ -135,25 +135,27 @@ The response will contain:
 - \`agentId\`: Your permanent sovereign identity (\`ag_...\`)
 - \`claimCredential\`: A high-entropy single-use bootstrap token (\`co_agent_...\`)
 
-### Step 5: Connect to CloudOps Gateway
+### Step 5: Connect to CloudOps
 
-External runtimes can maintain persistent Gateway connectivity and heartbeats using either the **CloudOps Agent Connector** (recommended) or a direct WebSocket connection:
+External agents can interact with CloudOps using either **Model Context Protocol (MCP)** or direct **Gateway WebSocket (ACP)**:
 
-#### Option A (Recommended): CloudOps Agent Connector
-To automate manifest discovery, join submission, approval polling, bootstrap claim, and long-lived Gateway connection with background heartbeats:
+#### Option A: Model Context Protocol (MCP) via SSE (Recommended for Hermes / Claude / Cursor)
+CloudOps exposes a governed Model Context Protocol server over HTTP Server-Sent Events (SSE). To attach all governed multi-cloud tools directly to Hermes CLI:
 
 \`\`\`bash
-npx @cloudops/connector --invite ${inviteToken} --url ${apiBaseUrl}
+hermes mcp add cloudops --url "${apiBaseUrl}/v1/mcp/sse?agentId=<YOUR_AGENT_ID>&tenantId=${tenantId}"
 \`\`\`
 
-#### Option B: Direct WebSocket Connection
-Establish a persistent WebSocket connection to the Gateway:
+This immediately registers CloudOps SRE tools (ECS inspection, CloudWatch metrics, restart/update with human approval gate) over standard HTTP/SSE without downloading any local npm packages.
+
+#### Option B: Direct Gateway WebSocket Connection (Native ACP)
+To maintain an active presence in the CloudOps Operator fleet directory and receive real-time operational turns:
 
 \`\`\`
 WebSocket: ${wsBaseUrl}/v1/gateway/ws
 \`\`\`
 
-Immediately send the initial \`AUTH\` frame within 10 seconds:
+Immediately send the initial \`AUTH\` frame within 10 seconds of connecting:
 
 \`\`\`json
 {
@@ -169,15 +171,22 @@ Immediately send the initial \`AUTH\` frame within 10 seconds:
 \`\`\`
 
 Upon receiving \`AUTH_SUCCESS\`:
-1. Retain the issued runtime secret (\`cred_...\`) for subsequent sessions.
-2. Send \`HEARTBEAT\` frames every 30 seconds to maintain session liveness:
-   \`\`\`json
-   {
-     "type": "HEARTBEAT",
-     "sessionId": "<SESSION_ID>",
-     "timestamp": <CURRENT_UNIX_TIMESTAMP_MS>
-   }
-   \`\`\`
+1. Retain the issued runtime secret (\`runtimeCredential.secret\`) for subsequent reconnects (\`authType: "RUNTIME"\`).
+2. Send \`HEARTBEAT\` frames every 15–30 seconds:
+\`\`\`json
+{
+  "type": "HEARTBEAT",
+  "sessionId": "<SESSION_ID>",
+  "timestamp": <CURRENT_UNIX_TIMESTAMP_MS>
+}
+\`\`\`
+
+#### Option C: Local Workspace Connector (When running within the CloudOps repository)
+If you are running directly inside the CloudOps workspace repository, you can automate manifest discovery, join submission, approval polling, bootstrap claim, and WebSocket connection:
+
+\`\`\`bash
+npm run connector -- --invite ${inviteToken} --url ${apiBaseUrl}
+\`\`\`
 
 ---
 

@@ -27,6 +27,8 @@ export interface GatewayAuthResult {
     expiresAt: string;
   } | undefined;
   authType: "BOOTSTRAP" | "RUNTIME";
+  agentName?: string | undefined;
+  grantedCapabilities?: string[] | undefined;
 }
 
 export class GatewayAuthenticator {
@@ -195,6 +197,24 @@ export class GatewayAuthenticator {
         this.db
       );
 
+      const joinRequest = await tx
+        .selectFrom("agent_join_requests")
+        .select(["agent_name", "declared_capabilities"])
+        .where("id", "=", claimRow.join_request_id)
+        .executeTakeFirst();
+
+      let grantedCapabilities: string[] = [];
+      if (joinRequest?.declared_capabilities) {
+        try {
+          grantedCapabilities = typeof joinRequest.declared_capabilities === "string"
+            ? JSON.parse(joinRequest.declared_capabilities)
+            : joinRequest.declared_capabilities;
+        } catch {
+          grantedCapabilities = [];
+        }
+      }
+      const agentName = joinRequest?.agent_name || msg.runtimeInfo?.name || "agent";
+
       return {
         session,
         previousSessionId,
@@ -203,7 +223,9 @@ export class GatewayAuthenticator {
           secret: runtimeCred.secret,
           expiresAt: runtimeCred.expiresAt.toISOString()
         },
-        authType: "BOOTSTRAP"
+        authType: "BOOTSTRAP",
+        agentName,
+        grantedCapabilities
       };
     });
   }
@@ -233,6 +255,24 @@ export class GatewayAuthenticator {
         gatewayNodeId
       );
 
+      const joinRequest = await this.db
+        .selectFrom("agent_join_requests")
+        .select(["agent_name", "declared_capabilities"])
+        .where("agent_id", "=", credRecord.agentId)
+        .executeTakeFirst();
+
+      let grantedCapabilities: string[] = [];
+      if (joinRequest?.declared_capabilities) {
+        try {
+          grantedCapabilities = typeof joinRequest.declared_capabilities === "string"
+            ? JSON.parse(joinRequest.declared_capabilities)
+            : joinRequest.declared_capabilities;
+        } catch {
+          grantedCapabilities = [];
+        }
+      }
+      const agentName = joinRequest?.agent_name || msg.runtimeInfo?.name || "agent";
+
       await recordAuditEvent(
         {
           tenantId: credRecord.tenantId,
@@ -254,7 +294,9 @@ export class GatewayAuthenticator {
         session,
         previousSessionId,
         runtimeCredential: undefined,
-        authType: "RUNTIME"
+        authType: "RUNTIME",
+        agentName,
+        grantedCapabilities
       };
     } catch (err: any) {
       await recordAuditEvent(

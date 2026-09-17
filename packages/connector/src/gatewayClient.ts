@@ -8,7 +8,9 @@ import type {
   HeartbeatAckMessage,
   CredentialRotatedMessage,
   SessionTerminatedMessage,
-  ErrorMessage
+  ErrorMessage,
+  CapabilityRequestMessage,
+  CapabilityResponseMessage
 } from "@cloudops/gateway";
 import type { StoredRuntimeCredential } from "./types.js";
 
@@ -185,6 +187,10 @@ export class GatewayClient extends EventEmitter {
         this.emit("server_error", msg);
         break;
 
+      case "CAPABILITY_RESPONSE":
+        this.emit("capability_response", msg);
+        break;
+
       default:
         break;
     }
@@ -205,6 +211,62 @@ export class GatewayClient extends EventEmitter {
         this.ws.send(JSON.stringify(ping));
       }
     }, intervalMs);
+  }
+
+  /**
+   * Invoke a capability through CloudOps Gateway with security policy enforcement.
+   */
+  async invokeCapability(
+    capability: string,
+    args: Record<string, unknown> = {},
+    options?: {
+      traceparent?: string;
+      approvalId?: string;
+      budgetOverride?: boolean;
+      timeoutMs?: number;
+    }
+  ): Promise<CapabilityResponseMessage> {
+    if (!this.isConnected || !this.ws) {
+      throw new Error("Cannot invoke capability: Gateway connection is not active");
+    }
+
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const timeoutMs = options?.timeoutMs || 10000;
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.off("capability_response", onResponse);
+        reject(new Error(`Timeout waiting for capability response for ${capability}`));
+      }, timeoutMs);
+
+      const onResponse = (msg: CapabilityResponseMessage) => {
+        if (msg.requestId === requestId) {
+          clearTimeout(timer);
+          this.off("capability_response", onResponse);
+          resolve(msg);
+        }
+      };
+
+      this.on("capability_response", onResponse);
+
+      const capMsg: CapabilityRequestMessage = {
+        type: "CAPABILITY_REQUEST",
+        requestId,
+        capability,
+        arguments: args,
+        traceparent: options?.traceparent,
+        approvalId: options?.approvalId,
+        budgetOverride: options?.budgetOverride
+      };
+
+      try {
+        this.ws!.send(JSON.stringify(capMsg));
+      } catch (err) {
+        clearTimeout(timer);
+        this.off("capability_response", onResponse);
+        reject(err);
+      }
+    });
   }
 
   /**

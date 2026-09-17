@@ -1,10 +1,12 @@
 import type { WebSocket } from "ws";
 import {
   RuntimeCredentialService,
-  RuntimeSessionService
+  RuntimeSessionService,
+  recordAuditEvent
 } from "@cloudops/runtime";
 import { GatewayAuthenticator } from "./authenticator.js";
-import { GatewayConnectionManager } from "./connectionManager.js";
+import { GatewayConnectionManager, type ConnectedSocketMetadata } from "./connectionManager.js";
+import { DefenseClawClient, generateTraceparent, isValidTraceparent } from "./defenseClawClient.js";
 import {
   ClientMessageSchema,
   type AuthSuccessMessage,
@@ -12,7 +14,9 @@ import {
   type HeartbeatAckMessage,
   type CredentialRotatedMessage,
   type ErrorMessage,
-  type ServerMessage
+  type ServerMessage,
+  type CapabilityRequestMessage,
+  type CapabilityResponseMessage
 } from "./protocol.js";
 
 export interface GatewayHandlerOptions {
@@ -20,6 +24,7 @@ export interface GatewayHandlerOptions {
   heartbeatIntervalMs?: number;
   heartbeatTimeoutMs?: number;
   gatewayNodeId?: string;
+  defenseClaw?: DefenseClawClient;
 }
 
 export class GatewayHandler {
@@ -27,6 +32,7 @@ export class GatewayHandler {
   private readonly heartbeatIntervalMs: number;
   private readonly heartbeatTimeoutMs: number;
   private readonly gatewayNodeId: string;
+  public readonly defenseClaw: DefenseClawClient;
 
   constructor(
     public readonly authenticator: GatewayAuthenticator = new GatewayAuthenticator(),
@@ -39,6 +45,7 @@ export class GatewayHandler {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs || 15000;
     this.heartbeatTimeoutMs = options.heartbeatTimeoutMs || 45000;
     this.gatewayNodeId = options.gatewayNodeId || "gateway-node-1";
+    this.defenseClaw = options.defenseClaw || new DefenseClawClient();
   }
 
   /**
@@ -115,7 +122,9 @@ export class GatewayHandler {
             this.connectionManager.registerSession(
               authResult.session,
               ws,
-              authResult.previousSessionId
+              authResult.previousSessionId,
+              authResult.grantedCapabilities,
+              authResult.agentName
             );
 
             const successMsg: AuthSuccessMessage = {
@@ -233,6 +242,11 @@ export class GatewayHandler {
             ws.send(JSON.stringify(errMsg));
             break;
           }
+
+          case "CAPABILITY_REQUEST": {
+            await this.handleCapabilityRequest(ws, meta, msg);
+            break;
+          }
         }
       } catch (err: any) {
         const errMsg: ErrorMessage = {
@@ -263,5 +277,116 @@ export class GatewayHandler {
         await this.sessionService.terminateSession(meta.sessionId, "CLIENT_DISCONNECT");
       }
     });
+  }
+
+  private async handleCapabilityRequest(
+    ws: WebSocket,
+    meta: ConnectedSocketMetadata,
+    msg: CapabilityRequestMessage
+  ): Promise<void> {
+    const traceparent = isValidTraceparent(msg.traceparent)
+      ? msg.traceparent!
+      : generateTraceparent();
+
+    const evalResult = await this.defenseClaw.evaluate({
+      correlationId: msg.requestId,
+      agentId: meta.agentId,
+      tenantId: meta.tenantId,
+      capability: msg.capability,
+      arguments: msg.arguments || {},
+      grantedCapabilities: meta.grantedCapabilities,
+      traceparent,
+      approvalGranted: Boolean(msg.approvalId),
+      budgetOverride: msg.budgetOverride
+    });
+
+    if (evalResult.verdict === "BLOCK") {
+      await recordAuditEvent({
+        tenantId: meta.tenantId,
+        eventType: "CAPABILITY_BLOCKED",
+        actorType: "AGENT",
+        actorId: meta.agentId,
+        agentId: meta.agentId,
+        payload: {
+          capability: msg.capability,
+          ruleId: evalResult.ruleId,
+          reason: evalResult.reason,
+          traceparent
+        }
+      }).catch(() => {});
+
+      const response: CapabilityResponseMessage = {
+        type: "CAPABILITY_RESPONSE",
+        requestId: msg.requestId,
+        status: "BLOCKED",
+        error: {
+          code: evalResult.ruleId === "DEFENSECLAW_UNAVAILABLE" ? "DEFENSECLAW_UNAVAILABLE" : "POLICY_VIOLATION",
+          message: evalResult.reason || "Blocked by security policy",
+          ruleId: evalResult.ruleId,
+          verdict: "BLOCK"
+        },
+        traceparent
+      };
+      ws.send(JSON.stringify(response));
+      return;
+    }
+
+    if (evalResult.verdict === "APPROVAL_REQUIRED") {
+      await recordAuditEvent({
+        tenantId: meta.tenantId,
+        eventType: "CAPABILITY_APPROVAL_REQUIRED",
+        actorType: "AGENT",
+        actorId: meta.agentId,
+        agentId: meta.agentId,
+        payload: {
+          capability: msg.capability,
+          ruleId: evalResult.ruleId,
+          reason: evalResult.reason,
+          traceparent
+        }
+      }).catch(() => {});
+
+      const response: CapabilityResponseMessage = {
+        type: "CAPABILITY_RESPONSE",
+        requestId: msg.requestId,
+        status: "APPROVAL_REQUIRED",
+        error: {
+          code: "APPROVAL_REQUIRED",
+          message: evalResult.reason || "Approval required for capability execution",
+          ruleId: evalResult.ruleId,
+          verdict: "APPROVAL_REQUIRED"
+        },
+        traceparent
+      };
+      ws.send(JSON.stringify(response));
+      return;
+    }
+
+    // Verdict is ALLOW
+    await recordAuditEvent({
+      tenantId: meta.tenantId,
+      eventType: "CAPABILITY_INVOKED",
+      actorType: "AGENT",
+      actorId: meta.agentId,
+      agentId: meta.agentId,
+      payload: {
+        capability: msg.capability,
+        arguments: msg.arguments,
+        traceparent
+      }
+    }).catch(() => {});
+
+    const response: CapabilityResponseMessage = {
+      type: "CAPABILITY_RESPONSE",
+      requestId: msg.requestId,
+      status: "SUCCESS",
+      data: {
+        executed: true,
+        capability: msg.capability,
+        arguments: msg.arguments
+      },
+      traceparent
+    };
+    ws.send(JSON.stringify(response));
   }
 }

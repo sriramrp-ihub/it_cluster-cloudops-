@@ -32,11 +32,22 @@ export const DisconnectMessageSchema = z.object({
   reason: z.string().optional()
 });
 
+export const CapabilityRequestMessageSchema = z.object({
+  type: z.literal("CAPABILITY_REQUEST"),
+  requestId: z.string().min(1),
+  capability: z.string().min(1),
+  arguments: z.record(z.unknown()).default({}),
+  traceparent: z.string().optional(),
+  approvalId: z.string().optional(),
+  budgetOverride: z.boolean().optional()
+});
+
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   AuthMessageSchema,
   HeartbeatMessageSchema,
   RotateCredentialMessageSchema,
-  DisconnectMessageSchema
+  DisconnectMessageSchema,
+  CapabilityRequestMessageSchema
 ]);
 
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
@@ -44,6 +55,7 @@ export type AuthMessage = z.infer<typeof AuthMessageSchema>;
 export type HeartbeatMessage = z.infer<typeof HeartbeatMessageSchema>;
 export type RotateCredentialMessage = z.infer<typeof RotateCredentialMessageSchema>;
 export type DisconnectMessage = z.infer<typeof DisconnectMessageSchema>;
+export type CapabilityRequestMessage = z.infer<typeof CapabilityRequestMessageSchema>;
 
 export interface AuthSuccessMessage {
   type: "AUTH_SUCCESS";
@@ -93,10 +105,25 @@ export interface ErrorMessage {
   message: string;
 }
 
+export interface CapabilityResponseMessage {
+  type: "CAPABILITY_RESPONSE";
+  requestId: string;
+  status: "SUCCESS" | "BLOCKED" | "APPROVAL_REQUIRED";
+  data?: unknown;
+  error?: {
+    code: string;
+    message: string;
+    ruleId?: string | undefined;
+    verdict?: string | undefined;
+  } | undefined;
+  traceparent?: string | undefined;
+}
+
 export type ServerMessage =
   | AuthSuccessMessage
   | AuthFailedMessage
   | HeartbeatAckMessage
   | CredentialRotatedMessage
   | SessionTerminatedMessage
-  | ErrorMessage;
+  | ErrorMessage
+  | CapabilityResponseMessage;

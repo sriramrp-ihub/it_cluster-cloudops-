@@ -14,6 +14,8 @@ export interface OnboardingManifest {
   endpoints: {
     join: string;
     claim: string;
+    gatewayWs?: string;
+    mcpSse?: string;
   };
   joinSchema: {
     type: "object";
@@ -68,7 +70,9 @@ export class ManifestService {
       supportedAgentTypes: ["hermes", "openclaw", "custom"],
       endpoints: {
         join: `/v1/onboarding/${rawToken}/join`,
-        claim: "/v1/onboarding/claim"
+        claim: "/v1/onboarding/claim",
+        gatewayWs: "/v1/gateway/ws",
+        mcpSse: "/v1/mcp/sse"
       },
       joinSchema: {
         type: "object",

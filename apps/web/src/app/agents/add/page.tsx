@@ -95,23 +95,19 @@ export default function AddAgentPage() {
     const slug = agentName.toLowerCase().replace(/[^a-z0-9]/g, "_") || "agent";
     const agentIdPlaceholder = `ag_${slug}_mcp`;
     if (tab === "hermes") {
-      return `# Add CloudOps Governed MCP Server to Hermes CLI
-hermes mcp add cloudops npx @cloudops/connector --mcp --agent-id "${agentIdPlaceholder}" --tenant-id "${tenantId}"`;
+      return `# Add CloudOps Governed MCP Server to Hermes CLI (Native SSE - Zero Install)
+hermes mcp add cloudops --url "${apiBase}/v1/mcp/sse?agentId=${agentIdPlaceholder}&tenantId=${tenantId}"
+
+# Optional: verify Hermes can read CloudOps tools
+# hermes mcp list
+# hermes mcp test cloudops`;
     }
     if (tab === "claude") {
       return JSON.stringify(
         {
           mcpServers: {
             cloudops: {
-              command: "npx",
-              args: [
-                "@cloudops/connector",
-                "--mcp",
-                "--agent-id",
-                agentIdPlaceholder,
-                "--tenant-id",
-                tenantId
-              ]
+              url: `${apiBase}/v1/mcp/sse?agentId=${agentIdPlaceholder}&tenantId=${tenantId}`
             }
           }
         },
@@ -124,15 +120,7 @@ hermes mcp add cloudops npx @cloudops/connector --mcp --agent-id "${agentIdPlace
         {
           mcpServers: {
             cloudops: {
-              command: "npx",
-              args: [
-                "@cloudops/connector",
-                "--mcp",
-                "--agent-id",
-                agentIdPlaceholder,
-                "--tenant-id",
-                tenantId
-              ]
+              url: `${apiBase}/v1/mcp/sse?agentId=${agentIdPlaceholder}&tenantId=${tenantId}`
             }
           }
         },

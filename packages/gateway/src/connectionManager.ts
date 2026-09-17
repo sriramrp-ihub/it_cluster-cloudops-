@@ -9,6 +9,8 @@ export interface ConnectedSocketMetadata {
   tenantId: string;
   credentialId: CredentialId;
   lastHeartbeatTime: number;
+  agentName?: string | undefined;
+  grantedCapabilities?: string[] | undefined;
 }
 
 export class GatewayConnectionManager {
@@ -25,7 +27,9 @@ export class GatewayConnectionManager {
   registerSession(
     session: RuntimeSessionRecord,
     ws: WebSocket,
-    previousSessionId?: SessionId | undefined
+    previousSessionId?: SessionId | undefined,
+    grantedCapabilities?: string[] | undefined,
+    agentName?: string | undefined
   ): void {
     // 1. If this connection replaced a previous session, terminate previous socket
     if (previousSessionId) {
@@ -53,7 +57,9 @@ export class GatewayConnectionManager {
       agentId: session.agentId,
       tenantId: session.tenantId,
       credentialId: session.credentialId,
-      lastHeartbeatTime: Date.now()
+      lastHeartbeatTime: Date.now(),
+      agentName,
+      grantedCapabilities: grantedCapabilities || []
     });
   }
 
