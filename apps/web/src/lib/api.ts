@@ -199,7 +199,11 @@ export async function approveJoinRequest(
 ): Promise<{ joinRequestId: string; agentId: string; status: string }> {
   const res = await fetch(`${API_BASE}/v1/agent-join-requests/${joinRequestId}/approve`, {
     method: "POST",
-    headers: getAuthHeaders(tenantId, operatorId)
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(tenantId, operatorId)
+    },
+    body: JSON.stringify({})
   });
 
   if (!res.ok) {
@@ -526,7 +530,8 @@ export async function testAgent(
     headers: {
       "Content-Type": "application/json",
       ...getAuthHeaders(tenantId, operatorId)
-    }
+    },
+    body: JSON.stringify({})
   });
 
   if (!res.ok) {
