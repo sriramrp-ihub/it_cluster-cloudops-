@@ -1,0 +1,656 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for ``defenseclaw.bundle_refresh``.
+
+Covers the rsync-style overwrite primitive, the Splunk + local
+observability refresh wrappers (preserve / refresh contracts), and
+the docker-ps-based running-stack detector. No real Docker calls are
+made — :func:`is_compose_project_running` is exercised against a
+mocked ``subprocess.run``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+
+class TestRsyncOverwrite(unittest.TestCase):
+    """Cover the low-level :func:`_rsync_overwrite` primitive."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dclaw-rsync-")
+        self.src = os.path.join(self.tmp, "src")
+        self.dest = os.path.join(self.tmp, "dest")
+        os.makedirs(self.src)
+        os.makedirs(self.dest)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, root: str, rel: str, contents: str) -> str:
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        return path
+
+    def test_overwrites_dest_files_from_src(self) -> None:
+        from defenseclaw.bundle_refresh import _rsync_overwrite
+
+        self._write(self.src, "bin/run.sh", "new\n")
+        self._write(self.dest, "bin/run.sh", "old\n")
+
+        refreshed, preserved, errors = _rsync_overwrite(
+            src=Path(self.src),
+            dest=Path(self.dest),
+            preserve=(),
+        )
+
+        self.assertEqual(errors, [])
+        self.assertIn("bin/run.sh", refreshed)
+        self.assertEqual(preserved, [])
+        with open(os.path.join(self.dest, "bin/run.sh"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "new\n")
+
+    def test_creates_missing_dest_subdirs(self) -> None:
+        from defenseclaw.bundle_refresh import _rsync_overwrite
+
+        self._write(self.src, "compose/docker-compose.local.yml", "new\n")
+
+        refreshed, _preserved, errors = _rsync_overwrite(
+            src=Path(self.src),
+            dest=Path(self.dest),
+            preserve=(),
+        )
+
+        self.assertEqual(errors, [])
+        self.assertIn("compose/docker-compose.local.yml", refreshed)
+        path = os.path.join(self.dest, "compose/docker-compose.local.yml")
+        self.assertTrue(os.path.isfile(path))
+
+    def test_preserves_files_listed_explicitly(self) -> None:
+        from defenseclaw.bundle_refresh import _rsync_overwrite
+
+        self._write(self.src, "env/.env", "new-secret\n")
+        self._write(self.dest, "env/.env", "operator-secret\n")
+
+        refreshed, preserved, errors = _rsync_overwrite(
+            src=Path(self.src),
+            dest=Path(self.dest),
+            preserve=("env/.env",),
+        )
+
+        self.assertEqual(errors, [])
+        self.assertNotIn("env/.env", refreshed)
+        self.assertIn("env/.env", preserved)
+        with open(os.path.join(self.dest, "env/.env"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "operator-secret\n")
+
+    def test_preserves_whole_directory_subtree(self) -> None:
+        from defenseclaw.bundle_refresh import _rsync_overwrite
+
+        self._write(self.src, "splunk/build/app.tgz", "new-tarball\n")
+        self._write(self.dest, "splunk/build/app.tgz", "old-tarball\n")
+        self._write(self.dest, "splunk/build/old-only.txt", "operator-only\n")
+
+        refreshed, preserved, errors = _rsync_overwrite(
+            src=Path(self.src),
+            dest=Path(self.dest),
+            preserve=("splunk/build",),
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(refreshed, [])
+        self.assertIn("splunk/build", preserved)
+        with open(os.path.join(self.dest, "splunk/build/app.tgz"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "old-tarball\n")
+        self.assertTrue(os.path.isfile(os.path.join(self.dest, "splunk/build/old-only.txt")))
+
+    def test_does_not_prune_dest_only_files_outside_preserve(self) -> None:
+        """A file present only in dest survives a refresh.
+
+        The seeded copy can have generated artefacts (e.g.
+        ``splunk/build/defenseclaw_local_mode.tgz``) that should not
+        be deleted just because they don't appear in the source bundle.
+        """
+        from defenseclaw.bundle_refresh import _rsync_overwrite
+
+        self._write(self.src, "bin/run.sh", "new\n")
+        self._write(self.dest, "bin/run.sh", "old\n")
+        self._write(self.dest, "bin/dest-only.sh", "i-stay\n")
+
+        _refreshed, _preserved, errors = _rsync_overwrite(
+            src=Path(self.src),
+            dest=Path(self.dest),
+            preserve=(),
+        )
+
+        self.assertEqual(errors, [])
+        self.assertTrue(os.path.isfile(os.path.join(self.dest, "bin/dest-only.sh")))
+
+
+class TestRefreshSplunkBridge(unittest.TestCase):
+    """Cover the :func:`refresh_splunk_bridge` wrapper."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dclaw-splunk-refresh-")
+        self.bundle = tempfile.mkdtemp(prefix="dclaw-splunk-bundle-")
+
+        os.makedirs(os.path.join(self.bundle, "bin"))
+        with open(
+            os.path.join(self.bundle, "bin", "splunk-claw-bridge"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("#!/usr/bin/env bash\n# new bridge\n")
+        os.makedirs(os.path.join(self.bundle, "compose"))
+        with open(
+            os.path.join(self.bundle, "compose", "docker-compose.local.yml"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("name: defenseclaw-splunk-local\n# new compose\n")
+        os.makedirs(os.path.join(self.bundle, "env"))
+        with open(
+            os.path.join(self.bundle, "env", ".env.example"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("# example env (refreshed)\n")
+        os.makedirs(os.path.join(self.bundle, "s3_exporter"))
+        with open(
+            os.path.join(self.bundle, "s3_exporter", "Dockerfile"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("# new s3 exporter\n")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.bundle, ignore_errors=True)
+
+    def _seeded_dest(self) -> str:
+        return os.path.join(self.tmp, "splunk-bridge")
+
+    @patch("defenseclaw.bundle_refresh.bundled_splunk_bridge_dir")
+    def test_initial_seed_when_dest_missing(self, mock_bundle: MagicMock) -> None:
+        from defenseclaw.bundle_refresh import refresh_splunk_bridge
+
+        mock_bundle.return_value = Path(self.bundle)
+        result = refresh_splunk_bridge(self.tmp)
+
+        self.assertTrue(result.refreshed)
+        self.assertEqual(result.refreshed_paths, ["(initial seed)"])
+        bridge_bin = os.path.join(self._seeded_dest(), "bin", "splunk-claw-bridge")
+        self.assertTrue(os.path.isfile(bridge_bin))
+        self.assertTrue(os.access(bridge_bin, os.X_OK))
+
+    @patch("defenseclaw.bundle_refresh.bundled_splunk_bridge_dir")
+    def test_refresh_overwrites_maintainer_files(self, mock_bundle: MagicMock) -> None:
+        """A re-run after the bundle changes copies the new files
+        across, ensuring operators who already ran ``init`` actually
+        get bundle changes shipped post-PR-227 (s3_exporter, compose).
+        """
+        from defenseclaw.bundle_refresh import refresh_splunk_bridge
+
+        mock_bundle.return_value = Path(self.bundle)
+        # First seed.
+        refresh_splunk_bridge(self.tmp)
+
+        # Now bump bundle versions.
+        with open(
+            os.path.join(self.bundle, "compose", "docker-compose.local.yml"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("name: defenseclaw-splunk-local\n# v2 compose\n")
+        with open(
+            os.path.join(self.bundle, "s3_exporter", "Dockerfile"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("# v2 s3 exporter\n")
+
+        result = refresh_splunk_bridge(self.tmp)
+        self.assertTrue(result.refreshed)
+        self.assertIn("compose/docker-compose.local.yml", result.refreshed_paths)
+        self.assertIn("s3_exporter/Dockerfile", result.refreshed_paths)
+
+        with open(
+            os.path.join(self._seeded_dest(), "compose", "docker-compose.local.yml"),
+            encoding="utf-8",
+        ) as handle:
+            self.assertIn("v2 compose", handle.read())
+        with open(
+            os.path.join(self._seeded_dest(), "s3_exporter", "Dockerfile"),
+            encoding="utf-8",
+        ) as handle:
+            self.assertIn("v2 s3 exporter", handle.read())
+
+    @patch("defenseclaw.bundle_refresh.bundled_splunk_bridge_dir")
+    def test_refresh_preserves_operator_env_dotenv(self, mock_bundle: MagicMock) -> None:
+        """``env/.env`` carries operator secrets (SPLUNK_PASSWORD, AWS
+        keys) and must never be overwritten by a refresh.
+        """
+        from defenseclaw.bundle_refresh import refresh_splunk_bridge
+
+        mock_bundle.return_value = Path(self.bundle)
+        refresh_splunk_bridge(self.tmp)
+
+        operator_env = os.path.join(self._seeded_dest(), "env", ".env")
+        with open(operator_env, "w", encoding="utf-8") as handle:
+            handle.write("SPLUNK_PASSWORD=do-not-overwrite\n")
+
+        # Now ship a new bundle that includes a stale env/.env we
+        # should NOT honour.
+        with open(
+            os.path.join(self.bundle, "env", ".env"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("SPLUNK_PASSWORD=stale-from-bundle\n")
+
+        result = refresh_splunk_bridge(self.tmp)
+        self.assertIn("env/.env", result.preserved_paths)
+        self.assertNotIn("env/.env", result.refreshed_paths)
+        with open(operator_env, encoding="utf-8") as handle:
+            self.assertIn("do-not-overwrite", handle.read())
+
+    @patch("defenseclaw.bundle_refresh.bundled_splunk_bridge_dir")
+    def test_refresh_preserves_generated_app_tarball(self, mock_bundle: MagicMock) -> None:
+        from defenseclaw.bundle_refresh import refresh_splunk_bridge
+
+        mock_bundle.return_value = Path(self.bundle)
+        refresh_splunk_bridge(self.tmp)
+
+        build_dir = os.path.join(self._seeded_dest(), "splunk", "build")
+        os.makedirs(build_dir, exist_ok=True)
+        tarball = os.path.join(build_dir, "defenseclaw_local_mode.tgz")
+        with open(tarball, "wb") as handle:
+            handle.write(b"\x1f\x8b\x08\x00fake")  # gzip magic + junk
+
+        # A new bundle that ships a different tarball — we should not
+        # ferry it over because we always rebuild from app source via
+        # package_local_mode_app.sh on `up`.
+        os.makedirs(os.path.join(self.bundle, "splunk", "build"), exist_ok=True)
+        with open(
+            os.path.join(self.bundle, "splunk", "build", "defenseclaw_local_mode.tgz"),
+            "wb",
+        ) as handle:
+            handle.write(b"NEW")
+
+        refresh_splunk_bridge(self.tmp)
+        with open(tarball, "rb") as handle:
+            data = handle.read()
+        self.assertNotEqual(data, b"NEW")  # operator artefact survived
+
+    @patch("defenseclaw.bundle_refresh.bundled_splunk_bridge_dir")
+    def test_missing_bundle_returns_skipped(self, mock_bundle: MagicMock) -> None:
+        from defenseclaw.bundle_refresh import refresh_splunk_bridge
+
+        mock_bundle.return_value = Path(self.bundle) / "does-not-exist"
+        result = refresh_splunk_bridge(self.tmp)
+
+        self.assertFalse(result.refreshed)
+        self.assertIsNotNone(result.skipped_reason)
+        self.assertFalse(os.path.isdir(self._seeded_dest()))
+
+
+class TestRefreshLocalObservabilityStack(unittest.TestCase):
+    """Cover :func:`refresh_local_observability_stack`."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dclaw-obs-refresh-")
+        self.bundle = tempfile.mkdtemp(prefix="dclaw-obs-bundle-")
+
+        os.makedirs(os.path.join(self.bundle, "bin"))
+        with open(
+            os.path.join(self.bundle, "bin", "openclaw-observability-bridge"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("#!/usr/bin/env bash\n# v2 bridge\n")
+        with open(os.path.join(self.bundle, "run.sh"), "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env bash\n# v2 shim\n")
+        with open(
+            os.path.join(self.bundle, "docker-compose.yml"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("# v2 compose\n")
+        os.makedirs(os.path.join(self.bundle, "grafana", "dashboards"))
+        with open(
+            os.path.join(self.bundle, "grafana", "dashboards", "overview.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write('{"title": "bundled-v2"}\n')
+        os.makedirs(os.path.join(self.bundle, "prometheus"))
+        with open(
+            os.path.join(self.bundle, "prometheus", "prometheus.yml"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("# v2 prometheus\n")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.bundle, ignore_errors=True)
+
+    def _dest(self) -> str:
+        return os.path.join(self.tmp, "observability-stack")
+
+    @patch("defenseclaw.bundle_refresh.bundled_local_observability_dir")
+    def test_refresh_normalizes_container_access_under_private_umask(
+        self,
+        mock_bundle: MagicMock,
+    ) -> None:
+        """Wheel extraction modes cannot make non-root containers unreadable."""
+        from defenseclaw.bundle_refresh import refresh_local_observability_stack
+
+        if os.name == "nt":
+            self.skipTest("POSIX bind-mount mode contract")
+        for root, dirs, files in os.walk(self.bundle):
+            os.chmod(root, 0o700)
+            for name in dirs:
+                os.chmod(os.path.join(root, name), 0o700)
+            for name in files:
+                os.chmod(os.path.join(root, name), 0o600)
+
+        mock_bundle.return_value = Path(self.bundle)
+        result = refresh_local_observability_stack(self.tmp)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.join(self._dest(), "docker-compose.yml")).st_mode),
+            0o644,
+        )
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.join(self._dest(), "run.sh")).st_mode),
+            0o755,
+        )
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.join(self._dest(), "grafana", "dashboards")).st_mode),
+            0o755,
+        )
+
+        custom = os.path.join(self._dest(), "grafana", "dashboards", "team-private.json")
+        with open(custom, "w", encoding="utf-8") as handle:
+            handle.write('{"uid":"team-private"}\n')
+        os.chmod(custom, 0o600)
+        refresh_local_observability_stack(self.tmp)
+        self.assertEqual(stat.S_IMODE(os.stat(custom).st_mode), 0o644)
+
+    @patch("defenseclaw.bundle_refresh.bundled_local_observability_dir")
+    def test_default_refresh_preserves_operator_dashboards(
+        self,
+        mock_bundle: MagicMock,
+    ) -> None:
+        """The default refresh must not stomp on operator-edited dashboards."""
+        from defenseclaw.bundle_refresh import refresh_local_observability_stack
+
+        mock_bundle.return_value = Path(self.bundle)
+        refresh_local_observability_stack(self.tmp)
+
+        dashboards = os.path.join(self._dest(), "grafana", "dashboards")
+        os.makedirs(dashboards, exist_ok=True)
+        operator = os.path.join(dashboards, "overview.json")
+        with open(operator, "w", encoding="utf-8") as handle:
+            handle.write('{"title": "operator-edited"}\n')
+        operator_prom = os.path.join(self._dest(), "prometheus", "prometheus.yml")
+        with open(operator_prom, "w", encoding="utf-8") as handle:
+            handle.write("# operator-edited prometheus\n")
+
+        # Bump bridge in the bundle to drive a maintainer-file refresh.
+        with open(
+            os.path.join(self.bundle, "bin", "openclaw-observability-bridge"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("#!/usr/bin/env bash\n# v3 bridge\n")
+
+        result = refresh_local_observability_stack(self.tmp)
+        self.assertIn("bin/openclaw-observability-bridge", result.refreshed_paths)
+        self.assertIn("grafana", result.preserved_paths)
+        self.assertIn("prometheus", result.preserved_paths)
+
+        with open(operator, encoding="utf-8") as handle:
+            self.assertIn("operator-edited", handle.read())
+        with open(operator_prom, encoding="utf-8") as handle:
+            self.assertIn("operator-edited prometheus", handle.read())
+        bridge_bin = os.path.join(
+            self._dest(),
+            "bin",
+            "openclaw-observability-bridge",
+        )
+        with open(bridge_bin, encoding="utf-8") as handle:
+            self.assertIn("v3 bridge", handle.read())
+        self.assertTrue(os.access(bridge_bin, os.X_OK))
+
+    @patch("defenseclaw.bundle_refresh.bundled_local_observability_dir")
+    def test_refresh_config_overwrites_operator_surfaces(
+        self,
+        mock_bundle: MagicMock,
+    ) -> None:
+        """``refresh_config=True`` is the destructive mode operators opt
+        into when they want a clean wipe of dashboards / rules /
+        configs to match the new bundle.
+        """
+        from defenseclaw.bundle_refresh import refresh_local_observability_stack
+
+        mock_bundle.return_value = Path(self.bundle)
+        refresh_local_observability_stack(self.tmp)
+
+        # Operator edit in place...
+        operator = os.path.join(self._dest(), "grafana", "dashboards", "overview.json")
+        with open(operator, "w", encoding="utf-8") as handle:
+            handle.write('{"title": "operator-edited"}\n')
+
+        # ...gets overwritten when explicit opt-in is passed.
+        result = refresh_local_observability_stack(self.tmp, refresh_config=True)
+        self.assertIn("grafana/dashboards/overview.json", result.refreshed_paths)
+        self.assertNotIn("grafana", result.preserved_paths)
+        with open(operator, encoding="utf-8") as handle:
+            self.assertIn("bundled-v2", handle.read())
+
+    @patch("defenseclaw.bundle_refresh.bundled_local_observability_dir")
+    def test_refresh_config_removes_only_retired_managed_dashboards(
+        self,
+        mock_bundle: MagicMock,
+    ) -> None:
+        """Upgrade tombstones prune retired DefenseClaw assets without
+        deleting destination-only operator dashboards.
+        """
+        from defenseclaw.bundle_refresh import refresh_local_observability_stack
+
+        mock_bundle.return_value = Path(self.bundle)
+        refresh_local_observability_stack(self.tmp)
+        dashboards = os.path.join(self._dest(), "grafana", "dashboards")
+        retired = os.path.join(dashboards, "defenseclaw-reliability.json")
+        custom = os.path.join(dashboards, "team-custom.json")
+        with open(retired, "w", encoding="utf-8") as handle:
+            handle.write('{"title": "retired"}\n')
+        with open(custom, "w", encoding="utf-8") as handle:
+            handle.write('{"title": "custom"}\n')
+
+        # Text-mode writes use CRLF on Windows. Hash the exact bytes that the
+        # refresh code will inspect instead of assuming a POSIX newline.
+        digest = hashlib.sha256(Path(retired).read_bytes()).hexdigest()
+        with patch.dict(
+            "defenseclaw.bundle_refresh._LOCAL_OBSERVABILITY_RETIRED_SHA256",
+            {"grafana/dashboards/defenseclaw-reliability.json": frozenset({digest})},
+            clear=True,
+        ):
+            result = refresh_local_observability_stack(self.tmp, refresh_config=True)
+
+        self.assertFalse(os.path.exists(retired))
+        self.assertTrue(os.path.exists(custom))
+        self.assertIn(
+            "grafana/dashboards/defenseclaw-reliability.json (removed)",
+            result.refreshed_paths,
+        )
+
+    @patch("defenseclaw.bundle_refresh.bundled_local_observability_dir")
+    def test_refresh_config_preserves_custom_bytes_at_retired_filename(
+        self,
+        mock_bundle: MagicMock,
+    ) -> None:
+        from defenseclaw.bundle_refresh import refresh_local_observability_stack
+
+        mock_bundle.return_value = Path(self.bundle)
+        refresh_local_observability_stack(self.tmp)
+        retired = os.path.join(
+            self._dest(),
+            "grafana",
+            "dashboards",
+            "defenseclaw-reliability.json",
+        )
+        with open(retired, "w", encoding="utf-8") as handle:
+            handle.write('{"title": "operator collision"}\n')
+
+        result = refresh_local_observability_stack(self.tmp, refresh_config=True)
+
+        self.assertTrue(os.path.exists(retired))
+        self.assertNotIn(
+            "grafana/dashboards/defenseclaw-reliability.json (removed)",
+            result.refreshed_paths,
+        )
+
+    def test_retired_path_tombstones_reject_traversal_and_external_symlinks(self) -> None:
+        from defenseclaw.bundle_refresh import _remove_retired_paths
+
+        root = Path(self._dest())
+        root.mkdir(parents=True)
+        outside = Path(self.tmp) / "outside.json"
+        outside.write_text("keep me\n", encoding="utf-8")
+        link = root / "external-link.json"
+        link.symlink_to(outside)
+
+        removed, errors = _remove_retired_paths(
+            root,
+            ("../outside.json", "external-link.json"),
+        )
+
+        self.assertEqual(removed, [])
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(outside.exists())
+        self.assertTrue(link.is_symlink())
+
+
+class TestIsComposeProjectRunning(unittest.TestCase):
+    """Cover :func:`is_compose_project_running`."""
+
+    @patch("defenseclaw.bundle_refresh.shutil.which", return_value=None)
+    def test_returns_false_without_docker_binary(self, _which: MagicMock) -> None:
+        from defenseclaw.bundle_refresh import is_compose_project_running
+
+        self.assertFalse(is_compose_project_running("any-project"))
+
+    @patch("defenseclaw.bundle_refresh.subprocess.run")
+    @patch("defenseclaw.bundle_refresh.shutil.which", return_value="/usr/bin/docker")
+    def test_returns_true_when_docker_lists_a_container_id(
+        self,
+        _which: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        from defenseclaw.bundle_refresh import is_compose_project_running
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="abc123\n", stderr="")
+        self.assertTrue(is_compose_project_running("defenseclaw-splunk-local"))
+        # Confirm we asked docker for the right project label.
+        called_args = mock_run.call_args.args[0]
+        self.assertIn(
+            "label=com.docker.compose.project=defenseclaw-splunk-local",
+            called_args,
+        )
+
+    @patch("defenseclaw.bundle_refresh.subprocess.run")
+    @patch("defenseclaw.bundle_refresh.shutil.which", return_value="/usr/bin/docker")
+    def test_returns_false_when_docker_lists_no_containers(
+        self,
+        _which: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        from defenseclaw.bundle_refresh import is_compose_project_running
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="\n", stderr="")
+        self.assertFalse(is_compose_project_running("any-project"))
+
+    @patch(
+        "defenseclaw.bundle_refresh.subprocess.run",
+        side_effect=OSError("broken pipe"),
+    )
+    @patch("defenseclaw.bundle_refresh.shutil.which", return_value="/usr/bin/docker")
+    def test_returns_false_on_docker_exec_error(
+        self,
+        _which: MagicMock,
+        _run: MagicMock,
+    ) -> None:
+        from defenseclaw.bundle_refresh import is_compose_project_running
+
+        # OSError must NOT propagate — callers treat False as
+        # "nothing to stop".
+        self.assertFalse(is_compose_project_running("any-project"))
+
+
+class TestInstalledBundleVersion(unittest.TestCase):
+    def test_manifest_version_is_a_bounded_safe_string(self) -> None:
+        from defenseclaw.bundle_refresh import (
+            LocalObservabilityUpgradeError,
+            installed_local_observability_bundle_version,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root, "observability-stack")
+            destination.mkdir()
+            self.assertEqual(installed_local_observability_bundle_version(root), "")
+
+            manifest = destination / ".defenseclaw-bundle-manifest.json"
+            document = {
+                "schema_version": 1,
+                "bundle_version": "",
+                "files": [],
+                "dashboard_uids": [],
+                "named_volumes": [],
+            }
+            for accepted in ("dev", "01.2.3", "0.8.6-rc.1+build.7"):
+                with self.subTest(bundle_version=accepted):
+                    document["bundle_version"] = accepted
+                    manifest.write_text(json.dumps(document), encoding="utf-8")
+                    self.assertEqual(
+                        installed_local_observability_bundle_version(root),
+                        accepted,
+                    )
+
+            for invalid in ("", "a" * 65, "0.8.6/rc1", "0.8.6 rc1"):
+                with self.subTest(bundle_version=invalid):
+                    document["bundle_version"] = invalid
+                    manifest.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaises(LocalObservabilityUpgradeError) as raised:
+                        installed_local_observability_bundle_version(root)
+                    self.assertEqual(raised.exception.code, "installed_manifest_invalid")
+
+
+if __name__ == "__main__":
+    unittest.main()

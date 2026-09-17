@@ -1,0 +1,1675 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package connector
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/defenseclaw/defenseclaw/internal/testenv"
+)
+
+func TestHookOnlyConnector_CapabilityMatrix(t *testing.T) {
+	opts := SetupOpts{DataDir: t.TempDir(), WorkspaceDir: t.TempDir()}
+	cases := []struct {
+		conn       *hookOnlyConnector
+		canAsk     bool
+		failClosed bool
+		scope      string
+		configBase string
+	}{
+		{NewHermesConnector(), false, false, "user", "config.yaml"},
+		{NewCursorConnector(), true, true, "user", "hooks.json"},
+		{NewWindsurfConnector(), false, false, "user", "hooks.json"},
+		{NewGeminiCLIConnector(), false, true, "user", "settings.json"},
+		{NewCopilotConnector(), true, false, "user,workspace", "defenseclaw.json"},
+		{NewOpenHandsConnector(), false, true, "user,workspace", "hooks.json"},
+		{NewAntigravityConnector(), true, false, "user", "hooks.json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.conn.Name(), func(t *testing.T) {
+			caps := tc.conn.HookCapabilities(opts)
+			if !caps.CanBlock {
+				t.Fatal("CanBlock = false, want true")
+			}
+			if caps.CanAskNative != tc.canAsk {
+				t.Fatalf("CanAskNative = %v, want %v", caps.CanAskNative, tc.canAsk)
+			}
+			if caps.SupportsFailClosed != tc.failClosed {
+				t.Fatalf("SupportsFailClosed = %v, want %v", caps.SupportsFailClosed, tc.failClosed)
+			}
+			if caps.Scope != tc.scope {
+				t.Fatalf("Scope = %q, want %q", caps.Scope, tc.scope)
+			}
+			if filepath.Base(caps.ConfigPath) != tc.configBase {
+				t.Fatalf("ConfigPath = %q, want basename %q", caps.ConfigPath, tc.configBase)
+			}
+		})
+	}
+}
+
+func TestHardeningJQFallbackRejectsStructuredOutputWithoutParser(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	emptyPath := filepath.Join(dir, "empty-path")
+	if err := os.Mkdir(emptyPath, 0o700); err != nil {
+		t.Fatalf("create empty PATH: %v", err)
+	}
+	cmd := exec.Command("/bin/bash", "-c", `. "$1"; _dc_jq -c '.hook_output // empty'`, "bash", helperPath)
+	cmd.Env = []string{"HOME=" + dir, "PATH=" + emptyPath}
+	cmd.Stdin = strings.NewReader(`{"hook_output":{"permissionDecision":"deny"}}`)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("structured output was accepted without jq or python3")
+	}
+}
+
+func TestHardeningJQFallbackPreservesStringDefault(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	helperPath := filepath.Join(t.TempDir(), "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && { [ "$2" = "jq" ] || [ "$2" = "python3" ]; }; then
+    return 1
+  fi
+  builtin command "$@"
+}
+printf '{}' | _dc_jq -r '.action//"allow"'
+value="$(printf '{"reason":""}' | _dc_jq -r '.reason // "fallback"')"
+printf '<%s>\n' "$value"
+printf '{}' | _dc_jq -r '.reason // null'
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run shell fallback: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "allow\n<>\nnull" {
+		t.Fatalf("fallback output = %q, want no-space default plus preserved empty string", got)
+	}
+}
+
+func TestHardeningJQFallbackRejectsExplicitNonStringField(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	helperPath := filepath.Join(t.TempDir(), "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && { [ "$2" = "jq" ] || [ "$2" = "python3" ]; }; then
+    return 1
+  fi
+  builtin command "$@"
+}
+printf '{"action":null}' | _dc_jq -r '.action // "allow"'
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("explicit non-string action used the allow default: %q", out)
+	}
+}
+
+func TestHardeningJQFallbackEmptyProducesNoOutput(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	helperPath := filepath.Join(t.TempDir(), "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && { [ "$2" = "jq" ] || [ "$2" = "python3" ]; }; then
+    return 1
+  fi
+  builtin command "$@"
+}
+printf '{}' | _dc_jq -r '.action // empty'
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run shell fallback: %v: %s", err, out)
+	}
+	if len(out) != 0 {
+		t.Fatalf("empty fallback output = %q, want zero bytes", out)
+	}
+}
+
+func TestHardeningJQFallbackOnlyReadsTopLevelFields(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	helperPath := filepath.Join(t.TempDir(), "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && { [ "$2" = "jq" ] || [ "$2" = "python3" ]; }; then
+    return 1
+  fi
+  builtin command "$@"
+}
+printf '{"nested":{"action":"allow"},"action":"deny"}' | _dc_jq -r '.action // "allow"'
+printf '{"nested":{"action":"deny"}}' | _dc_jq -r '.action // "allow"'
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run shell fallback: %v: %s", err, out)
+	}
+	if got := string(out); got != "deny\nallow\n" {
+		t.Fatalf("top-level fallback output = %q, want deny then absent-field default", got)
+	}
+}
+
+func TestHermesConfigPathHonorsHermesHomeAndExplicitOverride(t *testing.T) {
+	hermesHome := filepath.Join(t.TempDir(), "Hermes Home")
+	t.Setenv("HERMES_HOME", hermesHome)
+
+	previous := HermesConfigPathOverride
+	HermesConfigPathOverride = ""
+	t.Cleanup(func() { HermesConfigPathOverride = previous })
+
+	if got, want := hermesConfigPath(SetupOpts{}), filepath.Join(hermesHome, "config.yaml"); got != want {
+		t.Fatalf("hermesConfigPath() = %q, want %q", got, want)
+	}
+	caps := NewHermesConnector().Capabilities(SetupOpts{})
+	if got, want := caps.Skills.ReadPaths, []string{filepath.Join(hermesHome, "skills")}; len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("Hermes skill paths = %v, want %v", got, want)
+	}
+
+	explicit := filepath.Join(t.TempDir(), "explicit-config.yaml")
+	HermesConfigPathOverride = explicit
+	if got := hermesConfigPath(SetupOpts{}); got != explicit {
+		t.Fatalf("HermesConfigPathOverride lost precedence: got %q, want %q", got, explicit)
+	}
+}
+
+func TestHermesConfigPathUsesWindowsLocalAppData(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("native Windows Hermes path")
+	}
+	localAppData := filepath.Join(t.TempDir(), "Local AppData")
+	t.Setenv("HERMES_HOME", "")
+	t.Setenv("LOCALAPPDATA", localAppData)
+
+	previous := HermesConfigPathOverride
+	HermesConfigPathOverride = ""
+	t.Cleanup(func() { HermesConfigPathOverride = previous })
+
+	if got, want := hermesConfigPath(SetupOpts{}), filepath.Join(localAppData, "hermes", "config.yaml"); got != want {
+		t.Fatalf("hermesConfigPath() = %q, want %q", got, want)
+	}
+}
+
+// TestHardeningPython3UsableRefusesMacosCLTStub pins the QA regression
+// where a stock macOS host without Xcode Command Line Tools resolves
+// python3 to the /usr/bin/python3 CLT launcher stub. A bare
+// `command -v python3` treats that stub as usable; invoking it pops
+// the "install command line developer tools" GUI dialog and returns
+// no body, which then propagates as an empty payload / HTTP 400 into
+// the codex hook and blocks the user's prompt.
+//
+// _dc_python3_usable must refuse the stub by cross-checking
+// `xcode-select -p` (a safe macOS system call that does not trigger
+// the installer dialog).
+func TestHardeningPython3UsableRefusesMacosCLTStub(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	// Simulate stock macOS without CLT:
+	//   - command -v python3 -> /usr/bin/python3 (the launcher stub)
+	//   - uname -s -> Darwin
+	//   - xcode-select -p -> exit 2 (CLT missing)
+	// _dc_python3_usable must return non-zero. If it returns 0, the
+	// caller would invoke /usr/bin/python3 and the QA popup returns.
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "python3" ]; then
+    printf '/usr/bin/python3\n'
+    return 0
+  fi
+  builtin command "$@"
+}
+uname() { printf 'Darwin\n'; }
+xcode-select() { return 2; }
+if _dc_python3_usable; then
+  echo STUB_ACCEPTED
+  exit 1
+fi
+echo STUB_REFUSED
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run stub-refusal probe: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "STUB_REFUSED" {
+		t.Fatalf("_dc_python3_usable accepted the /usr/bin/python3 CLT stub without CLT installed: %q", got)
+	}
+}
+
+// TestHardeningPython3UsableAcceptsMacosCLTInstalled asserts the other
+// half of the contract: on macOS with CLT actually installed
+// (xcode-select -p succeeds), _dc_python3_usable trusts
+// /usr/bin/python3 as a real interpreter and returns 0 so the
+// preferred tier-1 python3 path in defenseclaw_read_stdin_capped and
+// the _dc_jq shim remain in use.
+func TestHardeningPython3UsableAcceptsMacosCLTInstalled(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "python3" ]; then
+    printf '/usr/bin/python3\n'
+    return 0
+  fi
+  builtin command "$@"
+}
+uname() { printf 'Darwin\n'; }
+xcode-select() { printf '/Library/Developer/CommandLineTools\n'; return 0; }
+if _dc_python3_usable; then
+  echo REAL_ACCEPTED
+  exit 0
+fi
+echo REAL_REJECTED
+exit 1
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("_dc_python3_usable refused python3 despite CLT installed: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "REAL_ACCEPTED" {
+		t.Fatalf("_dc_python3_usable did not accept real /usr/bin/python3 with CLT: %q", got)
+	}
+}
+
+// TestHardeningPython3UsableAcceptsHomebrewPython covers the case
+// where the operator has installed python3 outside the CLT-managed
+// /usr/bin path (typical for homebrew, pyenv, asdf, etc.). Only
+// /usr/bin/python3 on Darwin is a CLT launcher stub — everything
+// else is trusted at face value regardless of xcode-select state.
+func TestHardeningPython3UsableAcceptsHomebrewPython(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "python3" ]; then
+    printf '/usr/local/bin/python3\n'
+    return 0
+  fi
+  builtin command "$@"
+}
+uname() { printf 'Darwin\n'; }
+xcode-select() { return 2; }
+if _dc_python3_usable; then
+  echo BREW_ACCEPTED
+  exit 0
+fi
+echo BREW_REJECTED
+exit 1
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("_dc_python3_usable refused non-/usr/bin python3: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "BREW_ACCEPTED" {
+		t.Fatalf("_dc_python3_usable did not accept /usr/local/bin/python3 on Darwin: %q", got)
+	}
+}
+
+// TestHardeningPython3UsableSkipsXcodeSelectOffDarwin asserts that
+// the CLT stub check is Darwin-only. On Linux hosts we do not consult
+// xcode-select at all — python3 is a first-class binary there and a
+// failing (or missing) xcode-select must not gate the python3 tier.
+func TestHardeningPython3UsableSkipsXcodeSelectOffDarwin(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "python3" ]; then
+    printf '/usr/bin/python3\n'
+    return 0
+  fi
+  builtin command "$@"
+}
+uname() { printf 'Linux\n'; }
+xcode-select() { echo "xcode-select must not be consulted on Linux" >&2; return 127; }
+if _dc_python3_usable; then
+  echo LINUX_ACCEPTED
+  exit 0
+fi
+echo LINUX_REJECTED
+exit 1
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("_dc_python3_usable rejected python3 on Linux: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "LINUX_ACCEPTED" {
+		t.Fatalf("_dc_python3_usable did not accept /usr/bin/python3 on Linux: %q", got)
+	}
+}
+
+// TestHardeningPython3UsableRejectsAbsentPython3 asserts the base
+// case: when python3 is not on PATH at all, _dc_python3_usable
+// returns non-zero regardless of platform. This is the pre-existing
+// contract for the tier-2 head(1) fallback in
+// defenseclaw_read_stdin_capped and the string-only tail in _dc_jq.
+func TestHardeningPython3UsableRejectsAbsentPython3(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	script := `. "$1"
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "python3" ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+if _dc_python3_usable; then
+  echo ACCEPTED_MISSING
+  exit 1
+fi
+echo REJECTED_MISSING
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run absent-python3 probe: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "REJECTED_MISSING" {
+		t.Fatalf("_dc_python3_usable accepted absent python3: %q", got)
+	}
+}
+
+// TestHardeningReadStdinCappedSkipsPython3StubOnStockMacos is the
+// integration guard: defenseclaw_read_stdin_capped must fall through
+// to the head(1) tier (tier 2) when python3 resolves to the macOS
+// CLT stub, instead of invoking the stub and returning an empty body.
+//
+// If this test regresses, the codex hook on stock macOS will post an
+// empty payload to the gateway, get HTTP 400, and block the user's
+// prompt with "codex hook error: gateway returned HTTP 400" — the
+// exact QA-reported failure this fix addresses.
+func TestHardeningReadStdinCappedSkipsPython3StubOnStockMacos(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	helper, err := hookFS.ReadFile("hooks/_hardening.sh")
+	if err != nil {
+		t.Fatalf("read hardening helper: %v", err)
+	}
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "_hardening.sh")
+	if err := os.WriteFile(helperPath, helper, 0o700); err != nil {
+		t.Fatalf("write hardening helper: %v", err)
+	}
+	// A python3 impostor that would empty stdin and exit non-zero if
+	// invoked — mirrors the macOS CLT stub's observed behaviour. If
+	// _dc_python3_usable incorrectly says "yes", this stub runs and
+	// the captured body is empty; the assertion below fails.
+	stubDir := filepath.Join(dir, "stub-bin")
+	if err := os.Mkdir(stubDir, 0o755); err != nil {
+		t.Fatalf("mkdir stub-bin: %v", err)
+	}
+	stubPython := filepath.Join(stubDir, "python3")
+	stubBody := "#!/bin/bash\n" +
+		"# Behaves like the macOS CLT launcher stub: consumes nothing,\n" +
+		"# prints the developer-tools note to stderr, exits non-zero.\n" +
+		"echo 'xcode-select: note: No developer tools were found, requesting install.' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(stubPython, []byte(stubBody), 0o755); err != nil {
+		t.Fatalf("write python3 stub: %v", err)
+	}
+	script := `. "$1"
+# Point command -v python3 at the stub we control, and mask xcode-select
+# so _dc_python3_usable classifies it as the CLT launcher.
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "python3" ]; then
+    printf '/usr/bin/python3\n'
+    return 0
+  fi
+  builtin command "$@"
+}
+uname() { printf 'Darwin\n'; }
+xcode-select() { return 2; }
+PATH="$2:$PATH"
+BODY="$(defenseclaw_read_stdin_capped)"
+printf 'BODY=<%s>\n' "$BODY"
+`
+	cmd := exec.Command("/bin/bash", "-c", script, "bash", helperPath, stubDir)
+	cmd.Stdin = strings.NewReader("hello-world")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run stdin-capped probe: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "BODY=<hello-world>") {
+		t.Fatalf("defenseclaw_read_stdin_capped invoked the CLT stub and lost the body:\n%s", out)
+	}
+}
+
+func TestHookOnlyConnector_SurfaceCapabilities(t *testing.T) {
+	opts := SetupOpts{DataDir: t.TempDir(), WorkspaceDir: t.TempDir(), APIAddr: "127.0.0.1:18970"}
+	cases := []struct {
+		conn             *hookOnlyConnector
+		codeGuardTargets []string
+		nativeOTLP       bool
+		pluginsSupported bool
+		// mcpSupported is true for connectors that expose a documented
+		// MCP install surface.
+		mcpSupported bool
+	}{
+		{NewHermesConnector(), []string{"skill"}, false, false, true},
+		{NewCursorConnector(), []string{"skill", "rule"}, false, false, true},
+		{NewWindsurfConnector(), []string{"rule"}, false, false, true},
+		{NewGeminiCLIConnector(), []string{"skill"}, true, false, true},
+		{NewCopilotConnector(), []string{"skill", "rule"}, true, false, true},
+		{NewOpenHandsConnector(), []string{"skill"}, false, false, true},
+		{NewAntigravityConnector(), nil, false, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.conn.Name(), func(t *testing.T) {
+			caps := tc.conn.Capabilities(opts)
+			if caps.MCP.Supported != tc.mcpSupported {
+				t.Fatalf("MCP.Supported = %v, want %v", caps.MCP.Supported, tc.mcpSupported)
+			}
+			if caps.CodeGuard.Supported != (len(tc.codeGuardTargets) > 0) {
+				t.Fatalf("CodeGuard.Supported = %v", caps.CodeGuard.Supported)
+			}
+			if strings.Join(caps.CodeGuard.InstallTargets, ",") != strings.Join(tc.codeGuardTargets, ",") {
+				t.Fatalf("CodeGuard.InstallTargets = %v, want %v", caps.CodeGuard.InstallTargets, tc.codeGuardTargets)
+			}
+			if caps.CodeGuard.AutoInstall {
+				t.Fatal("CodeGuard.AutoInstall = true, want explicit opt-in")
+			}
+			if caps.Telemetry.NativeOTLP != tc.nativeOTLP {
+				t.Fatalf("Telemetry.NativeOTLP = %v, want %v", caps.Telemetry.NativeOTLP, tc.nativeOTLP)
+			}
+			if caps.Plugins.Supported != tc.pluginsSupported {
+				t.Fatalf("Plugins.Supported = %v, want %v", caps.Plugins.Supported, tc.pluginsSupported)
+			}
+		})
+	}
+}
+
+func TestAntigravityConnector_CapabilityContract(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	workspace := filepath.Join(dir, "repo")
+	testenv.SetHome(t, home)
+
+	conn := NewAntigravityConnector()
+	opts := SetupOpts{
+		DataDir:      filepath.Join(dir, "dc"),
+		WorkspaceDir: workspace,
+		APIAddr:      "127.0.0.1:18970",
+	}
+	caps := conn.Capabilities(opts)
+
+	if caps.Hooks.ConfigPath != filepath.Join(home, ".gemini", "config", "hooks.json") {
+		t.Fatalf("Antigravity hook ConfigPath=%q", caps.Hooks.ConfigPath)
+	}
+	if caps.Hooks.Scope != "user" {
+		t.Fatalf("Antigravity hook scope=%q want user", caps.Hooks.Scope)
+	}
+	if caps.Hooks.ConfigPath == filepath.Join(workspace, ".agents", "hooks.json") {
+		t.Fatalf("Antigravity hook config must remain global-write only: %q", caps.Hooks.ConfigPath)
+	}
+
+	wantMCP := []string{
+		filepath.Join(home, ".gemini", "config", "mcp_config.json"),
+		filepath.Join(workspace, ".agents", "mcp_config.json"),
+	}
+	if !caps.MCP.Supported {
+		t.Fatal("Antigravity MCP must be supported")
+	}
+	if !sameStrings(caps.MCP.ConfigPaths, wantMCP) || !sameStrings(caps.MCP.ReadPaths, wantMCP) || !sameStrings(caps.MCP.WritePaths, wantMCP) {
+		t.Fatalf("Antigravity MCP paths drifted: config=%v read=%v write=%v want %v", caps.MCP.ConfigPaths, caps.MCP.ReadPaths, caps.MCP.WritePaths, wantMCP)
+	}
+	for _, path := range append(append([]string{}, caps.MCP.ConfigPaths...), append(caps.MCP.ReadPaths, caps.MCP.WritePaths...)...) {
+		if strings.Contains(path, ".openclaw") || strings.Contains(path, "antigravity-cli") {
+			t.Fatalf("Antigravity MCP path is not the contracted agy config path: %q", path)
+		}
+	}
+
+	wantSkillWrites := []string{
+		filepath.Join(home, ".gemini", "config", "skills"),
+		filepath.Join(workspace, ".agents", "skills"),
+	}
+	if !caps.Skills.Supported || !sameStrings(caps.Skills.WritePaths, wantSkillWrites) {
+		t.Fatalf("Antigravity skill write paths=%v supported=%v", caps.Skills.WritePaths, caps.Skills.Supported)
+	}
+	for _, want := range []string{
+		filepath.Join(home, ".gemini", "antigravity-cli", "skills"),
+		filepath.Join(workspace, ".agent", "skills"),
+	} {
+		if !stringInSlice(caps.Skills.ReadPaths, want) {
+			t.Fatalf("Antigravity skill read paths missing discovery-only %q: %v", want, caps.Skills.ReadPaths)
+		}
+		if stringInSlice(caps.Skills.WritePaths, want) {
+			t.Fatalf("Antigravity discovery-only skill path appeared as write target %q: %v", want, caps.Skills.WritePaths)
+		}
+	}
+
+	if !caps.Rules.Supported || !caps.Rules.DiscoveryOnly || len(caps.Rules.WritePaths) != 0 {
+		t.Fatalf("Antigravity rules should be discovery-only with no write paths: %+v", caps.Rules)
+	}
+	if !caps.Plugins.Supported || !caps.Plugins.DiscoveryOnly || len(caps.Plugins.WritePaths) != 0 {
+		t.Fatalf("Antigravity plugins should be discovery-only with no write paths: %+v", caps.Plugins)
+	}
+	if !caps.Agents.Supported || !caps.Agents.DiscoveryOnly || len(caps.Agents.WritePaths) != 0 {
+		t.Fatalf("Antigravity plugin-contained agents should be discovery-only with no write paths: %+v", caps.Agents)
+	}
+	for _, want := range []string{
+		filepath.Join(home, ".gemini", "config", "plugins"),
+		filepath.Join(home, ".gemini", "antigravity-cli", "plugins"),
+		filepath.Join(workspace, ".agents", "plugins"),
+		filepath.Join(workspace, "_agents", "plugins"),
+	} {
+		if !stringInSlice(caps.Plugins.ReadPaths, want) {
+			t.Fatalf("Antigravity plugin read paths missing %q: %v", want, caps.Plugins.ReadPaths)
+		}
+		if !stringInSlice(caps.Agents.ReadPaths, want) {
+			t.Fatalf("Antigravity agent read paths missing plugin root %q: %v", want, caps.Agents.ReadPaths)
+		}
+	}
+}
+
+func TestHookOnlyConnector_SetupTeardown_BackupRestore(t *testing.T) {
+	dir := t.TempDir()
+	configDir := t.TempDir()
+	overrides := map[string]*string{
+		"hermes":      &HermesConfigPathOverride,
+		"cursor":      &CursorHooksPathOverride,
+		"windsurf":    &WindsurfHooksPathOverride,
+		"geminicli":   &GeminiSettingsPathOverride,
+		"copilot":     &CopilotHooksPathOverride,
+		"openhands":   &OpenHandsHooksPathOverride,
+		"antigravity": &AntigravityHooksPathOverride,
+	}
+	connectors := []*hookOnlyConnector{
+		NewHermesConnector(),
+		NewCursorConnector(),
+		NewWindsurfConnector(),
+		NewGeminiCLIConnector(),
+		NewCopilotConnector(),
+		NewOpenHandsConnector(),
+		NewAntigravityConnector(),
+	}
+	for _, conn := range connectors {
+		t.Run(conn.Name(), func(t *testing.T) {
+			cfgPath := filepath.Join(configDir, conn.Name(), "config")
+			if conn.Name() == "hermes" {
+				cfgPath += ".yaml"
+			} else {
+				cfgPath += ".json"
+			}
+			ptr := overrides[conn.Name()]
+			prev := *ptr
+			*ptr = cfgPath
+			t.Cleanup(func() { *ptr = prev })
+
+			opts := SetupOpts{DataDir: filepath.Join(dir, conn.Name()), APIAddr: "127.0.0.1:18970", APIToken: "tok-test", WorkspaceDir: t.TempDir()}
+			if err := conn.Setup(context.Background(), opts); err != nil {
+				t.Fatalf("Setup: %v", err)
+			}
+			data, err := os.ReadFile(cfgPath)
+			if err != nil {
+				t.Fatalf("read config after setup: %v", err)
+			}
+			wantConfigNeedle := conn.scriptName
+			if runtime.GOOS == "windows" {
+				if conn.Name() == "cursor" {
+					wantConfigNeedle = "cursor-hook.ps1"
+				} else {
+					wantConfigNeedle = nativeHookFlag + conn.Name()
+				}
+			}
+			if runtime.GOOS == "windows" && conn.Name() == "antigravity" {
+				var cfg map[string]interface{}
+				if err := json.Unmarshal(data, &cfg); err != nil {
+					t.Fatalf("parse antigravity config after setup: %v\n%s", err, data)
+				}
+				if !structuredHookCommandReferences(cfg, []string{conn.hookCommand(opts)}) {
+					t.Fatalf("config after setup does not reference safe Antigravity command:\n%s", string(data))
+				}
+			} else if !strings.Contains(string(data), wantConfigNeedle) {
+				t.Fatalf("config after setup does not reference %s:\n%s", wantConfigNeedle, string(data))
+			}
+			if err := conn.Teardown(context.Background(), opts); err != nil {
+				t.Fatalf("Teardown: %v", err)
+			}
+			if _, err := os.Stat(cfgPath); err == nil {
+				t.Fatalf("config file still exists after teardown of previously missing config: %s", cfgPath)
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("stat config after teardown: %v", err)
+			}
+		})
+	}
+}
+
+// TestHermesSetup_WritesFullLifecycleAndAutoAccept pins the
+// hermes-hooks-v1 setup contract: Setup must register every lifecycle
+// event in the cli-config.yaml `hooks:` block AND set hooks_auto_accept
+// so the hooks actually register on non-TTY/gateway runs (Hermes
+// silently skips un-accepted hooks there). Teardown must heal a
+// previously-missing config back to absent.
+func TestHermesSetup_WritesFullLifecycleAndAutoAccept(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".hermes", "config.yaml")
+	prev := HermesConfigPathOverride
+	HermesConfigPathOverride = cfgPath
+	t.Cleanup(func() { HermesConfigPathOverride = prev })
+
+	conn := NewHermesConnector()
+	opts := SetupOpts{DataDir: filepath.Join(dir, "dc"), APIAddr: "127.0.0.1:18970", APIToken: "tok-test"}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	cfg, err := readYAMLObject(cfgPath)
+	if err != nil {
+		t.Fatalf("read hermes config after setup: %v", err)
+	}
+	if v, _ := cfg["hooks_auto_accept"].(bool); !v {
+		t.Fatalf("hooks_auto_accept not set true after setup: %#v", cfg["hooks_auto_accept"])
+	}
+	hooks, ok := cfg["hooks"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("hooks block missing or wrong type: %#v", cfg["hooks"])
+	}
+	for _, event := range []string{
+		"pre_llm_call", "pre_tool_call", "post_tool_call", "post_llm_call",
+		"on_session_start", "on_session_end", "on_session_finalize", "on_session_reset",
+		"subagent_start", "subagent_stop",
+	} {
+		if _, ok := hooks[event]; !ok {
+			t.Errorf("hooks block missing lifecycle event %q; got keys %v", event, mapKeys(hooks))
+		}
+	}
+
+	if err := conn.Teardown(context.Background(), opts); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if _, err := os.Stat(cfgPath); err == nil {
+		t.Fatalf("config still exists after teardown of previously-missing config")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat after teardown: %v", err)
+	}
+}
+
+// TestHermesSetup_RespectsExplicitAutoAcceptAndHealsUserConfig asserts
+// two coupled behaviors: (1) Setup does NOT override an operator's
+// explicit hooks_auto_accept:false, and (2) Teardown heals a
+// pre-existing config back to its pristine bytes (managed-file backup),
+// preserving the user's own hook and their auto-accept choice.
+func TestHermesSetup_RespectsExplicitAutoAcceptAndHealsUserConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".hermes", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	pristine := "hooks_auto_accept: false\nhooks:\n  pre_tool_call:\n    - command: /usr/local/bin/my-own-hook.sh\n"
+	if err := os.WriteFile(cfgPath, []byte(pristine), 0o600); err != nil {
+		t.Fatalf("write pristine config: %v", err)
+	}
+	prev := HermesConfigPathOverride
+	HermesConfigPathOverride = cfgPath
+	t.Cleanup(func() { HermesConfigPathOverride = prev })
+
+	conn := NewHermesConnector()
+	opts := SetupOpts{DataDir: filepath.Join(dir, "dc"), APIAddr: "127.0.0.1:18970", APIToken: "tok-test"}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	cfg, err := readYAMLObject(cfgPath)
+	if err != nil {
+		t.Fatalf("read after setup: %v", err)
+	}
+	if v, ok := cfg["hooks_auto_accept"].(bool); !ok || v {
+		t.Fatalf("explicit hooks_auto_accept:false was overridden: %#v", cfg["hooks_auto_accept"])
+	}
+
+	if err := conn.Teardown(context.Background(), opts); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	got, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read after teardown: %v", err)
+	}
+	if string(got) != pristine {
+		t.Fatalf("teardown did not heal config to pristine bytes\n got: %q\nwant: %q", string(got), pristine)
+	}
+}
+
+func mapKeys(m map[string]interface{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestAntigravitySetup_WritesClaudeCodeNestedSchema pins the
+// hooks.json shape that agy v1.0.x actually evaluates and is the
+// regression guard for two cumulative empirical findings from the
+// v0.5.0 smoke test:
+//
+//  1. **Nested schema, not flat.** An earlier draft wrote a flat
+//     {event, matcher, command, description} object per top-level
+//     key. agy never evaluated those entries — neither tracer hooks
+//     nor DefenseClaw hooks fired. Replacing the file with a
+//     Claude-Code-style nested schema (top-level key →
+//     {<EventName>: [{matcher, hooks: [{type, command}]}]}) caused
+//     agy to invoke the configured command on every tool call. agy
+//     binary `strings` confirms only the nested shape is parsed.
+//
+//  2. **No embedded quotes in command.** Empirical D3 of the smoke
+//     test (D1=bare-path-OK, D2=sh -c-OK, D3=direct-exec-FAILS-127)
+//     proved agy invokes the configured command via direct exec()
+//     not through a shell, so any '/" added by shellWord() would
+//     become literal path bytes and the hook would silently
+//     no-fire.
+//
+// Combined assertions:
+//
+//   - top-level key "defenseclaw-antigravity-pretooluse" exists
+//   - its value is a map with key "PreToolUse"
+//   - "PreToolUse" is a list with exactly one entry
+//   - that entry has matcher="*" and hooks=[{type="command",
+//     command=<tokenizer-safe Antigravity command>}]
+//   - the inner command field has no visible quote characters and no
+//     surrounding whitespace; on Windows the absolute managed launcher path
+//     lives inside the PowerShell encoded command instead
+//
+// If a future agy release pivots back to a flat schema, OR adds
+// shell invocation, OR moves the hooks file again, this test must
+// be updated in lockstep with patchAntigravityHooks /
+// antigravityHooksPath. Until then this test pins the contract.
+func TestAntigravitySetup_WritesClaudeCodeNestedSchema(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".gemini", "config", "hooks.json")
+	prev := AntigravityHooksPathOverride
+	AntigravityHooksPathOverride = cfgPath
+	t.Cleanup(func() { AntigravityHooksPathOverride = prev })
+
+	conn := NewAntigravityConnector()
+	opts := SetupOpts{
+		DataDir:  filepath.Join(dir, "dc"),
+		APIAddr:  "127.0.0.1:18970",
+		APIToken: "tok-test",
+	}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read antigravity hooks.json: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("antigravity hooks.json is not valid JSON: %v\n%s", err, string(data))
+	}
+
+	entry, ok := cfg["defenseclaw-antigravity-pretooluse"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("defenseclaw-antigravity-pretooluse missing or wrong shape: %#v", cfg)
+	}
+
+	preToolUse, ok := entry["PreToolUse"].([]interface{})
+	if !ok {
+		t.Fatalf("PreToolUse is not an array: %#v\nfull entry: %#v", entry["PreToolUse"], entry)
+	}
+	if len(preToolUse) != 1 {
+		t.Fatalf("PreToolUse must hold exactly one matcher group, got %d:\n%#v", len(preToolUse), preToolUse)
+	}
+
+	group, ok := preToolUse[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("PreToolUse[0] is not an object: %#v", preToolUse[0])
+	}
+	if group["matcher"] != "*" {
+		t.Fatalf("matcher=%#v want *", group["matcher"])
+	}
+
+	hooks, ok := group["hooks"].([]interface{})
+	if !ok {
+		t.Fatalf("hooks is not an array: %#v", group["hooks"])
+	}
+	if len(hooks) != 1 {
+		t.Fatalf("hooks must hold exactly one entry, got %d:\n%#v", len(hooks), hooks)
+	}
+
+	hook, ok := hooks[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("hooks[0] is not an object: %#v", hooks[0])
+	}
+	if hook["type"] != "command" {
+		t.Fatalf("hook type=%#v want command", hook["type"])
+	}
+	command, isString := hook["command"].(string)
+	if !isString {
+		t.Fatalf("command field is not a string: %#v", hook["command"])
+	}
+
+	// Primary assertion: no quote characters at all. agy v1.0.x
+	// exec()s the command directly, so any '/" would become a
+	// literal byte in the path and the hook would silently
+	// no-fire.
+	if strings.ContainsAny(command, `'"`) {
+		t.Fatalf(
+			"antigravity command field contains quote characters %q — "+
+				"agy v1.0.x exec()s this directly so the quotes become "+
+				"literal path bytes. Did shellWord() get re-introduced?",
+			command,
+		)
+	}
+	wantCommand := conn.hookCommand(opts)
+	if command != wantCommand {
+		t.Fatalf("command=%q want %q", command, wantCommand)
+	}
+	// Unix runs the absolute shell hook. Windows runs a tokenizer-safe system
+	// PowerShell command whose encoded script invokes the absolute no-console
+	// hook launcher path; agy's direct-exec tokenizer cannot dequote that path
+	// if it is placed visibly in hooks.json.
+	if runtime.GOOS == "windows" {
+		if command == legacyAntigravityWindowsHookCommand() {
+			t.Fatalf("windows command still uses vulnerable bare launcher: %q", command)
+		}
+		decoded := decodePowerShellEncodedCommandForTest(t, command)
+		if !strings.Contains(decoded, windowsNativePowerShellStartForTest(defenseclawHookBinary(), "antigravity")) ||
+			!strings.Contains(decoded, "NoDefaultCurrentDirectoryInExePath") {
+			t.Fatalf("windows encoded command lost managed launcher or hardening:\n%s", decoded)
+		}
+	} else {
+		if !strings.HasSuffix(command, "antigravity-hook.sh") {
+			t.Fatalf("command=%q does not end with antigravity-hook.sh", command)
+		}
+		if !filepath.IsAbs(command) {
+			t.Fatalf("command=%q is not an absolute path", command)
+		}
+	}
+	// Tertiary: no surrounding whitespace either.
+	if command != strings.TrimSpace(command) {
+		t.Fatalf("command=%q has surrounding whitespace", command)
+	}
+
+	// Quaternary: all five Antigravity 2.0 lifecycle events are
+	// registered under their own DefenseClaw-owned outer keys, with
+	// the same nested Claude-Code-derived schema. Spec source:
+	// Antigravity 2.0 hook docs (PreInvocation, PreToolUse,
+	// PostToolUse, PostInvocation, Stop). PreToolUse is the only
+	// event empirically verified against agy v1.0.1; the other four
+	// keys are registered for spec parity so DefenseClaw is ready
+	// when agy starts emitting them upstream — see
+	// patchAntigravityHooks docs in hook_only.go for the rationale.
+	for _, event := range []string{"PreInvocation", "PreToolUse", "PostToolUse", "PostInvocation", "Stop"} {
+		outerKey := "defenseclaw-antigravity-" + strings.ToLower(event)
+		eventEntry, ok := cfg[outerKey].(map[string]interface{})
+		if !ok {
+			t.Errorf("%s missing or wrong shape: %#v", outerKey, cfg[outerKey])
+			continue
+		}
+		eventList, ok := eventEntry[event].([]interface{})
+		if !ok {
+			t.Errorf("%s[%q] is not an array: %#v", outerKey, event, eventEntry[event])
+			continue
+		}
+		if len(eventList) != 1 {
+			t.Errorf("%s[%q] must hold exactly one matcher group, got %d", outerKey, event, len(eventList))
+			continue
+		}
+		matcherGroup, ok := eventList[0].(map[string]interface{})
+		if !ok {
+			t.Errorf("%s[%q][0] is not an object: %#v", outerKey, event, eventList[0])
+			continue
+		}
+		if matcherGroup["matcher"] != "*" {
+			t.Errorf("%s[%q][0].matcher=%#v want *", outerKey, event, matcherGroup["matcher"])
+		}
+		hookList, ok := matcherGroup["hooks"].([]interface{})
+		if !ok || len(hookList) != 1 {
+			t.Errorf("%s[%q][0].hooks not a single-entry array: %#v", outerKey, event, matcherGroup["hooks"])
+			continue
+		}
+		hookEntry, ok := hookList[0].(map[string]interface{})
+		if !ok {
+			t.Errorf("%s[%q][0].hooks[0] is not an object: %#v", outerKey, event, hookList[0])
+			continue
+		}
+		if hookEntry["type"] != "command" {
+			t.Errorf("%s[%q][0].hooks[0].type=%#v want command", outerKey, event, hookEntry["type"])
+		}
+		eventCommand, ok := hookEntry["command"].(string)
+		if !ok || eventCommand != wantCommand {
+			t.Errorf("%s[%q][0].hooks[0].command=%#v want %q", outerKey, event, hookEntry["command"], wantCommand)
+		}
+	}
+}
+
+func TestAntigravityRemoveConfigEntriesPrunesLegacyWindowsCommand(t *testing.T) {
+	setHookBinaryOverride(t, `C:\Users\Jane Doe\.local\bin\defenseclaw-hook.exe`)
+	current := hookInvocationCommandFor("windows", "antigravity", "")
+	legacy := legacyAntigravityWindowsHookCommand()
+	legacyNonWaiting := legacyAntigravityNonWaitingWindowsHookCommand()
+	foreign := `foreign-hook.exe hook --connector antigravity`
+	path := filepath.Join(t.TempDir(), "hooks.json")
+	cfg := map[string]interface{}{
+		"defenseclaw-antigravity-pretooluse": map[string]interface{}{
+			"PreToolUse": []interface{}{
+				map[string]interface{}{
+					"matcher": "*",
+					"hooks": []interface{}{
+						map[string]interface{}{"type": "command", "command": current},
+						map[string]interface{}{"type": "command", "command": legacy},
+						map[string]interface{}{"type": "command", "command": legacyNonWaiting},
+					},
+				},
+			},
+		},
+		"operator-hook": map[string]interface{}{
+			"PreToolUse": []interface{}{
+				map[string]interface{}{
+					"matcher": "*",
+					"hooks": []interface{}{
+						map[string]interface{}{"type": "command", "command": foreign},
+					},
+				},
+			},
+		},
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write fixture hooks.json: %v", err)
+	}
+
+	conn := NewAntigravityConnector()
+	if err := conn.removeConfigEntries(path, current); err != nil {
+		t.Fatalf("removeConfigEntries: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read pruned hooks.json: %v", err)
+	}
+	var pruned map[string]interface{}
+	if err := json.Unmarshal(after, &pruned); err != nil {
+		t.Fatalf("parse pruned hooks.json: %v\n%s", err, after)
+	}
+	if structuredHookCommandReferences(pruned, []string{current, legacy, legacyNonWaiting}) {
+		t.Fatalf("managed Antigravity command survived pruning:\n%s", after)
+	}
+	if !strings.Contains(string(after), foreign) {
+		t.Fatalf("foreign hook was not preserved:\n%s", after)
+	}
+}
+
+func TestOpenHandsSetup_PatchesDocumentedHookSchema(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("OpenHands requires WSL and is unsupported on native Windows; platform rejection coverage remains active")
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".openhands", "hooks.json")
+	prev := OpenHandsHooksPathOverride
+	OpenHandsHooksPathOverride = cfgPath
+	t.Cleanup(func() { OpenHandsHooksPathOverride = prev })
+
+	conn := NewOpenHandsConnector()
+	opts := SetupOpts{
+		DataDir:      filepath.Join(dir, "dc"),
+		WorkspaceDir: dir,
+		APIAddr:      "127.0.0.1:18970",
+		APIToken:     "tok-test",
+	}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read OpenHands hooks.json: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("OpenHands hooks.json is not valid JSON: %v\n%s", err, string(data))
+	}
+	raw, ok := cfg["pre_tool_use"].([]interface{})
+	if !ok || len(raw) == 0 {
+		t.Fatalf("pre_tool_use missing from native top-level OpenHands hook schema: %#v", cfg)
+	}
+	group, ok := raw[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("pre_tool_use[0] = %#v, want object", raw[0])
+	}
+	if group["matcher"] != "*" {
+		t.Fatalf("matcher=%#v want *", group["matcher"])
+	}
+	hooks, ok := group["hooks"].([]interface{})
+	if !ok || len(hooks) == 0 {
+		t.Fatalf("hooks missing from OpenHands group: %#v", group)
+	}
+	hook, ok := hooks[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("hooks[0] = %#v, want object", hooks[0])
+	}
+	if hook["type"] != "command" {
+		t.Fatalf("hook type=%#v want command", hook["type"])
+	}
+	command, _ := hook["command"].(string)
+	if !strings.Contains(command, "openhands-hook.sh") {
+		t.Fatalf("command=%q does not reference openhands-hook.sh", command)
+	}
+	if _, wrapped := cfg["hooks"]; wrapped {
+		t.Fatalf("OpenHands native schema should not add Claude-compatible top-level hooks wrapper: %#v", cfg["hooks"])
+	}
+}
+
+func TestGeminiSetup_PatchesNativeTelemetryPathToken(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "settings.json")
+	prev := GeminiSettingsPathOverride
+	GeminiSettingsPathOverride = cfgPath
+	t.Cleanup(func() { GeminiSettingsPathOverride = prev })
+
+	conn := NewGeminiCLIConnector()
+	opts := SetupOpts{
+		DataDir:  filepath.Join(dir, "dc"),
+		APIAddr:  "127.0.0.1:18970",
+		APIToken: "tok-test",
+	}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read gemini settings: %v", err)
+	}
+	text := string(data)
+	// Gemini CLI's settings.json schema only accepts target ∈
+	// {"local","gcp"}. To forward telemetry to a custom (loopback)
+	// OTLP collector we must set target=local + useCollector=true.
+	// See https://geminicli.com/docs/reference/configuration/.
+	if !strings.Contains(text, `"target": "local"`) {
+		t.Fatalf("gemini settings missing managed telemetry target=local:\n%s", text)
+	}
+	if !strings.Contains(text, `"useCollector": true`) {
+		t.Fatalf("gemini settings missing useCollector=true (required for external OTLP):\n%s", text)
+	}
+	if !strings.Contains(text, `"otlpProtocol": "http"`) {
+		t.Fatalf("gemini settings missing otlpProtocol=http:\n%s", text)
+	}
+	// Gemini's schema rejects unknown keys at load time, so we MUST
+	// NOT write the legacy "managedBy" / "protocol" fields anymore —
+	// otherwise `gemini` aborts with "Unrecognized key(s) in object".
+	for _, banned := range []string{`"managedBy"`, `"protocol":`} {
+		if strings.Contains(text, banned) {
+			t.Fatalf("gemini settings contain key rejected by schema (%s):\n%s", banned, text)
+		}
+	}
+	// H-4: settings.json must NOT contain the master gateway bearer
+	// (opts.APIToken). The OTLP exporter authenticates via a scoped
+	// per-source path-token instead — see EnsureOTLPPathToken /
+	// patchGeminiTelemetry.
+	if strings.Contains(text, "tok-test") {
+		t.Fatalf("gemini settings leaked master gateway token (H4 regression):\n%s", text)
+	}
+	scoped, err := LoadOTLPPathToken(opts.DataDir, OTLPScopeGeminiCLI)
+	if err != nil {
+		t.Fatalf("LoadOTLPPathToken: %v", err)
+	}
+	if scoped == "" {
+		t.Fatalf("setup did not mint a scoped OTLP token under %s", opts.DataDir)
+	}
+	if !strings.Contains(text, "/otlp/geminicli/"+scoped) {
+		t.Fatalf("gemini settings missing scoped path-token config:\n%s", text)
+	}
+}
+
+func TestGeminiSetup_MigratesLegacySchemaInPlace(t *testing.T) {
+	// Regression: defenseclaw < 0.x wrote `target: "otlp"`,
+	// `protocol: "http/json"`, and `managedBy: "defenseclaw"` —
+	// all three are rejected by the current Gemini CLI schema, so
+	// `gemini` refuses to start until the file is repaired. Running
+	// `defenseclaw setup` against a stale settings.json must
+	// migrate the keys (not just append).
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "settings.json")
+	prev := GeminiSettingsPathOverride
+	GeminiSettingsPathOverride = cfgPath
+	t.Cleanup(func() { GeminiSettingsPathOverride = prev })
+
+	legacy := map[string]interface{}{
+		"telemetry": map[string]interface{}{
+			"enabled":      true,
+			"target":       "otlp",
+			"otlpEndpoint": "http://127.0.0.1:18790/otlp/geminicli/legacy-token",
+			"protocol":     "http/json",
+			"logPrompts":   true,
+			"managedBy":    "defenseclaw",
+		},
+		"userSetting": "keep",
+	}
+	body, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal legacy config: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, append(body, '\n'), 0o600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	conn := NewGeminiCLIConnector()
+	opts := SetupOpts{
+		DataDir:  filepath.Join(dir, "dc"),
+		APIAddr:  "127.0.0.1:18970",
+		APIToken: "tok-test",
+	}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup over legacy config: %v", err)
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read migrated config: %v", err)
+	}
+	text := string(data)
+	for _, banned := range []string{`"target": "otlp"`, `"protocol": "http/json"`, `"managedBy": "defenseclaw"`} {
+		if strings.Contains(text, banned) {
+			t.Fatalf("legacy schema key %q survived migration:\n%s", banned, text)
+		}
+	}
+	for _, want := range []string{`"target": "local"`, `"otlpProtocol": "http"`, `"useCollector": true`, `"userSetting": "keep"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("migrated config missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestGeminiTeardown_DriftedConfigRemovesManagedTelemetry(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "settings.json")
+	prev := GeminiSettingsPathOverride
+	GeminiSettingsPathOverride = cfgPath
+	t.Cleanup(func() { GeminiSettingsPathOverride = prev })
+
+	conn := NewGeminiCLIConnector()
+	opts := SetupOpts{
+		DataDir:  filepath.Join(dir, "dc"),
+		APIAddr:  "127.0.0.1:18970",
+		APIToken: "tok-test",
+	}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read setup config: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("parse setup config: %v", err)
+	}
+	cfg["userSetting"] = "keep"
+	telemetry, _ := cfg["telemetry"].(map[string]interface{})
+	if telemetry == nil {
+		t.Fatal("setup did not create telemetry object")
+	}
+	telemetry["userTelemetrySetting"] = "keep"
+	drifted, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal drifted config: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, append(drifted, '\n'), 0o600); err != nil {
+		t.Fatalf("write drifted config: %v", err)
+	}
+
+	if err := conn.Teardown(context.Background(), opts); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	restored, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config after teardown: %v", err)
+	}
+	text := string(restored)
+	for _, forbidden := range []string{"geminicli-hook.sh", "/otlp/geminicli/", `"managedBy": "defenseclaw"`} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("teardown left managed Gemini residue %q:\n%s", forbidden, text)
+		}
+	}
+	for _, want := range []string{`"userSetting": "keep"`, `"userTelemetrySetting": "keep"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("teardown did not preserve user edit %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestHookOnlyTeardown_UsesBackedUpConfigPathWhenWorkspaceChanges(t *testing.T) {
+	dir := t.TempDir()
+	prevHooks := CopilotHooksPathOverride
+	prevWorkspace := CopilotWorkspaceDirOverride
+	CopilotHooksPathOverride = ""
+	CopilotWorkspaceDirOverride = ""
+	t.Cleanup(func() {
+		CopilotHooksPathOverride = prevHooks
+		CopilotWorkspaceDirOverride = prevWorkspace
+	})
+
+	oldWorkspace := filepath.Join(dir, "old-workspace")
+	newWorkspace := filepath.Join(dir, "new-workspace")
+	conn := NewCopilotConnector()
+	setupOpts := SetupOpts{
+		DataDir:      filepath.Join(dir, "dc"),
+		APIAddr:      "127.0.0.1:18970",
+		APIToken:     "tok-test",
+		WorkspaceDir: oldWorkspace,
+	}
+	if err := conn.Setup(context.Background(), setupOpts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	oldPath := filepath.Join(oldWorkspace, ".github", "hooks", "defenseclaw.json")
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("expected old workspace hook config after setup: %v", err)
+	}
+
+	teardownOpts := setupOpts
+	teardownOpts.WorkspaceDir = newWorkspace
+	if err := conn.Teardown(context.Background(), teardownOpts); err != nil {
+		t.Fatalf("Teardown with changed workspace: %v", err)
+	}
+	if _, err := os.Stat(oldPath); err == nil {
+		t.Fatalf("old workspace hook config survived teardown: %s", oldPath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat old workspace hook config: %v", err)
+	}
+}
+
+func TestOpenHandsWorkspaceRootFallsBackToHomeWhenDaemonCwdIsDataDir(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	dataDir := filepath.Join(home, ".defenseclaw")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	testenv.SetHome(t, home)
+
+	prevHooks := OpenHandsHooksPathOverride
+	prevWorkspace := OpenHandsWorkspaceDirOverride
+	OpenHandsHooksPathOverride = ""
+	OpenHandsWorkspaceDirOverride = ""
+	t.Cleanup(func() {
+		OpenHandsHooksPathOverride = prevHooks
+		OpenHandsWorkspaceDirOverride = prevWorkspace
+	})
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dataDir); err != nil {
+		t.Fatalf("chdir data dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	got := openhandsHooksPath(SetupOpts{DataDir: dataDir})
+	want := filepath.Join(home, ".openhands", "hooks.json")
+	if got != want {
+		t.Fatalf("OpenHands hooks path = %q, want SDK-reachable home fallback %q", got, want)
+	}
+}
+
+func TestCopilotSetupDefaultsToGlobalWhenDaemonCwdIsDataDir(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	dataDir := filepath.Join(dir, ".defenseclaw")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	testenv.SetHome(t, home)
+
+	prevHooks := CopilotHooksPathOverride
+	prevWorkspace := CopilotWorkspaceDirOverride
+	CopilotHooksPathOverride = ""
+	CopilotWorkspaceDirOverride = ""
+	t.Cleanup(func() {
+		CopilotHooksPathOverride = prevHooks
+		CopilotWorkspaceDirOverride = prevWorkspace
+	})
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dataDir); err != nil {
+		t.Fatalf("chdir data dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	err = NewCopilotConnector().Setup(context.Background(), SetupOpts{
+		DataDir:  dataDir,
+		APIAddr:  "127.0.0.1:18970",
+		APIToken: "tok-test",
+	})
+	if err != nil {
+		t.Fatalf("Copilot setup with global home path failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".copilot", "hooks", "defenseclaw.json")); err != nil {
+		t.Fatalf("stat global copilot hook config: %v", err)
+	}
+
+	err = NewCopilotConnector().Setup(context.Background(), SetupOpts{
+		DataDir:      dataDir,
+		APIAddr:      "127.0.0.1:18970",
+		APIToken:     "tok-test",
+		WorkspaceDir: dataDir,
+	})
+	if err == nil {
+		t.Fatal("Copilot setup succeeded with explicit data dir as workspace")
+	}
+	if !strings.Contains(err.Error(), "workspace must be outside DefenseClaw data dir") {
+		t.Fatalf("Copilot setup error = %v, want clear workspace error", err)
+	}
+}
+
+func TestCursorHooks_FailClosedOnlyWhenExplicit(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "hooks.json")
+	prev := CursorHooksPathOverride
+	CursorHooksPathOverride = cfgPath
+	t.Cleanup(func() { CursorHooksPathOverride = prev })
+
+	conn := NewCursorConnector()
+	opts := SetupOpts{
+		DataDir:      filepath.Join(dir, "dc"),
+		APIAddr:      "127.0.0.1:18970",
+		APIToken:     "tok-test",
+		HookFailMode: "closed",
+	}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read cursor hooks: %v", err)
+	}
+	if !strings.Contains(string(data), `"failClosed": true`) {
+		t.Fatalf("cursor hooks did not enable failClosed when explicitly requested:\n%s", string(data))
+	}
+
+	// Refreshing the same connector in observe/fail-open mode must replace the
+	// managed entries rather than retaining stale host-side enforcement.
+	opts.HookFailMode = "open"
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("observe refresh Setup: %v", err)
+	}
+	cfg, err := readJSONObject(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks, _ := cfg["hooks"].(map[string]interface{})
+	for event, raw := range hooks {
+		entries, _ := raw.([]interface{})
+		if len(entries) != 1 {
+			t.Fatalf("Cursor %s entries = %d after refresh, want 1", event, len(entries))
+		}
+		entry, _ := entries[0].(map[string]interface{})
+		if entry["failClosed"] != false {
+			t.Fatalf("Cursor %s retained failClosed=true after observe refresh: %#v", event, entry)
+		}
+	}
+}
+
+func TestCursorHooks_RefreshMigratesNativeCommandAndUpdatesFailClosed(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("direct-native to PowerShell adapter migration is Windows-specific")
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "hooks.json")
+	prev := CursorHooksPathOverride
+	CursorHooksPathOverride = cfgPath
+	t.Cleanup(func() { CursorHooksPathOverride = prev })
+	setHookBinaryOverride(t, filepath.Join(userHomeDir(), ".local", "bin", windowsHookBinaryName))
+
+	legacyNative := windowsQuoteExe(defenseclawHookBinary()) + " " + nativeHookFlag + "cursor"
+	foreign := `& 'C:\Tools\operator-hook.ps1'`
+	seed := fmt.Sprintf(`{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {"type":"command","command":%q,"failClosed":true},
+      {"type":"command","command":%q,"failClosed":true}
+    ]
+  }
+}`, legacyNative, foreign)
+	if err := os.WriteFile(cfgPath, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	conn := NewCursorConnector()
+	opts := SetupOpts{
+		DataDir:      filepath.Join(dir, "dc"),
+		APIAddr:      "127.0.0.1:18970",
+		APIToken:     "tok-test",
+		HookFailMode: "open",
+	}
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("observe Setup: %v", err)
+	}
+	// A second setup must be idempotent rather than duplicating the adapter.
+	if err := conn.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("repeated observe Setup: %v", err)
+	}
+
+	cfg, err := readJSONObject(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks, _ := cfg["hooks"].(map[string]interface{})
+	entries, _ := hooks["beforeSubmitPrompt"].([]interface{})
+	if len(entries) != 2 {
+		t.Fatalf("beforeSubmitPrompt entries = %d, want one foreign and one DefenseClaw: %#v", len(entries), entries)
+	}
+	managedCount := 0
+	foreignFound := false
+	for _, raw := range entries {
+		item, _ := raw.(map[string]interface{})
+		command, _ := item["command"].(string)
+		switch {
+		case command == foreign:
+			foreignFound = true
+		case strings.Contains(command, "cursor-hook.ps1"):
+			managedCount++
+			if item["failClosed"] != false {
+				t.Fatalf("observe adapter retained failClosed=true: %#v", item)
+			}
+		case command == legacyNative:
+			t.Fatalf("legacy direct-native command survived refresh: %#v", item)
+		}
+	}
+	if !foreignFound || managedCount != 1 {
+		t.Fatalf("refresh did not preserve foreign hook and deduplicate adapter: %#v", entries)
+	}
+}
+
+func TestHookOnlyHookScripts_RespectFailClosedCapability(t *testing.T) {
+	cases := []struct {
+		name         string
+		connector    *hookOnlyConnector
+		wantFailMode string
+	}{
+		{name: "cursor_supports_fail_closed", connector: NewCursorConnector(), wantFailMode: "closed"},
+		{name: "geminicli_supports_fail_closed", connector: NewGeminiCLIConnector(), wantFailMode: "closed"},
+		{name: "openhands_supports_fail_closed", connector: NewOpenHandsConnector(), wantFailMode: "closed"},
+		{name: "hermes_downgrades_to_fail_open", connector: NewHermesConnector(), wantFailMode: "open"},
+		{name: "copilot_downgrades_to_fail_open", connector: NewCopilotConnector(), wantFailMode: "open"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			opts := SetupOpts{
+				DataDir:      filepath.Join(dir, "dc"),
+				APIAddr:      "127.0.0.1:18970",
+				APIToken:     "tok-test",
+				HookFailMode: "closed",
+				WorkspaceDir: dir,
+			}
+			if err := WriteHookScriptsForConnectorObjectWithOpts(filepath.Join(dir, "hooks"), opts, tc.connector); err != nil {
+				t.Fatalf("WriteHookScriptsForConnectorObjectWithOpts: %v", err)
+			}
+			body, err := os.ReadFile(filepath.Join(dir, "hooks", tc.connector.scriptName))
+			if err != nil {
+				t.Fatalf("read hook script: %v", err)
+			}
+			want := `FAIL_MODE="${DEFENSECLAW_FAIL_MODE:-` + tc.wantFailMode + `}"`
+			if !strings.Contains(string(body), want) {
+				t.Fatalf("hook script missing %s:\n%s", want, string(body))
+			}
+		})
+	}
+}
+
+func TestOpenHandsHookScript_BlockExitsTwo(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/openhands/hook" {
+			t.Fatalf("path=%s want /api/v1/openhands/hook", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"hook_output":{"decision":"deny","reason":"policy denied"}}`))
+	}))
+	defer server.Close()
+	addr := strings.TrimPrefix(server.URL, "http://")
+	dir := t.TempDir()
+	if err := WriteHookScriptsForConnectorObjectWithOpts(dir, SetupOpts{APIAddr: addr, APIToken: "tok-test", HookFailMode: "closed"}, NewOpenHandsConnector()); err != nil {
+		t.Fatalf("WriteHookScriptsForConnectorObjectWithOpts: %v", err)
+	}
+	home := t.TempDir()
+	cmd := exec.Command("bash", filepath.Join(dir, "openhands-hook.sh"))
+	cmd.Stdin = strings.NewReader(`{"event_type":"PreToolUse","tool_name":"terminal","tool_input":{"command":"cat /etc/shadow"}}`)
+	cmd.Env = append(os.Environ(), "DEFENSECLAW_HOME="+home)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("OpenHands deny hook exited 0, want exit 2; output=%s", string(out))
+	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("OpenHands deny hook exit=%v want code 2; output=%s", err, string(out))
+	}
+	if !strings.Contains(string(out), `"decision":"deny"`) {
+		t.Fatalf("OpenHands deny hook did not print decision JSON; output=%s", string(out))
+	}
+}

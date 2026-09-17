@@ -1,0 +1,103 @@
+<dashboard version="1.1">
+  <label>Alerts And Saved Searches</label>
+  <description>Packaged security-operations detections and supporting saved searches for the seeded investigation model.</description>
+  <row>
+    <panel>
+      <html>
+        <h2>Security operations detection pack</h2>
+        <p>This page now highlights the packaged DefenseClaw Security Ops detection searches that sit on top of the seeded `dcso_*` support layer. The detection searches remain disabled by default, run on a 5-minute schedule with a 15-minute lookback when enabled, and intentionally stop at detect, explain, investigate, and recommend.</p>
+      </html>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Packaged security-operations detections</title>
+      <table>
+        <search>
+          <query>| makeresults count=8
+| streamstats count as row
+| eval search_name=case(
+    row=1, "DefenseClaw Security Ops - Repeated Deny Activity",
+    row=2, "DefenseClaw Security Ops - Dangerous Command Or Tool Denied",
+    row=3, "DefenseClaw Security Ops - Policy Bypass Or Retry After Denial",
+    row=4, "DefenseClaw Security Ops - Stuck Or Retry-Storm Session",
+    row=5, "DefenseClaw Security Ops - Runtime Error Burst Around Risky Run",
+    row=6, "DefenseClaw Security Ops - High-Cost Or Long-Duration Risky Run",
+    row=7, "DefenseClaw Security Ops - Latest Critical Investigations",
+    row=8, "DefenseClaw Security Ops - Top Risky Runs Sessions"
+  ),
+  purpose=case(
+    row=1, "Detect repeated deny outcomes for the same run or session.",
+    row=2, "Detect denied dangerous command or tool evidence.",
+    row=3, "Detect bypass-like retry-after-deny behavior.",
+    row=4, "Detect stuck sessions and retry storms.",
+    row=5, "Detect repeated runtime errors around a risky run or session.",
+    row=6, "Detect high-cost or long-duration risky investigations.",
+    row=7, "Populate the command-center critical queue.",
+    row=8, "Populate the command-center top risky queue."
+  ),
+  primary_family=case(
+    row=1 OR row=2 OR row=3, "policy + runtime + diagnostics",
+    row=4, "diagnostics",
+    row=5, "runtime + diagnostics",
+    row=6, "usage",
+    row=7 OR row=8, "rolled-up investigations"
+  ),
+  default_state=case(row&lt;=6, "disabled scheduled search", 1=1, "visible report search"),
+  schedule=case(row&lt;=6, "*/5 * * * * with last 15 minutes", 1=1, "on-demand"),
+  target_surface=case(row&lt;=6, "Runs And Sessions + Search And Drilldown", 1=1, "Overview")
+| table search_name purpose primary_family default_state schedule target_surface</query>
+          <earliest>0</earliest>
+          <latest></latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Recent matching security-operations conditions</title>
+      <table>
+        <search>
+          <query>`dcso_detection_repeated_deny_activity` | eval workflow="Repeated Deny Activity" | table workflow run_id session_id risk_state risk_reason deny_count risk_rule_ids last_seen
+| append [ search `dcso_detection_dangerous_command_or_tool_denied` | eval workflow="Dangerous Command Or Tool Denied" | table workflow run_id session_id risk_state risk_reason dangerous_deny_count deny_count risk_rule_ids last_seen ]
+| append [ search `dcso_detection_policy_bypass_or_retry_after_denial` | eval workflow="Policy Bypass Or Retry After Denial" | table workflow run_id session_id risk_state risk_reason retry_after_deny_count session_retried_count queue_pressure_count risk_rule_ids last_seen ]
+| append [ search `dcso_detection_stuck_or_retry_storm_session` | eval workflow="Stuck Or Retry-Storm Session" | table workflow run_id session_id risk_state risk_reason session_stuck_count session_retried_count queue_pressure_count risk_rule_ids last_seen ]
+| append [ search `dcso_detection_runtime_error_burst_around_risky_run` | eval workflow="Runtime Error Burst Around Risky Run" | table workflow run_id session_id risk_state risk_reason runtime_error_count deny_count risk_rule_ids last_seen ]
+| append [ search `dcso_detection_high_cost_or_long_duration_risky_run` | eval workflow="High-Cost Or Long-Duration Risky Run" | table workflow run_id session_id risk_state risk_reason max_cost_usd max_duration_ms risk_rule_ids last_seen ]
+| head 30</query>
+          <earliest>0</earliest>
+          <latest></latest>
+        </search>
+        <option name="count">30</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Command-center support searches</title>
+      <table>
+        <search>
+          <query>| makeresults count=2
+| streamstats count as row
+| eval search_name=case(
+    row=1, "DefenseClaw Security Ops - Latest Critical Investigations",
+    row=2, "DefenseClaw Security Ops - Top Risky Runs Sessions"
+  ),
+  purpose=case(
+    row=1, "Populate the command-center critical investigations queue.",
+    row=2, "Populate the command-center priority queue across needs_review, risky, and critical."
+  ),
+  target_surface="Overview"
+| table search_name purpose target_surface</query>
+          <earliest>0</earliest>
+          <latest></latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+</dashboard>

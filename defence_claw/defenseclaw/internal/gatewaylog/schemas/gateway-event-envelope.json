@@ -1,0 +1,463 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defenseclaw.io/schemas/gateway-event-envelope.json",
+  "title": "DefenseClaw Gateway Event Envelope (v7)",
+  "description": "One JSONL line emitted by the DefenseClaw gateway sidecar to gateway.jsonl / stderr / HTTP sinks. The envelope carries correlation + provenance; exactly one of the type-specific payload sub-objects is populated and selected by `event_type`. `hook_decision` records the final connector-facing action after enforcement-mode/capability mapping, distinct from the underlying guardrail verdict.",
+  "type": "object",
+  "required": ["ts", "event_type", "severity", "schema_version"],
+  "properties": {
+    "ts":         { "type": "string", "format": "date-time" },
+    "event_type": {
+      "type": "string",
+      "enum": ["verdict", "judge", "lifecycle", "error", "diagnostic", "scan", "scan_finding", "activity", "egress", "llm_prompt", "llm_response", "tool_invocation", "hook_decision", "ai_discovery", "connector_inventory", "mcp_inventory", "agent_inventory"]
+    },
+    "severity":   { "type": "string", "enum": ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL", "WARN"] },
+
+    "schema_version": { "type": "integer", "minimum": 7 },
+    "content_hash":   { "type": ["string", "null"] },
+    "generation":     { "type": ["integer", "null"], "minimum": 0 },
+    "binary_version": { "type": ["string", "null"] },
+
+    "run_id":     { "type": ["string", "null"] },
+    "request_id": { "type": ["string", "null"] },
+    "session_id": { "type": ["string", "null"] },
+    "turn_id":    { "type": ["string", "null"] },
+    "trace_id":   { "type": ["string", "null"] },
+
+    "provider":  { "type": ["string", "null"] },
+    "model":     { "type": ["string", "null"] },
+    "direction": { "type": ["string", "null"], "enum": ["prompt", "completion", "tool_call", null] },
+
+    "agent_id":            { "type": ["string", "null"] },
+    "agent_name":          { "type": ["string", "null"] },
+    "agent_type":          { "type": ["string", "null"] },
+    "root_agent_id":       { "type": ["string", "null"] },
+    "parent_agent_id":     { "type": ["string", "null"] },
+    "root_session_id":     { "type": ["string", "null"] },
+    "parent_session_id":   { "type": ["string", "null"] },
+    "agent_lifecycle_id":  { "type": ["string", "null"], "pattern": "^lifecycle-[0-9a-f]{16}$" },
+    "agent_execution_id":  { "type": ["string", "null"], "pattern": "^execution-[0-9a-f]{16}$" },
+    "agent_lifecycle_event": { "type": ["string", "null"], "enum": ["session_start", "session_end", "subagent_start", "subagent_stop", "turn_start", "turn_end", "tool_start", "tool_end", "compact_start", "compact_end", "event", null] },
+    "agent_lifecycle_state": { "type": ["string", "null"], "enum": ["active", "completed", "failed", "interrupted", "observed", null] },
+    "agent_phase": { "$ref": "#/$defs/AgentPhase" },
+    "agent_previous_phase": { "$ref": "#/$defs/AgentPhase" },
+    "agent_phase_code": { "type": ["integer", "null"], "minimum": 0, "maximum": 12 },
+    "agent_sequence": { "type": ["integer", "null"], "minimum": 1 },
+    "agent_operation_id": { "type": ["string", "null"] },
+    "agent_depth":         { "type": ["integer", "null"], "minimum": 0 },
+    "agent_reported_cost_usd": { "type": ["number", "null"], "minimum": 0 },
+    "agent_reported_cost_present": { "type": ["boolean", "null"] },
+    "session_source":      { "type": ["string", "null"] },
+    "session_resumed":     { "type": ["boolean", "null"] },
+    "agent_instance_id":   { "type": ["string", "null"] },
+    "sidecar_instance_id": { "type": ["string", "null"] },
+    "user_id":             { "type": ["string", "null"] },
+    "user_name":           { "type": ["string", "null"] },
+
+    "policy_id":       { "type": ["string", "null"] },
+    "destination_app": { "type": ["string", "null"] },
+    "tool_name":       { "type": ["string", "null"] },
+    "tool_id":         { "type": ["string", "null"] },
+
+    "tenant_id":        { "type": ["string", "null"], "description": "Logical tenancy boundary for hosted/SaaS deployments. Populated from config tenant_id when set." },
+    "workspace_id":     { "type": ["string", "null"], "description": "Sub-tenant workspace, organization, or team scope. Populated from config workspace_id when set." },
+    "environment":      { "type": ["string", "null"], "description": "Deployment environment. Populated from config environment when set." },
+    "deployment_mode":  {
+      "anyOf": [
+        { "type": "string", "enum": ["managed_enterprise", "unmanaged_byod", "ci_cd", "sandboxed", "server", "saas"] },
+        { "type": "null" }
+      ],
+      "description": "Sidecar deployment mode. Populated from config deployment_mode when set."
+    },
+    "discovery_source": { "type": ["string", "null"], "description": "How the monitored agent or tool was discovered. Populated from config discovery_source when set." },
+
+    "verdict":         { "$ref": "#/$defs/VerdictPayload" },
+    "judge":           { "$ref": "#/$defs/JudgePayload" },
+    "lifecycle":       { "$ref": "#/$defs/LifecyclePayload" },
+    "error":           { "$ref": "#/$defs/ErrorPayload" },
+    "diagnostic":      { "$ref": "#/$defs/DiagnosticPayload" },
+    "scan":            { "$ref": "https://defenseclaw.io/schemas/scan-event.json#/$defs/ScanPayload" },
+    "scan_finding":    { "$ref": "https://defenseclaw.io/schemas/scan-finding-event.json#/$defs/ScanFindingPayload" },
+    "activity":        { "$ref": "https://defenseclaw.io/schemas/activity-event.json#/$defs/ActivityPayload" },
+    "egress":          { "$ref": "#/$defs/EgressPayload" },
+    "llm_prompt":      { "$ref": "#/$defs/LLMPromptPayload" },
+    "llm_response":    { "$ref": "#/$defs/LLMResponsePayload" },
+    "tool_invocation": { "$ref": "#/$defs/ToolPayload" },
+    "hook_decision":   { "$ref": "#/$defs/HookDecisionPayload" },
+    "ai_discovery":    { "$ref": "#/$defs/AIDiscoveryPayload" },
+    "connector_inventory": { "$ref": "#/$defs/ConnectorInventoryPayload" },
+    "mcp_inventory":       { "$ref": "#/$defs/MCPInventoryPayload" },
+    "agent_inventory":     { "$ref": "#/$defs/AgentInventoryPayload" }
+  },
+  "oneOf": [
+    { "properties": { "event_type": { "const": "verdict" } },         "required": ["event_type", "verdict"] },
+    { "properties": { "event_type": { "const": "judge" } },           "required": ["event_type", "judge"] },
+    { "properties": { "event_type": { "const": "lifecycle" } },       "required": ["event_type", "lifecycle"] },
+    { "properties": { "event_type": { "const": "error" } },           "required": ["event_type", "error"] },
+    { "properties": { "event_type": { "const": "diagnostic" } },      "required": ["event_type", "diagnostic"] },
+    { "properties": { "event_type": { "const": "scan" } },            "required": ["event_type", "scan"] },
+    { "properties": { "event_type": { "const": "scan_finding" } },    "required": ["event_type", "scan_finding"] },
+    { "properties": { "event_type": { "const": "activity" } },        "required": ["event_type", "activity"] },
+    { "properties": { "event_type": { "const": "egress" } },          "required": ["event_type", "egress"] },
+    { "properties": { "event_type": { "const": "llm_prompt" } },      "required": ["event_type", "llm_prompt"] },
+    { "properties": { "event_type": { "const": "llm_response" } },    "required": ["event_type", "llm_response"] },
+    { "properties": { "event_type": { "const": "tool_invocation" } }, "required": ["event_type", "tool_invocation"] },
+    { "properties": { "event_type": { "const": "hook_decision" } },   "required": ["event_type", "hook_decision"] },
+    { "properties": { "event_type": { "const": "ai_discovery" } },    "required": ["event_type", "ai_discovery"] },
+    { "properties": { "event_type": { "const": "connector_inventory" } }, "required": ["event_type", "connector_inventory"] },
+    { "properties": { "event_type": { "const": "mcp_inventory" } },       "required": ["event_type", "mcp_inventory"] },
+    { "properties": { "event_type": { "const": "agent_inventory" } },     "required": ["event_type", "agent_inventory"] }
+  ],
+  "$defs": {
+    "AgentPhase": {
+      "type": ["string", "null"],
+      "enum": ["session", "planning", "model", "tool", "approval", "waiting", "responding", "maintenance", "completed", "failed", "interrupted", "observed", null]
+    },
+    "VerdictPayload": {
+      "type": "object",
+      "required": ["stage", "action"],
+      "properties": {
+        "stage":      { "type": "string", "enum": ["regex", "judge", "cisco_ai_defense", "opa", "final", "session_message", "multi_turn", "block_list", "approval"] },
+        "action":     { "type": "string", "enum": ["allow", "warn", "alert", "confirm", "block"] },
+        "reason":     { "type": ["string", "null"] },
+        "categories": { "type": ["array", "null"], "items": { "type": "string" } },
+        "latency_ms": { "type": ["integer", "null"] },
+        "evaluation_id": { "type": ["string", "null"], "description": "Optional join key linking this verdict to its per-finding scan_findings rows / EventScanFinding fan-out." },
+        "rule_ids":   { "type": ["array", "null"], "items": { "type": "string" }, "description": "Top detection rule identifiers that drove this verdict (capped at 8). Quick SIEM-pivot key." }
+      }
+    },
+    "HookDecisionPayload": {
+      "type": "object",
+      "description": "The final action delivered to a hook connector. action may differ from raw_action when observe mode or connector capability downgrades a guardrail block; this is the durable source for recovery-path analysis.",
+      "required": ["connector", "event", "result", "action", "raw_action", "severity", "mode", "would_block", "enforced"],
+      "properties": {
+        "connector": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "event": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "result": { "type": "string", "enum": ["ok", "panic"] },
+        "action": { "type": "string", "enum": ["allow", "warn", "alert", "confirm", "block", "unknown"] },
+        "raw_action": { "type": "string", "enum": ["allow", "warn", "alert", "confirm", "block", "unknown"] },
+        "severity": { "type": "string", "enum": ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL", "WARN"] },
+        "mode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "would_block": { "type": "boolean" },
+        "enforced": { "type": "boolean" },
+        "step_idx": { "type": ["integer", "null"], "minimum": 1 },
+        "latency_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "reason": { "type": ["string", "null"], "maxLength": 4096 },
+        "evaluation_id": { "type": ["string", "null"], "maxLength": 256 },
+        "rule_ids": { "type": ["array", "null"], "items": { "type": "string", "maxLength": 256 }, "maxItems": 8 }
+      }
+    },
+    "JudgePayload": {
+      "type": "object",
+      "required": ["kind", "model", "input_bytes", "latency_ms"],
+      "properties": {
+        "kind":         { "type": "string" },
+        "model":        { "type": "string" },
+        "input_bytes":  { "type": "integer" },
+        "latency_ms":   { "type": "integer" },
+        "action":       { "type": ["string", "null"] },
+        "severity":     { "type": ["string", "null"] },
+        "findings":     { "type": ["array", "null"] },
+        "raw_response": { "type": ["string", "null"] },
+        "parse_error":  { "type": ["string", "null"] }
+      }
+    },
+    "LifecyclePayload": {
+      "type": "object",
+      "required": ["subsystem", "transition"],
+      "properties": {
+        "subsystem":  { "type": "string" },
+        "transition": { "type": "string", "enum": ["start", "stop", "ready", "degraded", "restored", "alert", "completed"] },
+        "details":    { "type": ["object", "null"] }
+      }
+    },
+    "ErrorPayload": {
+      "type": "object",
+      "required": ["subsystem", "message"],
+      "properties": {
+        "subsystem":     { "type": "string" },
+        "code":          { "type": ["string", "null"] },
+        "message":       { "type": "string" },
+        "cause":         { "type": ["string", "null"] },
+        "rule_id":       { "type": ["string", "null"], "description": "Optional rule identifier this error is attributable to (schema-gate violations on finding events, verdict-failure errors)." },
+        "evaluation_id": { "type": ["string", "null"], "description": "Optional join key linking this error to the evaluation that produced the broken event (matches ScanPayload.evaluation_id / VerdictPayload.evaluation_id)." }
+      }
+    },
+    "DiagnosticPayload": {
+      "type": "object",
+      "required": ["component", "message"],
+      "properties": {
+        "component": { "type": "string" },
+        "message":   { "type": "string" },
+        "fields":    { "type": ["object", "null"] }
+      }
+    },
+    "EgressPayload": {
+      "type": "object",
+      "required": ["branch", "decision", "source"],
+      "properties": {
+        "target_host":    { "type": ["string", "null"] },
+        "resolved_ip":    { "type": ["string", "null"], "format": "ip-address" },
+        "target_path":    { "type": ["string", "null"] },
+        "body_shape":     { "type": ["string", "null"], "enum": ["", "none", "messages", "prompt", "input", "contents", "unknown", null] },
+        "looks_like_llm": { "type": ["boolean", "null"] },
+        "branch":         { "type": "string", "enum": ["known", "shape", "passthrough", "private-upstream"] },
+        "decision":       { "type": "string", "enum": ["allow", "block"] },
+        "reason":         { "type": ["string", "null"] },
+        "source":         { "type": "string", "enum": ["go", "ts"] }
+      }
+    },
+    "LLMPromptPayload": {
+      "type": "object",
+      "required": ["prompt_id"],
+      "properties": {
+        "prompt_id":        { "type": "string" },
+        "turn_id":          { "type": ["string", "null"] },
+        "role":             { "type": ["string", "null"] },
+        "prompt":           { "type": ["string", "null"] },
+        "raw_request_body": { "type": ["string", "null"] },
+        "source":           { "type": ["string", "null"] }
+      }
+    },
+    "LLMResponsePayload": {
+      "type": "object",
+      "required": ["response_id"],
+      "properties": {
+        "response_id":         { "type": "string" },
+        "reply_to_prompt_id":  { "type": ["string", "null"] },
+        "turn_id":             { "type": ["string", "null"] },
+        "response":            { "type": ["string", "null"] },
+        "raw_response_body":   { "type": ["string", "null"] },
+        "finish_reasons":      { "type": ["array", "null"], "items": { "type": "string" } },
+        "source":              { "type": ["string", "null"] }
+      }
+    },
+    "ToolPayload": {
+      "type": "object",
+      "required": ["phase", "tool"],
+      "properties": {
+        "tool_call_id":       { "type": ["string", "null"] },
+        "phase":              { "type": "string", "enum": ["call", "result"] },
+        "turn_id":            { "type": ["string", "null"] },
+        "tool":               { "type": "string" },
+        "tool_input":         { "type": ["string", "null"] },
+        "tool_output":        { "type": ["string", "null"] },
+        "exit_code":          { "type": ["integer", "null"] },
+        "reply_to_prompt_id": { "type": ["string", "null"] },
+        "source":             { "type": ["string", "null"] }
+      }
+    },
+    "AIDiscoveryPayload": {
+      "type": "object",
+      "required": ["scan_id", "signal_id", "category", "state"],
+      "properties": {
+        "scan_id":        { "type": "string", "maxLength": 128 },
+        "signal_id":      { "type": "string", "maxLength": 128 },
+        "category":       { "type": "string", "enum": ["supported_connector", "ai_cli", "active_process", "editor_extension", "mcp_server", "skill", "rule", "plugin", "package_dependency", "env_var_name", "shell_history_match", "provider_domain", "workspace_artifact", "desktop_app", "local_ai_endpoint", "local_model"] },
+        "vendor":         { "type": ["string", "null"], "maxLength": 128 },
+        "product":        { "type": ["string", "null"], "maxLength": 128 },
+        "confidence":     { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "state":          { "type": "string", "enum": ["new", "seen", "changed", "gone"] },
+        "evidence_types": { "type": ["array", "null"], "items": { "type": "string", "maxLength": 64 }, "maxItems": 16 },
+        "path_hashes":    { "type": ["array", "null"], "items": { "type": "string", "pattern": "^(sha256|hmac-sha256):[0-9a-f]{64}$" }, "maxItems": 16 },
+        "basenames":      { "type": ["array", "null"], "items": { "type": "string", "maxLength": 128, "pattern": "^[^/\\\\]+$" }, "maxItems": 16 },
+        "workspace_hash": { "type": ["string", "null"], "pattern": "^((sha256|hmac-sha256):[0-9a-f]{64})?$" },
+        "last_seen":      { "type": ["string", "null"], "format": "date-time" },
+        "detector":       { "type": ["string", "null"], "maxLength": 64,
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it." },
+        "component":      { "type": ["object", "null"],
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it.",
+          "properties": {
+            "ecosystem": { "type": ["string", "null"], "maxLength": 64 },
+            "name":      { "type": ["string", "null"], "maxLength": 256 },
+            "version":   { "type": ["string", "null"], "maxLength": 64 },
+            "framework": { "type": ["string", "null"], "maxLength": 256 }
+          }
+        },
+        "model":          { "type": ["object", "null"],
+          "description": "Historical pre-v8 local-model field; canonical v8 producers do not populate it.",
+          "required": ["id", "status"],
+          "properties": {
+            "id":         { "type": "string", "minLength": 1, "maxLength": 512 },
+            "status":     { "type": "string", "enum": ["installed", "loaded"] },
+            "format":     { "type": ["string", "null"], "maxLength": 64 },
+            "provider":   { "type": ["string", "null"], "maxLength": 96 },
+            "recipe":     { "type": ["string", "null"], "maxLength": 128 },
+            "modality":   { "type": ["string", "null"], "maxLength": 64 },
+            "device":     { "type": ["string", "null"], "maxLength": 128 },
+            "owner_application": { "type": ["string", "null"], "maxLength": 96, "pattern": "^[^/\\\\]*$" },
+            "relevance": { "type": ["string", "null"], "enum": ["primary", "supporting", "embedded", "unknown", null] },
+            "discovery_confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+            "pinned":     { "type": ["boolean", "null"] },
+            "provenance": { "type": ["object", "null"],
+              "properties": {
+                "publisher":    { "type": ["string", "null"], "maxLength": 128 },
+                "country_code": { "type": ["string", "null"], "pattern": "^[A-Z]{2}$" },
+                "root_model":   { "type": ["string", "null"], "maxLength": 512 },
+                "base_models":  { "type": ["array", "null"], "items": { "type": "string", "minLength": 1, "maxLength": 512 }, "maxItems": 8, "uniqueItems": true },
+                "quantized":    { "type": ["boolean", "null"], "description": "Authoritative when non-null: true means the artifact is quantized, false means it is positively identified as not quantized, and null means unknown." },
+                "quantization": { "type": ["string", "null"], "maxLength": 64 },
+                "distilled":    { "type": ["boolean", "null"], "description": "Authoritative when non-null: true means the artifact is distilled, false means it is positively identified as not distilled, and null means unknown." },
+                "derivation":   { "type": ["string", "null"], "enum": ["distilled", "quantized", "distilled+quantized", null], "description": "Normalized summary of the authoritative flags: distilled means distilled=true and quantized is not true; quantized means quantized=true and distilled is not true; distilled+quantized means both are true. null means neither flag is true (each may be false or unknown/null), and consumers must not infer false from null." },
+                "source":       { "type": ["string", "null"], "maxLength": 64 },
+                "confidence":   { "type": ["string", "null"], "enum": ["high", "medium", "low", null] }
+              }
+            }
+          }
+        },
+        "runtime":        { "type": ["object", "null"],
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it.",
+          "properties": {
+            "pid":        { "type": ["integer", "null"], "minimum": 0 },
+            "ppid":       { "type": ["integer", "null"], "minimum": 0 },
+            "started_at": { "type": ["string", "null"], "format": "date-time" },
+            "uptime_sec": { "type": ["integer", "null"] },
+            "user":       { "type": ["string", "null"], "maxLength": 64 },
+            "comm":       { "type": ["string", "null"], "maxLength": 256 }
+          }
+        },
+        "last_active_at": { "type": ["string", "null"], "format": "date-time",
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it." },
+        "identity_score": { "type": ["number", "null"], "minimum": 0, "maximum": 1,
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it." },
+        "identity_band":  { "type": ["string", "null"], "enum": [null, "very_high", "high", "medium", "low", "very_low"],
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it." },
+        "presence_score": { "type": ["number", "null"], "minimum": 0, "maximum": 1,
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it." },
+        "presence_band":  { "type": ["string", "null"], "enum": [null, "very_high", "high", "medium", "low", "very_low"],
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it." },
+        "identity_factors": { "type": ["array", "null"],
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it.",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/AIDiscoveryFactor" }
+        },
+        "presence_factors": { "type": ["array", "null"],
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it.",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/AIDiscoveryFactor" }
+        },
+        "detectors":      { "type": ["array", "null"], "items": { "type": "string", "maxLength": 64 }, "maxItems": 16,
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it." },
+        "evidence":       { "type": ["array", "null"], "maxItems": 32,
+          "description": "Historical pre-v8 envelope field; canonical v8 producers do not populate it.",
+          "items": { "$ref": "#/$defs/AIDiscoveryEvidence" }
+        },
+        "raw_paths":      { "type": ["array", "null"], "items": { "type": "string", "maxLength": 4096 }, "maxItems": 32,
+          "description": "Historical pre-v8 raw-path field; canonical v8 producers never populate it." }
+      }
+    },
+    "AIDiscoveryFactor": {
+      "type": "object",
+      "required": ["detector", "logit_delta"],
+      "properties": {
+        "detector":   { "type": "string", "maxLength": 64 },
+        "evidence_id": { "type": ["string", "null"], "maxLength": 256 },
+        "match_kind": { "type": ["string", "null"], "enum": [null, "exact", "substring", "heuristic"] },
+        "quality":    { "type": ["number", "null"] },
+        "specificity": { "type": ["number", "null"] },
+        "lr":         { "type": ["number", "null"] },
+        "logit_delta": { "type": "number" }
+      }
+    },
+    "AIDiscoveryEvidence": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type":          { "type": "string", "maxLength": 64 },
+        "basename":      { "type": ["string", "null"], "maxLength": 128, "pattern": "^[^/\\\\]*$" },
+        "path_hash":     { "type": ["string", "null"], "pattern": "^((sha256|hmac-sha256):[0-9a-f]{64})?$" },
+        "value_hash":    { "type": ["string", "null"], "maxLength": 256 },
+        "workspace_hash": { "type": ["string", "null"], "pattern": "^((sha256|hmac-sha256):[0-9a-f]{64})?$" },
+        "raw_path":      { "type": ["string", "null"], "maxLength": 4096,
+          "description": "Historical pre-v8 raw-path field; canonical v8 producers never populate it." },
+        "quality":       { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "match_kind":    { "type": ["string", "null"], "enum": [null, "exact", "substring", "heuristic"] }
+      }
+    },
+    "ConnectorInventoryPayload": {
+      "type": "object",
+      "required": ["count", "connectors"],
+      "description": "Endpoint roster of configured DefenseClaw connectors. Metadata-only.",
+      "properties": {
+        "device_id": { "type": ["string", "null"], "maxLength": 128 },
+        "hostname":  { "type": ["string", "null"], "maxLength": 256 },
+        "count":     { "type": "integer", "minimum": 0 },
+        "connectors": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name":                 { "type": "string", "maxLength": 128 },
+              "description":          { "type": ["string", "null"], "maxLength": 512 },
+              "source":               { "type": ["string", "null"], "enum": [null, "built-in", "plugin"] },
+              "tool_inspection_mode": { "type": ["string", "null"], "maxLength": 64 },
+              "subprocess_policy":    { "type": ["string", "null"], "maxLength": 64 }
+            }
+          }
+        }
+      }
+    },
+    "MCPInventoryPayload": {
+      "type": "object",
+      "required": ["count", "servers"],
+      "description": "MCP servers configured for the endpoint's active connector(s). Redaction-safe: command basename + URL host only; never args/env/headers.",
+      "properties": {
+        "device_id": { "type": ["string", "null"], "maxLength": 128 },
+        "hostname":  { "type": ["string", "null"], "maxLength": 256 },
+        "count":     { "type": "integer", "minimum": 0 },
+        "servers": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name":               { "type": "string", "maxLength": 256 },
+              "transport":          { "type": ["string", "null"], "maxLength": 64 },
+              "command":            { "type": ["string", "null"], "maxLength": 256, "pattern": "^[^/\\\\]*$" },
+              "url_host":           { "type": ["string", "null"], "maxLength": 256, "pattern": "^[^\\s/@?#\\\\]*$" },
+              "auth_provider_type": { "type": ["string", "null"], "maxLength": 64 },
+              "disabled":           { "type": ["boolean", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "AgentInventoryPayload": {
+      "type": "object",
+      "required": ["count", "installed", "agents"],
+      "description": "Endpoint roster of installed coding agents. Sanitized: basenames + sha256 path hashes only, never raw paths.",
+      "properties": {
+        "device_id":  { "type": ["string", "null"], "maxLength": 128 },
+        "hostname":   { "type": ["string", "null"], "maxLength": 256 },
+        "source":     { "type": ["string", "null"], "maxLength": 64 },
+        "scanned_at": { "type": ["string", "null"], "format": "date-time", "maxLength": 64 },
+        "count":      { "type": "integer", "minimum": 0 },
+        "installed":  { "type": "integer", "minimum": 0 },
+        "agents": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name":                 { "type": "string", "maxLength": 128 },
+              "installed":            { "type": ["boolean", "null"] },
+              "has_config":           { "type": ["boolean", "null"] },
+              "config_basename":      { "type": ["string", "null"], "maxLength": 128, "pattern": "^[^/\\\\]*$" },
+              "config_path_hash":     { "type": ["string", "null"], "pattern": "^((sha256|hmac-sha256):[0-9a-f]{64})?$" },
+              "has_binary":           { "type": ["boolean", "null"] },
+              "binary_basename":      { "type": ["string", "null"], "maxLength": 128, "pattern": "^[^/\\\\]*$" },
+              "binary_path_hash":     { "type": ["string", "null"], "pattern": "^((sha256|hmac-sha256):[0-9a-f]{64})?$" },
+              "version":              { "type": ["string", "null"], "maxLength": 200 },
+              "version_probe_status": { "type": ["string", "null"], "maxLength": 64 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

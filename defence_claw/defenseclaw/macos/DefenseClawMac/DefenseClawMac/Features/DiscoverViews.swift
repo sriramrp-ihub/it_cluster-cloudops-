@@ -1,0 +1,1750 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+// Discover panels (spec §9.7, §9.11, §9.12): Inventory, AI Discovery, Registries.
+
+import SwiftUI
+import Charts
+
+// MARK: - Inventory
+
+/// Toolbar connector-scope picker for the Inventory panel — same shared
+/// filter as the catalogs and signal panels; hidden on single-connector.
+private struct InventoryConnectorChip: View {
+    @Environment(AppState.self) private var appState
+    var body: some View {
+        @Bindable var state = appState
+        ConnectorFilterChip(names: appState.activeConnectorNames, selection: $state.connectorFilter)
+    }
+}
+
+struct InventoryView: View {
+    @Environment(AppState.self) private var appState
+    @State private var tab = "Summary"
+    @State private var items: [InventoryItem] = []
+    @State private var summaries: [InventoryConnectorSummary] = []
+    @State private var search = ""
+    @State private var statusFilter = "all"
+    @State private var selectedID: String?
+    @State private var scanning = false
+    @State private var error: String?
+    @State private var warning: String?
+    @State private var lastScan: Date?
+
+    private var category: InventoryCategory? {
+        InventoryCategory.allCases.first { $0.rawValue == tab }
+    }
+
+    private var filtered: [InventoryItem] {
+        guard let category else { return [] }
+        return items.filter { item in
+            guard item.category == category else { return false }
+            guard appState.connectorFilterAllows(item.connector) else { return false }
+            let state = "\(item.status) \(item.verdict) \(item.detail)".lowercased()
+            if statusFilter != "all", !state.contains(statusFilter) { return false }
+            guard !search.isEmpty else { return true }
+            let fields = item.fields.map { "\($0.label) \($0.value)" }.joined(separator: " ")
+            return "\(item.name) \(item.path) \(item.connector) \(fields)"
+                .localizedCaseInsensitiveContains(search)
+        }
+    }
+
+    /// Summary rows honoring the shared filter — a selected connector shows
+    /// its own snapshot only (TUI _summary_inventory behavior).
+    private var scopedSummaries: [InventoryConnectorSummary] {
+        summaries.filter { appState.connectorFilterAllows($0.connector) }
+    }
+
+    /// Items visible under the shared filter (for the Summary stat cards and
+    /// segmented tab counts).
+    private var scopedItems: [InventoryItem] {
+        items.filter { appState.connectorFilterAllows($0.connector) }
+    }
+
+    private var selectedItem: InventoryItem? {
+        guard let selectedID else { return nil }
+        return items.first { $0.id == selectedID }
+    }
+
+    private var statusOptions: [(String, String)] {
+        switch category {
+        case .skills: [("All", "all"), ("Eligible", "eligible"), ("Warning", "warning"), ("Blocked", "blocked")]
+        case .plugins: [("All", "all"), ("Loaded", "loaded"), ("Disabled", "disabled"), ("Blocked", "blocked")]
+        default: [("All", "all")]
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 8) {
+                Picker("View", selection: $tab) {
+                    Text("Summary").tag("Summary")
+                    ForEach(InventoryCategory.allCases) { category in
+                        Text("\(category.rawValue) (\(scopedItems.filter { $0.category == category }.count))")
+                            .tag(category.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                HStack {
+                    if category != nil, statusOptions.count > 1 {
+                        FilterChipRow("Status", options: statusOptions, selection: $statusFilter)
+                    }
+                    if let lastScan {
+                        Text("Last scan: \(DCDates.relative(lastScan))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        StaleBadge(date: lastScan)
+                    }
+                    Spacer()
+                    if scanning { ProgressView().controlSize(.small) }
+                }
+            }
+            .padding(10)
+            Divider()
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(Cisco.red)
+                    .padding(6)
+            }
+            if let warning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(Cisco.orange)
+                    .padding(6)
+            }
+            if tab == "Summary" {
+                summaryView
+            } else if filtered.isEmpty {
+                DCEmptyState(
+                    title: scanning ? "Scanning..." : "No \(tab.lowercased()) inventoried",
+                    message: scanning
+                        ? "Running `defenseclaw aibom scan` across every active connector."
+                        : "Inventory comes from `defenseclaw aibom scan --json`, the same per-connector bill of materials the TUI shows. Use Rescan to run it.",
+                    systemImage: "shippingbox"
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                Table(filtered, selection: $selectedID) {
+                    TableColumn("Name", value: \.name)
+                    TableColumn("Version", value: \.version).width(70)
+                    TableColumn("Connector") { item in
+                        Text(item.connector.isEmpty ? "—" : item.connector)
+                            .font(.caption)
+                            .foregroundStyle(Cisco.blue)
+                    }
+                    .width(90)
+                    TableColumn("Verdict") { item in
+                        if item.verdict.isEmpty || item.verdict == "unscanned" {
+                            Text(item.verdict.isEmpty ? "—" : item.verdict)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        } else {
+                            StatePill(raw: item.verdict)
+                        }
+                    }
+                    .width(100)
+                    TableColumn("Status") { item in
+                        Text(item.status.isEmpty ? "—" : item.status)
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .width(86)
+                    TableColumn("Path / Source") { item in
+                        Text(item.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    TableColumn("Detail") { item in
+                        Text(item.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+            }
+        }
+        .inspector(isPresented: Binding(
+            get: { selectedItem != nil },
+            set: { if !$0 { selectedID = nil } }
+        )) {
+            if let item = selectedItem {
+                inventoryInspector(item)
+                    .inspectorColumnWidth(min: 320, ideal: 400)
+            }
+        }
+        .searchable(text: $search, placement: .toolbar, prompt: "Search inventory")
+        .toolbar {
+            ToolbarItemGroup {
+                InventoryConnectorChip()
+                Button {
+                    scan()
+                } label: {
+                    Label("Rescan All", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(scanning || !appState.installationMutationsAllowed)
+            }
+        }
+        .task {
+            if items.isEmpty, appState.installationMutationsAllowed { scan() }
+        }
+        .onChange(of: tab) {
+            statusFilter = "all"
+            selectedID = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .dcRefreshPanel)) { _ in scan() }
+    }
+
+    private var summaryView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                StatCard(title: "Total Items", value: "\(scopedItems.count)", tint: Cisco.blue)
+                StatCard(title: "Tools", value: "\(scopedItems.filter { $0.category == .tools }.count)", tint: Cisco.green)
+                StatCard(title: "Connectors", value: "\(scopedSummaries.count)", tint: .secondary)
+                StatCard(title: "Errors", value: "\(scopedSummaries.reduce(0) { $0 + $1.errors })",
+                         tint: scopedSummaries.contains { $0.errors > 0 } ? Cisco.red : .secondary)
+            }
+            if scopedSummaries.isEmpty {
+                DCEmptyState(
+                    title: scanning ? "Scanning inventory..." : "No inventory snapshot",
+                    message: "Run Rescan All to collect the per-connector AIBOM summary.",
+                    systemImage: "shippingbox"
+                )
+            } else {
+                Table(scopedSummaries) {
+                    TableColumn("Connector", value: \.connector)
+                    TableColumn("Total") { Text("\($0.total)") }.width(55)
+                    TableColumn("Skills") { Text("\($0.counts[.skills, default: 0])") }.width(55)
+                    TableColumn("Plugins") { Text("\($0.counts[.plugins, default: 0])") }.width(58)
+                    TableColumn("MCPs") { Text("\($0.counts[.mcps, default: 0])") }.width(50)
+                    TableColumn("Agents") { Text("\($0.counts[.agents, default: 0])") }.width(55)
+                    TableColumn("Tools") { Text("\($0.counts[.tools, default: 0])") }.width(50)
+                    TableColumn("Models") { Text("\($0.counts[.providers, default: 0])") }.width(55)
+                    TableColumn("Memory") { Text("\($0.counts[.memories, default: 0])") }.width(55)
+                    TableColumn("Source") { summary in
+                        Text(summary.home.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+            }
+        }
+        .padding(12)
+    }
+
+    private func inventoryInspector(_ item: InventoryItem) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name).font(.headline)
+                    Text(item.category.rawValue).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { selectedID = nil } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.borderless)
+            }
+            KeyValueGrid(pairs: [
+                ("Connector", item.connector),
+                ("Status", item.status),
+                ("Verdict", item.verdict),
+                ("Version", item.version),
+                ("Source", item.path),
+            ].filter { !$0.1.isEmpty })
+            Divider()
+            Text("Inventory Fields").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            ScrollView {
+                KeyValueGrid(pairs: item.fields.map { ($0.label, $0.value) }.filter { !$0.1.isEmpty })
+            }
+            Spacer()
+        }
+        .padding(12)
+    }
+
+    /// The TUI's Inventory data source: `defenseclaw aibom scan --json` emits
+    /// one document per active connector with skills / plugins / mcp / agents /
+    /// model_providers / memory arrays (each row carrying scan verdicts).
+    private func scan() {
+        guard !scanning else { return }
+        guard appState.installationMutationsAllowed else {
+            error = appState.installationReadOnlyReason ?? "This installation is read only."
+            return
+        }
+        scanning = true
+        appState.scanInFlight = true
+        error = nil
+        warning = nil
+        Task {
+            let result = await appState.runCommand(
+                title: "Scan inventory",
+                arguments: ["aibom", "scan", "--json"],
+                category: "scan",
+                origin: "Inventory",
+                successEffects: ["Inventory snapshot refreshed"]
+            )
+            defer {
+                scanning = false
+                appState.scanInFlight = false
+            }
+            guard result.succeeded else {
+                error = "aibom scan failed (exit \(result.exitCode)). \(String(result.output.suffix(200)))"
+                return
+            }
+            guard let parsed = InventoryOutputParser.parse(result.output) else {
+                error = "Could not parse `aibom scan --json` output."
+                return
+            }
+            items = parsed.documents.flatMap(Self.rows(from:))
+            summaries = parsed.documents.map(Self.summary(from:))
+            warning = parsed.diagnostics.nonEmpty
+            lastScan = Date()
+        }
+    }
+
+    /// Map one per-connector aibom document into inventory rows.
+    private static func rows(from doc: [String: Any]) -> [InventoryItem] {
+        let connector = (doc["connector"] as? String) ?? ""
+
+        func str(_ r: [String: Any], _ keys: String...) -> String {
+            for key in keys {
+                if let v = r[key] as? String, !v.isEmpty { return v }
+            }
+            return ""
+        }
+        func verdict(_ r: [String: Any]) -> (verdict: String, detail: String) {
+            (str(r, "policy_verdict"), str(r, "policy_detail"))
+        }
+        func fields(_ r: [String: Any]) -> [InventoryField] {
+            r.keys.sorted().compactMap { key in
+                guard let value = r[key], !(value is NSNull) else { return nil }
+                return InventoryField(label: Self.fieldLabel(key), value: Self.displayValue(value))
+            }
+        }
+        func rows(_ key: String, _ category: InventoryCategory,
+                  _ map: ([String: Any]) -> InventoryItem) -> [InventoryItem] {
+            ((doc[key] as? [[String: Any]]) ?? []).map(map)
+        }
+
+        return rows("skills", .skills) { r in
+            let v = verdict(r)
+            let flags = [(r["eligible"] as? Bool) == true ? "eligible" : "not ready",
+                         (r["bundled"] as? Bool) == true ? "bundled" : ""]
+            return InventoryItem(
+                category: .skills, name: str(r, "id", "name"), version: str(r, "version"),
+                path: str(r, "path", "source"),
+                detail: (flags.filter { !$0.isEmpty } + [v.detail]).filter { !$0.isEmpty }.joined(separator: " · "),
+                connector: connector, verdict: v.verdict, status: str(r, "status"), fields: fields(r)
+            )
+        }
+        + rows("plugins", .plugins) { r in
+            let v = verdict(r)
+            return InventoryItem(
+                category: .plugins, name: str(r, "name", "id"), version: str(r, "version"),
+                path: str(r, "path", "origin"),
+                detail: [str(r, "status"), v.detail].filter { !$0.isEmpty }.joined(separator: " · "),
+                connector: connector, verdict: v.verdict, status: str(r, "status"), fields: fields(r)
+            )
+        }
+        + rows("mcp", .mcps) { r in
+            let v = verdict(r)
+            return InventoryItem(
+                category: .mcps, name: str(r, "id", "name"), version: "",
+                path: str(r, "command", "url"),
+                detail: [str(r, "source"), v.detail].filter { !$0.isEmpty }.joined(separator: " · "),
+                connector: connector, verdict: v.verdict, status: str(r, "status"), fields: fields(r)
+            )
+        }
+        + rows("agents", .agents) { r in
+            let v = verdict(r)
+            return InventoryItem(
+                category: .agents, name: str(r, "id", "name"), version: str(r, "version"),
+                path: str(r, "path", "source"),
+                detail: [str(r, "description"), v.detail].filter { !$0.isEmpty }.joined(separator: " · "),
+                connector: connector, verdict: v.verdict, status: str(r, "status"), fields: fields(r)
+            )
+        }
+        + rows("tools", .tools) { r in
+            let v = verdict(r)
+            return InventoryItem(
+                category: .tools, name: str(r, "name", "id"), version: str(r, "version"),
+                path: str(r, "source", "command"), detail: str(r, "description", "signature"),
+                connector: connector, verdict: v.verdict, status: str(r, "status"), fields: fields(r)
+            )
+        }
+        + rows("model_providers", .providers) { r in
+            InventoryItem(
+                category: .providers, name: str(r, "name", "id"), version: "",
+                path: str(r, "base_url"),
+                detail: [str(r, "source"),
+                         (r["api_key_present"] as? Bool) == true ? "key present" : "no key"]
+                    .filter { !$0.isEmpty }.joined(separator: " · "),
+                connector: connector, status: str(r, "status"), fields: fields(r)
+            )
+        }
+        + rows("memory", .memories) { r in
+            InventoryItem(
+                category: .memories, name: str(r, "id", "name"), version: "",
+                path: str(r, "path", "source"),
+                detail: str(r, "description", "detail", "kind"),
+                connector: connector, status: str(r, "status"), fields: fields(r)
+            )
+        }
+    }
+
+    private static func summary(from doc: [String: Any]) -> InventoryConnectorSummary {
+        func arrayCount(_ key: String) -> Int { (doc[key] as? [Any])?.count ?? 0 }
+        let summary = doc["summary"] as? [String: Any]
+        let errors: Int = {
+            if let value = summary?["errors"] as? Int { return value }
+            return (doc["errors"] as? [Any])?.count ?? 0
+        }()
+        let connector = (doc["connector"] as? String) ?? (doc["claw_mode"] as? String) ?? "default"
+        let configFiles = doc["connector_config_files"] as? [String]
+        return InventoryConnectorSummary(
+            connector: connector,
+            version: (doc["version"] as? String) ?? "",
+            generatedAt: (doc["generated_at"] as? String) ?? "",
+            home: (doc["connector_home"] as? String) ?? (doc["claw_home"] as? String) ?? "",
+            config: configFiles?.first ?? (doc["openclaw_config"] as? String) ?? "",
+            live: (doc["live"] as? Bool) ?? false,
+            errors: errors,
+            counts: [
+                .skills: arrayCount("skills"), .plugins: arrayCount("plugins"), .mcps: arrayCount("mcp"),
+                .agents: arrayCount("agents"), .tools: arrayCount("tools"),
+                .providers: arrayCount("model_providers"), .memories: arrayCount("memory"),
+            ]
+        )
+    }
+
+    private static func fieldLabel(_ key: String) -> String {
+        key.split(separator: "_").map { $0.capitalized }.joined(separator: " ")
+    }
+
+    private static func displayValue(_ value: Any) -> String {
+        if let text = value as? String { return text }
+        if let number = value as? NSNumber { return number.stringValue }
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+           let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        return String(describing: value)
+    }
+}
+
+// MARK: - AI Discovery
+
+private enum AIDiscoverySelection: Hashable {
+    case product(String)
+    case model(AIModelDiscoveryRowID)
+}
+
+struct AIDiscoveryView: View {
+    @Environment(AppState.self) private var appState
+    @AppStorage("aiDiscovery.showAllModels") private var showAllModels = false
+    @AppStorage("aiDiscovery.modelModality") private var modelModalityRaw = AIModelModalityFilter.all.rawValue
+    @AppStorage("aiDiscovery.modelRelevance") private var modelRelevanceRaw = AIModelRelevanceFilter.all.rawValue
+    @State private var snapshot = AIUsageSnapshot()
+    @State private var search = ""
+    @State private var selection: AIDiscoverySelection?
+    @State private var scanning = false
+    @State private var error: String?
+    @State private var loaded = false
+
+    /// Grouped non-model rows, filtered like the TUI's product table:
+    /// substring match across state/product/vendor/component/version/bands/categories/detectors.
+    private var filteredProducts: [AIDiscoveryRow] {
+        let rows = snapshot.rows.filter {
+            $0.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !search.isEmpty else { return rows }
+        return rows.filter { row in
+            let haystack = ([row.state, row.product, row.vendor, row.ecosystem, row.component,
+                             row.version, row.identityBand, row.presenceBand]
+                            + row.categories + row.detectors).joined(separator: " ")
+            return haystack.localizedCaseInsensitiveContains(search)
+        }
+    }
+
+    private var modelModality: AIModelModalityFilter {
+        AIModelModalityFilter(rawValue: modelModalityRaw) ?? .all
+    }
+
+    private var modelRelevance: AIModelRelevanceFilter {
+        AIModelRelevanceFilter(rawValue: modelRelevanceRaw) ?? .all
+    }
+
+    private var modelFilter: AIModelDiscoveryFilter {
+        AIModelDiscoveryFilter(
+            showAllModels: showAllModels,
+            modality: modelModality,
+            relevance: modelRelevance
+        ).preservingLegacySnapshot(snapshot.modelRows)
+    }
+
+    private var searchMatchedModels: [AIModelDiscoveryRow] {
+        snapshot.modelRows.filter { $0.matches(search) }
+    }
+
+    private var filteredModels: [AIModelDiscoveryRow] {
+        searchMatchedModels.filter(modelFilter.includes)
+    }
+
+    private var hiddenModelCount: Int {
+        max(searchMatchedModels.count - filteredModels.count, 0)
+    }
+
+    private var displayedDetectorErrorKeys: [String] {
+        Array(snapshot.detectorErrors.keys.sorted().prefix(6))
+    }
+
+    private var emptyState: (title: String, message: String) {
+        if !appState.gatewayReachable || !loaded {
+            return (
+                "AI discovery unavailable",
+                "Ensure the gateway is running and the macOS app is connected to it."
+            )
+        }
+        if !snapshot.enabled {
+            return (
+                "AI discovery disabled",
+                "Enable AI discovery in Setup or run: defenseclaw agent discovery enable"
+            )
+        }
+        if hiddenModelCount > 0, filteredModels.isEmpty {
+            return (
+                "Models hidden by filters",
+                "Use Model Filters in the toolbar, or choose Show All Models to review every discovery."
+            )
+        }
+        if !search.isEmpty {
+            return ("No matching signals", "Clear or change the current product/model filter.")
+        }
+        return (
+            "No AI agents or local models",
+            "Run a scan to detect AI agents, SDKs, frameworks, and local models on this Mac."
+        )
+    }
+
+    private var selectedProduct: AIDiscoveryRow? {
+        guard case let .product(id) = selection else { return nil }
+        return filteredProducts.first { $0.id == id }
+    }
+
+    private var selectedModel: AIModelDiscoveryRow? {
+        guard case let .model(id) = selection else { return nil }
+        return filteredModels.first { $0.id == id }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if loaded {
+                scanSummaryHeader
+                Divider()
+            }
+            if snapshot.isPartial {
+                partialScanBanner
+                Divider()
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(Cisco.red).padding(6)
+            }
+            if hiddenModelCount > 0 {
+                modelFilterNotice
+                Divider()
+            }
+            if filteredProducts.isEmpty, filteredModels.isEmpty {
+                DCEmptyState(
+                    title: emptyState.title,
+                    message: emptyState.message,
+                    systemImage: "sparkle.magnifyingglass"
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                discoveryTables
+            }
+        }
+        .inspector(isPresented: Binding(
+            get: { selectedProduct != nil || selectedModel != nil },
+            set: { if !$0 { selection = nil } }
+        )) {
+            if let row = selectedModel {
+                modelInspector(row)
+                    .inspectorColumnWidth(min: 320, ideal: 400)
+            } else if let row = selectedProduct {
+                productInspector(row)
+                    .inspectorColumnWidth(min: 320, ideal: 400)
+            }
+        }
+        .searchable(text: $search, placement: .toolbar, prompt: "Filter products and models")
+        .toolbar {
+            ToolbarItemGroup {
+                modelFilterMenu
+                Button {
+                    scan()
+                } label: {
+                    Label("Scan Now", systemImage: "wand.and.rays")
+                }
+                .disabled(
+                    scanning
+                        || !appState.gatewayReachable
+                        || !appState.installationMutationsAllowed
+                )
+                Button {
+                    Task { await load() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+        }
+        .task { await load() }
+        // Pulse-fed retry: a transient gateway failure (restart mid-fetch,
+        // token rotation) must not freeze the panel on a stale error.
+        .task(id: appState.health.fetchedAt) { if error != nil || !loaded { await load() } }
+        .onChange(of: search) { reconcileSelection() }
+        .onChange(of: showAllModels) { reconcileSelection() }
+        .onChange(of: modelModalityRaw) { reconcileSelection() }
+        .onChange(of: modelRelevanceRaw) { reconcileSelection() }
+        .onReceive(NotificationCenter.default.publisher(for: .dcRefreshPanel)) { _ in Task { await load() } }
+        .onReceive(NotificationCenter.default.publisher(for: .dcScanAIDiscovery)) { _ in
+            guard !scanning,
+                  appState.gatewayReachable,
+                  appState.installationMutationsAllowed
+            else { return }
+            scan()
+        }
+    }
+
+    private var scanSummaryHeader: some View {
+        HStack(spacing: 14) {
+            if !snapshot.result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || snapshot.isPartial {
+                Label(scanResultTitle, systemImage: scanResultSystemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(scanResultColor)
+                    .accessibilityLabel("Last AI discovery result: \(scanResultTitle)")
+                Text(snapshot.discoveryIssueLabel)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(snapshot.isPartial ? Cisco.orange : Color.secondary)
+                    .accessibilityLabel(snapshot.discoveryIssueLabel)
+            }
+            ForEach(snapshot.discoveryHeaderParts, id: \.self) { part in
+                Text(part)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(12)
+    }
+
+    private var scanResultTitle: String {
+        if snapshot.isPartial { return "Partial scan" }
+        switch snapshot.result.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "ok", "complete", "completed": return "Scan complete"
+        case "disabled": return "Discovery disabled"
+        case let value where !value.isEmpty:
+            return value.replacingOccurrences(of: "_", with: " ").capitalized
+        default: return "Scan status unavailable"
+        }
+    }
+
+    private var scanResultSystemImage: String {
+        if snapshot.isPartial { return "exclamationmark.triangle.fill" }
+        switch snapshot.result.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "ok", "complete", "completed": return "checkmark.circle.fill"
+        case "disabled": return "pause.circle.fill"
+        default: return "info.circle.fill"
+        }
+    }
+
+    private var scanResultColor: Color {
+        if snapshot.isPartial { return Cisco.orange }
+        switch snapshot.result.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "ok", "complete", "completed": return Cisco.green
+        default: return .secondary
+        }
+    }
+
+    private var partialScanBanner: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Label("Partial scan — results may be incomplete", systemImage: "exclamationmark.triangle.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(Cisco.orange)
+            Text(snapshot.partialDiscoveryDescription)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(displayedDetectorErrorKeys, id: \.self) { detector in
+                if let message = snapshot.detectorErrors[detector] {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(detector.replacingOccurrences(of: "_", with: " ").capitalized)
+                            .font(.caption.weight(.semibold))
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(detector) detector error: \(message)")
+                }
+            }
+            if snapshot.detectorErrors.count > displayedDetectorErrorKeys.count {
+                Text("\(snapshot.detectorErrors.count - displayedDetectorErrorKeys.count) additional detector errors not shown.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(
+                        "\(snapshot.detectorErrors.count - displayedDetectorErrorKeys.count) additional detector errors"
+                    )
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Cisco.orange.opacity(0.09))
+    }
+
+    private var modelFilterNotice: some View {
+        HStack(spacing: 8) {
+            Label(
+                "\(hiddenModelCount) model\(hiddenModelCount == 1 ? "" : "s") hidden by filters",
+                systemImage: "line.3.horizontal.decrease.circle"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Spacer()
+            Button("Show All Models") {
+                showAllModels = true
+                modelModalityRaw = AIModelModalityFilter.all.rawValue
+                modelRelevanceRaw = AIModelRelevanceFilter.all.rawValue
+            }
+            .buttonStyle(.borderless)
+            .accessibilityHint("Shows embedded, unknown, low-confidence, and other non-recommended models")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Cisco.surfacePanel)
+    }
+
+    private var modelFilterMenu: some View {
+        Menu {
+            Toggle("Show All Models", isOn: $showAllModels)
+            Divider()
+            Picker("Modality", selection: $modelModalityRaw) {
+                ForEach(AIModelModalityFilter.allCases) { option in
+                    Text(option.displayName).tag(option.rawValue)
+                }
+            }
+            Picker("Relevance", selection: $modelRelevanceRaw) {
+                ForEach(AIModelRelevanceFilter.allCases) { option in
+                    Text(option.displayName).tag(option.rawValue)
+                }
+            }
+            Divider()
+            Button("Reset to Recommended") {
+                showAllModels = false
+                modelModalityRaw = AIModelModalityFilter.all.rawValue
+                modelRelevanceRaw = AIModelRelevanceFilter.all.rawValue
+            }
+        } label: {
+            Label("Model Filters", systemImage: "line.3.horizontal.decrease.circle")
+        }
+        .help("Choose which discovered models appear")
+        .accessibilityLabel("Model Filters")
+        .accessibilityHint("Filter models by modality and relevance, or show all models")
+    }
+
+    private var productSelection: Binding<String?> {
+        Binding<String?>(
+            get: {
+                guard case let .product(id) = selection else { return nil }
+                return id
+            },
+            set: { id in
+                if let id {
+                    selection = .product(id)
+                } else if case .product = selection {
+                    selection = nil
+                }
+            }
+        )
+    }
+
+    private var modelSelection: Binding<AIModelDiscoveryRowID?> {
+        Binding<AIModelDiscoveryRowID?>(
+            get: {
+                guard case let .model(id) = selection else { return nil }
+                return id
+            },
+            set: { id in
+                if let id {
+                    selection = .model(id)
+                } else if case .model = selection {
+                    selection = nil
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var discoveryTables: some View {
+        if !filteredModels.isEmpty, !filteredProducts.isEmpty {
+            VSplitView {
+                modelSection
+                    .frame(minHeight: 140, idealHeight: 210, maxHeight: 280)
+                productSection
+                    .frame(minHeight: 220)
+            }
+        } else if !filteredModels.isEmpty {
+            modelSection
+        } else {
+            productSection
+        }
+    }
+
+    private var modelSection: some View {
+        VStack(spacing: 0) {
+            tableSectionHeader(
+                "Models",
+                count: filteredModels.count,
+                total: searchMatchedModels.count,
+                systemImage: "cpu"
+            )
+            Divider()
+            modelTable
+        }
+    }
+
+    private var productSection: some View {
+        VStack(spacing: 0) {
+            tableSectionHeader("AI Products & Surfaces", count: filteredProducts.count,
+                               systemImage: "sparkle.magnifyingglass")
+            Divider()
+            productTable
+        }
+    }
+
+    private func tableSectionHeader(
+        _ title: String,
+        count: Int,
+        total: Int? = nil,
+        systemImage: String
+    ) -> some View {
+        HStack(spacing: 7) {
+            Label(title, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+            Text(total.map { $0 == count ? "\(count)" : "\(count) of \($0)" } ?? "\(count)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Cisco.surfacePanel)
+    }
+
+    /// Compact model-centric table. Detailed lineage evidence remains in the
+    /// inspector so the model list stays useful in a short split pane.
+    private var modelTable: some View {
+        Table(filteredModels, selection: modelSelection) {
+            TableColumn("State") { (row: AIModelDiscoveryRow) in
+                StatePill(raw: row.state)
+            }
+            .width(80)
+            TableColumn("Model") { (row: AIModelDiscoveryRow) in
+                Text(row.modelID)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .help(row.modelID)
+            }
+            .width(min: 150, ideal: 240)
+            TableColumn("Owner") { (row: AIModelDiscoveryRow) in
+                let owners = AIDiscoveryGrouping.csvTruncated(row.ownerApplications)
+                Text(owners.isEmpty ? "Unknown app" : owners)
+                    .font(.caption)
+                    .foregroundStyle(owners.isEmpty ? .secondary : .primary)
+                    .lineLimit(1)
+                    .help(owners)
+            }
+            .width(min: 105, ideal: 140)
+            TableColumn("Modality") { (row: AIModelDiscoveryRow) in
+                Text(row.effectiveModality.displayName)
+                    .font(.caption)
+            }
+            .width(82)
+            TableColumn("Relevance") { (row: AIModelDiscoveryRow) in
+                Text(row.effectiveRelevance.displayName)
+                    .font(.caption)
+                    .foregroundStyle(row.effectiveRelevance == .primary ? .primary : .secondary)
+            }
+            .width(82)
+            TableColumn("Confidence") { (row: AIModelDiscoveryRow) in
+                Text(row.confidenceDisplayLabel)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(row.confidenceAccessibilityLabel)
+            }
+            .width(84)
+            TableColumn("Status") { (row: AIModelDiscoveryRow) in
+                Text(AIDiscoveryGrouping.csvTruncated(row.statuses))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .width(100)
+            TableColumn("Format") { (row: AIModelDiscoveryRow) in
+                Text(AIDiscoveryGrouping.csvTruncated(row.formats))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .width(82)
+        }
+        .accessibilityLabel("Discovered local models")
+    }
+
+    /// Column set mirrors the TUI: State · Categories · Product · Component ·
+    /// Version · Vendor · Detectors · Count · Identity · Presence.
+    private var productTable: some View {
+        Table(filteredProducts, selection: productSelection) {
+            Group {
+                TableColumn("State") { (r: AIDiscoveryRow) in
+                    StatePill(raw: r.state)
+                }
+                .width(80)
+                TableColumn("Categories") { (r: AIDiscoveryRow) in
+                    Text(AIDiscoveryGrouping.csvTruncated(r.categories))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .width(min: 130, ideal: 190)
+                TableColumn("Product") { (r: AIDiscoveryRow) in
+                    Text(r.product).font(.callout.weight(.medium))
+                }
+                .width(min: 110, ideal: 150)
+            }
+            Group {
+                TableColumn("Component") { (r: AIDiscoveryRow) in
+                    Text(r.componentLabel).font(.caption)
+                }
+                .width(90)
+                TableColumn("Version") { (r: AIDiscoveryRow) in
+                    Text(r.version.isEmpty ? "—" : r.version).font(.caption)
+                }
+                .width(70)
+                TableColumn("Vendor") { (r: AIDiscoveryRow) in
+                    Text(r.vendor).font(.caption)
+                }
+                .width(90)
+                TableColumn("Detectors") { (r: AIDiscoveryRow) in
+                    Text(AIDiscoveryGrouping.csvTruncated(r.detectors))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .width(min: 130, ideal: 190)
+                TableColumn("Count") { (r: AIDiscoveryRow) in
+                    Text("\(r.count)").font(.caption.monospacedDigit())
+                }
+                .width(46)
+                TableColumn("Identity") { (r: AIDiscoveryRow) in
+                    Text(AIDiscoveryGrouping.formatConfidence(score: r.identityScore, band: r.identityBand))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .width(90)
+                TableColumn("Presence") { (r: AIDiscoveryRow) in
+                    Text(AIDiscoveryGrouping.formatConfidence(score: r.presenceScore, band: r.presenceBand))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .width(90)
+            }
+        }
+    }
+
+    private func modelInspector(_ row: AIModelDiscoveryRow) -> some View {
+        let provenance = row.provenance
+        let country = provenance?.countryDisplay ?? ""
+        let provenancePairs: [(String, String)]
+        if let provenance {
+            provenancePairs = [
+                ("Country", country.isEmpty ? "Unknown" : country),
+                ("Publisher", provenance.publisher),
+                ("Root model", provenance.rootDisplay),
+                ("Base models", provenance.baseModels.joined(separator: ", ")),
+                ("Derivation", provenance.derivationDisplay),
+                ("Quantized", optionalBooleanLabel(provenance.quantized)),
+                ("Quantization", provenance.quantization),
+                ("Distilled", optionalBooleanLabel(provenance.distilled)),
+                ("Provenance source", displayToken(provenance.source)),
+                ("Provenance confidence", displayToken(provenance.confidence)),
+            ]
+        } else {
+            provenancePairs = [("Provenance", "Unknown")]
+        }
+        let size = row.maxSizeBytes > 0
+            ? ByteCountFormatter.string(fromByteCount: row.maxSizeBytes, countStyle: .file)
+            : ""
+        let modelPairs: [(String, String)] = [
+            ("State", row.state),
+            ("Signals", "\(row.count)"),
+            ("Owner application", row.ownerApplications.joined(separator: ", ").nonEmpty ?? "Unknown"),
+            ("Modality", row.modalities.map(\.displayName).joined(separator: ", ")),
+            ("Relevance", row.relevances.map(\.displayName).joined(separator: ", ")),
+            ("Confidence", row.confidenceDisplayLabel),
+            ("Status", row.statuses.joined(separator: ", ")),
+            ("Format", row.formats.joined(separator: ", ")),
+            ("Runtime / provider", row.providers.joined(separator: ", ")),
+            ("Products", row.products.joined(separator: ", ")),
+            ("Vendors", row.vendors.joined(separator: ", ")),
+            ("Detectors", row.detectors.joined(separator: ", ")),
+            ("Size", size),
+            ("Pinned", row.isPinned ? "Yes" : ""),
+            ("Last active", DCDates.relative(row.lastActive)),
+        ]
+        let inspectorPairs = (modelPairs + provenancePairs).filter { !$0.1.isEmpty }
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(row.modelID).font(.headline).textSelection(.enabled)
+                    Text("Local model").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { selection = nil } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.borderless)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    KeyValueGrid(pairs: inspectorPairs)
+                    Divider()
+                    Text("Signals").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(row.signals.enumerated()), id: \.offset) { _, signal in
+                            modelSignalCard(signal)
+                        }
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(12)
+    }
+
+    private func productInspector(_ row: AIDiscoveryRow) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(row.vendor.isEmpty ? row.product : "\(row.vendor) / \(row.product)")
+                    .font(.headline)
+                Spacer()
+                Button { selection = nil } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.borderless)
+            }
+            KeyValueGrid(pairs: [
+                ("State", row.state),
+                ("Signals", "\(row.count)"),
+                ("Model", row.model),
+                ("Model status", row.modelStatuses.joined(separator: ", ")),
+                ("Format", row.modelFormats.joined(separator: ", ")),
+                ("Component", row.componentLabel),
+                ("Version", row.version.isEmpty ? "—" : row.version),
+                ("Categories", row.categories.joined(separator: ", ")),
+                ("Detectors", row.detectors.joined(separator: ", ")),
+                ("Identity", AIDiscoveryGrouping.formatConfidence(score: row.identityScore, band: row.identityBand)),
+                ("Presence", AIDiscoveryGrouping.formatConfidence(score: row.presenceScore, band: row.presenceBand)),
+                ("Last active", DCDates.relative(row.lastActive)),
+            ].filter { !$0.1.isEmpty })
+            Divider()
+            Text("Signals").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(row.signals.prefix(AIDiscoveryGrouping.detailSignalLimit).enumerated()), id: \.offset) { _, signal in
+                        signalInspector(signal)
+                    }
+                    if row.signals.count > AIDiscoveryGrouping.detailSignalLimit {
+                        Text("...and \(row.signals.count - AIDiscoveryGrouping.detailSignalLimit) more "
+                             + "(use `defenseclaw agent usage --detail --json` for the full list)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(12)
+    }
+
+    private func signalInspector(_ signal: AISignal) -> some View {
+        let detector = [
+            signal.detector.isEmpty ? "" : "detector=\(signal.detector)",
+            signal.source.isEmpty ? "" : "source=\(signal.source)",
+        ].filter { !$0.isEmpty }.joined(separator: " ")
+        let runtime = signal.runtime.map(AIDiscoveryGrouping.runtimeDetail) ?? ""
+        let activity = AIDiscoveryGrouping.activityDetail(signal)
+
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(AIDiscoveryGrouping.signalIdentifier(signal))
+                    .font(.caption.weight(.medium))
+                Spacer()
+                ConfidenceGauge(value: signal.confidence)
+            }
+            if !detector.isEmpty {
+                Text(detector).font(.caption2).foregroundStyle(.secondary)
+            }
+            if let model = signal.model {
+                Text(AIDiscoveryGrouping.modelDetail(model))
+                    .font(.caption2.monospaced()).textSelection(.enabled)
+            }
+            if !runtime.isEmpty {
+                Text(runtime).font(.caption2.monospaced()).textSelection(.enabled)
+            }
+            if !activity.isEmpty {
+                Text(activity).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Cisco.surfacePanel, in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func modelSignalCard(_ signal: AISignal) -> some View {
+        signalInspector(signal)
+    }
+
+    private func optionalBooleanLabel(_ value: Bool?) -> String {
+        guard let value else { return "Unknown" }
+        return value ? "Yes" : "No"
+    }
+
+    private func displayToken(_ value: String) -> String {
+        value.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private func reconcileSelection() {
+        switch selection {
+        case let .product(id) where !filteredProducts.contains(where: { $0.id == id }):
+            selection = nil
+        case let .model(id) where !filteredModels.contains(where: { $0.id == id }):
+            selection = nil
+        default:
+            break
+        }
+    }
+
+    private func load() async {
+        guard appState.gatewayReachable else { return }
+        let installationGeneration = appState.installationGeneration
+        do {
+            let freshSnapshot = try await appState.gateway.aiUsage()
+            guard installationGeneration == appState.installationGeneration else { return }
+            snapshot = freshSnapshot
+            loaded = true
+            reconcileSelection()
+            error = nil
+        } catch {
+            guard installationGeneration == appState.installationGeneration else { return }
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func scan() {
+        guard appState.installationMutationsAllowed else {
+            error = appState.installationReadOnlyReason ?? "This installation is read only."
+            return
+        }
+        scanning = true
+        appState.scanInFlight = true
+        Task {
+            do {
+                try await appState.gateway.aiScan()
+                await load()
+            } catch { self.error = "Scan failed: \(error.localizedDescription)" }
+            scanning = false
+            appState.scanInFlight = false
+        }
+    }
+}
+
+// MARK: - Registries
+
+private enum RegistryTab: String, CaseIterable, Identifiable {
+    case sources = "Sources"
+    case entries = "Entries"
+    case approved = "Approved"
+
+    var id: String { rawValue }
+}
+
+struct RegistriesView: View {
+    @Environment(AppState.self) private var appState
+    @State private var snapshot = RegistrySnapshot()
+    @State private var tab: RegistryTab = .sources
+    @State private var selectedSourceID: String?
+    @State private var selectedEntryID: String?
+    @State private var search = ""
+    @State private var registryRequiredByType: [String: Bool] = [:]
+    @State private var registryDataDirectory: URL?
+    @State private var running = false
+    @State private var error: String?
+    @State private var status: String?
+    @State private var sourcePendingRemoval: RegistrySource?
+    @State private var entryPendingRejection: RegistryEntry?
+    @State private var showingAddSource = false
+
+    private var filteredSources: [RegistrySource] {
+        guard !search.isEmpty else { return snapshot.sources }
+        let query = search.lowercased()
+        return snapshot.sources.filter {
+            "\($0.id) \($0.kind) \($0.content) \($0.url) \($0.lastStatus)"
+                .lowercased().contains(query)
+        }
+    }
+
+    private var filteredEntries: [RegistryEntry] {
+        let approvedOnly = tab == .approved
+        return snapshot.entries.filter { entry in
+            if approvedOnly && !entry.approved { return false }
+            guard !search.isEmpty else { return true }
+            let query = search.lowercased()
+            return "\(entry.sourceID) \(entry.name) \(entry.type) \(entry.status) \(entry.severity) \(entry.location)"
+                .lowercased().contains(query)
+        }
+    }
+
+    private var selectedSource: RegistrySource? {
+        snapshot.sources.first { $0.id == selectedSourceID }
+    }
+
+    private var selectedEntry: RegistryEntry? {
+        snapshot.entries.first { $0.id == selectedEntryID }
+    }
+
+    private var selectedSourceForSync: String? {
+        selectedSource?.id ?? selectedEntry?.sourceID
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Registry view", selection: $tab) {
+                ForEach(RegistryTab.allCases) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 420)
+            .padding(10)
+
+            if let error {
+                messageBanner(error, systemImage: "exclamationmark.triangle", tint: Cisco.red)
+            } else if let status {
+                messageBanner(status, systemImage: "checkmark.circle", tint: Cisco.green)
+            }
+
+            Divider()
+            registryContent
+        }
+        .searchable(text: $search, placement: .toolbar, prompt: tab == .sources ? "Search sources" : "Search entries")
+        .inspector(isPresented: inspectorPresented) {
+            inspectorContent
+                .inspectorColumnWidth(min: 320, ideal: 400)
+        }
+        .toolbar {
+            ToolbarItemGroup {
+                if tab == .sources {
+                    Button {
+                        showingAddSource = true
+                    } label: {
+                        Label("Add Source", systemImage: "plus")
+                    }
+                    .disabled(!appState.installationMutationsAllowed)
+                    .help("Add Registry Source")
+
+                    Button(role: .destructive) {
+                        sourcePendingRemoval = selectedSource
+                    } label: {
+                        Label("Remove Source", systemImage: "trash")
+                    }
+                    .disabled(
+                        selectedSource == nil
+                            || running
+                            || !appState.installationMutationsAllowed
+                    )
+                    .help("Remove Selected Source")
+                } else {
+                    Button {
+                        if let entry = selectedEntry { approve(entry) }
+                    } label: {
+                        Label("Approve", systemImage: "checkmark.seal")
+                    }
+                    .disabled(
+                        selectedEntry == nil
+                            || running
+                            || !appState.installationMutationsAllowed
+                    )
+
+                    Button(role: .destructive) {
+                        entryPendingRejection = selectedEntry
+                    } label: {
+                        Label("Reject", systemImage: "xmark.seal")
+                    }
+                    .disabled(
+                        selectedEntry == nil
+                            || running
+                            || !appState.installationMutationsAllowed
+                    )
+
+                    Button {
+                        if let entry = selectedEntry { toggleRequirement(for: entry) }
+                    } label: {
+                        Label(requirementActionLabel, systemImage: "lock.shield")
+                    }
+                    .disabled(
+                        !selectedEntrySupportsRequirement
+                            || running
+                            || !appState.installationMutationsAllowed
+                    )
+                    .help(requirementActionLabel)
+                }
+
+                Button {
+                    syncSelected()
+                } label: {
+                    Label("Sync Selected", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(
+                    running
+                        || selectedSourceForSync == nil
+                        || !appState.installationMutationsAllowed
+                )
+
+                Button {
+                    syncAll()
+                } label: {
+                    Label("Sync All", systemImage: "arrow.triangle.2.circlepath.circle")
+                }
+                .disabled(
+                    running
+                        || snapshot.sources.isEmpty
+                        || !appState.installationMutationsAllowed
+                )
+
+                Button {
+                    Task { await load() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(running)
+            }
+        }
+        .task { await load() }
+        .onChange(of: tab) { _, _ in
+            search = ""
+            selectedSourceID = nil
+            selectedEntryID = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .dcRefreshPanel)) { _ in Task { await load() } }
+        .sheet(isPresented: $showingAddSource) {
+            AddRegistrySourceSheet { draft in
+                addSource(draft)
+            }
+        }
+        .confirmationDialog(
+            "Remove registry source \(sourcePendingRemoval?.id ?? "")?",
+            isPresented: Binding(
+                get: { sourcePendingRemoval != nil },
+                set: { if !$0 { sourcePendingRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove Source", role: .destructive) {
+                if let source = sourcePendingRemoval { remove(source) }
+                sourcePendingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { sourcePendingRemoval = nil }
+        } message: {
+            Text("The source, its cache, and policy rules promoted from it will be removed.")
+        }
+        .confirmationDialog(
+            "Reject \(entryPendingRejection?.name ?? "")?",
+            isPresented: Binding(
+                get: { entryPendingRejection != nil },
+                set: { if !$0 { entryPendingRejection = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Reject Entry", role: .destructive) {
+                if let entry = entryPendingRejection { reject(entry) }
+                entryPendingRejection = nil
+            }
+            Button("Cancel", role: .cancel) { entryPendingRejection = nil }
+        } message: {
+            Text("Rejected entries remain blocked during future registry syncs.")
+        }
+    }
+
+    @ViewBuilder
+    private var registryContent: some View {
+        switch tab {
+        case .sources:
+            if filteredSources.isEmpty {
+                DCEmptyState(
+                    title: "No registry sources",
+                    message: search.isEmpty ? "Add a source to begin." : "No sources match the current search.",
+                    systemImage: "books.vertical"
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                sourcesTable
+            }
+        case .entries, .approved:
+            if filteredEntries.isEmpty {
+                DCEmptyState(
+                    title: tab == .approved ? "No approved entries" : "No registry entries",
+                    message: search.isEmpty ? "Sync a source to populate this view." : "No entries match the current search.",
+                    systemImage: tab == .approved ? "checkmark.seal" : "list.bullet.rectangle"
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                entriesTable
+            }
+        }
+    }
+
+    private var sourcesTable: some View {
+        Table(filteredSources, selection: $selectedSourceID) {
+            TableColumn("ID", value: \.id)
+            TableColumn("Kind", value: \.kind).width(90)
+            TableColumn("Content", value: \.content).width(70)
+            TableColumn("On") { source in
+                Toggle("", isOn: Binding(
+                    get: { source.enabled },
+                    set: { toggleSource(source, to: $0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .disabled(running)
+            }
+            .width(44)
+            TableColumn("Last Sync") { source in
+                Text(relativeTimestamp(source.lastSync))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .width(90)
+            TableColumn("Status") { source in
+                Text(source.indexError ?? (source.lastStatus.isEmpty ? "—" : source.lastStatus))
+                    .font(.caption)
+                    .foregroundStyle(source.indexError == nil ? Color.secondary : Cisco.red)
+                    .lineLimit(1)
+            }
+            TableColumn("Entries") { source in Text("\(source.entryCount)").monospacedDigit() }.width(56)
+            TableColumn("Clean") { source in Text("\(source.cleanCount)").monospacedDigit() }.width(48)
+            TableColumn("Warn") { source in Text("\(source.warningCount)").monospacedDigit() }.width(44)
+            TableColumn("Block / Error") { source in
+                Text("\(source.blockedCount) / \(source.errorCount)").monospacedDigit()
+                    .foregroundStyle(source.blockedCount > 0 || source.errorCount > 0 ? Cisco.red : Color.secondary)
+            }
+            .width(82)
+        }
+    }
+
+    private var entriesTable: some View {
+        Table(filteredEntries, selection: $selectedEntryID) {
+            TableColumn("Source", value: \.sourceID).width(110)
+            TableColumn("Name", value: \.name)
+            TableColumn("Type", value: \.type).width(70)
+            TableColumn("Status") { entry in StatePill(raw: entry.status.isEmpty ? "unknown" : entry.status) }
+                .width(90)
+            TableColumn("Severity") { entry in
+                Text(entry.severity.isEmpty ? "—" : entry.severity.uppercased())
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(severityColor(entry.severity))
+            }
+            .width(80)
+            TableColumn("Review") { entry in
+                Text(entry.approvalMarker)
+                    .font(.caption)
+                    .foregroundStyle(entry.approved ? Cisco.green : entry.rejected ? Cisco.red : Color.secondary)
+            }
+            .width(82)
+            TableColumn("Location") { entry in
+                Text(entry.location).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+    }
+
+    private var inspectorPresented: Binding<Bool> {
+        Binding(
+            get: { selectedSource != nil || selectedEntry != nil },
+            set: { presented in
+                if !presented {
+                    selectedSourceID = nil
+                    selectedEntryID = nil
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var inspectorContent: some View {
+        if let source = selectedSource {
+            VStack(alignment: .leading, spacing: 12) {
+                inspectorHeader(source.id)
+                KeyValueGrid(pairs: [
+                    ("Kind", source.kind),
+                    ("Content", source.content),
+                    ("Enabled", source.enabled ? "yes" : "no"),
+                    ("URL", source.url.isEmpty ? "—" : source.url),
+                    ("Last Sync", source.lastSync.isEmpty ? "never" : source.lastSync),
+                    ("Status", source.indexError ?? (source.lastStatus.isEmpty ? "—" : source.lastStatus)),
+                    ("Fetched", source.fetchedAt.isEmpty ? "—" : source.fetchedAt),
+                    ("Publisher", source.publisher.isEmpty ? "—" : source.publisher),
+                    ("Entries", "\(source.entryCount)"),
+                    ("Verdicts", "\(source.cleanCount) clean, \(source.warningCount) warning, \(source.blockedCount) blocked, \(source.errorCount) error"),
+                    ("Cache", cachePath(for: source)),
+                ])
+                Spacer()
+            }
+            .padding(12)
+        } else if let entry = selectedEntry {
+            VStack(alignment: .leading, spacing: 12) {
+                inspectorHeader(entry.name)
+                KeyValueGrid(pairs: [
+                    ("Source", entry.sourceID),
+                    ("Type", entry.type),
+                    ("Status", entry.status.isEmpty ? "—" : entry.status),
+                    ("Severity", entry.severity.isEmpty ? "—" : entry.severity.uppercased()),
+                    ("Findings", "\(entry.findings)"),
+                    ("Approved", entry.approved ? "yes" : "no"),
+                    ("Rejected", entry.rejected ? "yes" : "no"),
+                    ("Transport", entry.transport.isEmpty ? "—" : entry.transport),
+                    ("Command", entry.command.isEmpty ? "—" : entry.command),
+                    ("Arguments", entry.arguments.isEmpty ? "—" : entry.arguments.joined(separator: " ")),
+                    ("Location", entry.location.isEmpty ? "—" : entry.location),
+                ])
+                Spacer()
+            }
+            .padding(12)
+        }
+    }
+
+    private func inspectorHeader(_ title: String) -> some View {
+        HStack {
+            Text(title).font(.headline).lineLimit(1)
+            Spacer()
+            Button {
+                selectedSourceID = nil
+                selectedEntryID = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .help("Close Inspector")
+        }
+    }
+
+    private func messageBanner(_ text: String, systemImage: String, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+            Text(text).lineLimit(2)
+            Spacer()
+            Button {
+                error = nil
+                status = nil
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("Dismiss")
+        }
+        .font(.caption)
+        .foregroundStyle(tint)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+    }
+
+    private func load() async {
+        let installationGeneration = appState.installationGeneration
+        let config = await appState.configStore.reload()
+        guard installationGeneration == appState.installationGeneration else { return }
+        let dataDirectory = appState.installationContext.dataDirectory
+        let freshSnapshot = RegistryStore.load(
+            config: config,
+            dataDirectory: dataDirectory
+        )
+        guard installationGeneration == appState.installationGeneration else { return }
+        registryDataDirectory = dataDirectory
+        snapshot = freshSnapshot
+        registryRequiredByType = config.registryRequiredByType
+        if let selected = selectedSourceID, !snapshot.sources.contains(where: { $0.id == selected }) {
+            selectedSourceID = nil
+        }
+        if let selected = selectedEntryID, !snapshot.entries.contains(where: { $0.id == selected }) {
+            selectedEntryID = nil
+        }
+    }
+
+    private func syncSelected() {
+        guard let sourceID = selectedSourceForSync else { return }
+        run(RegistryCLIArguments.sync(sourceID: sourceID), success: "Synced \(sourceID).")
+    }
+
+    private func syncAll() {
+        run(RegistryCLIArguments.syncAll, success: "Synced all enabled sources.")
+    }
+
+    private func approve(_ entry: RegistryEntry) {
+        run(RegistryCLIArguments.approve(entry), success: "Approved \(entry.name).")
+    }
+
+    private func toggleSource(_ source: RegistrySource, to enabled: Bool) {
+        run(
+            RegistryCLIArguments.setSourceEnabled(sourceID: source.id, enabled: enabled),
+            success: "\(enabled ? "Enabled" : "Disabled") \(source.id)."
+        )
+    }
+
+    private func reject(_ entry: RegistryEntry) {
+        run(RegistryCLIArguments.reject(entry), success: "Rejected \(entry.name).")
+    }
+
+    private func toggleRequirement(for entry: RegistryEntry) {
+        guard ["skill", "mcp"].contains(entry.type) else { return }
+        let required = registryRequiredByType[entry.type] ?? false
+        run(
+            RegistryCLIArguments.setRequired(type: entry.type, required: !required),
+            success: "Registry is now \(required ? "optional" : "required") for \(entry.type) entries."
+        )
+    }
+
+    private func remove(_ source: RegistrySource) {
+        run(RegistryCLIArguments.remove(sourceID: source.id), success: "Removed \(source.id).")
+    }
+
+    private func addSource(_ draft: RegistrySourceDraft) {
+        let arguments = RegistryCLIArguments.add(
+            sourceID: draft.normalizedID,
+            kind: draft.kind,
+            content: draft.content,
+            url: draft.url.trimmingCharacters(in: .whitespacesAndNewlines),
+            authEnv: draft.authEnv.trimmingCharacters(in: .whitespacesAndNewlines),
+            enabled: draft.enabled
+        )
+        run(arguments, success: "Added \(draft.normalizedID).")
+    }
+
+    private func run(_ arguments: [String], success successMessage: String) {
+        guard !running else { return }
+        running = true
+        error = nil
+        status = nil
+        Task {
+            let result = await appState.runCommand(
+                title: arguments.prefix(3).joined(separator: " "),
+                arguments: arguments,
+                category: "registry",
+                origin: "Registries",
+                refreshOnSuccess: true
+            )
+            if result.succeeded {
+                status = successMessage
+                appState.reloadConfig()
+            } else {
+                let detail = String(result.output.suffix(400)).trimmingCharacters(in: .whitespacesAndNewlines)
+                error = detail.isEmpty
+                    ? "Registry command failed with exit \(result.exitCode)."
+                    : "Registry command failed: \(detail)"
+            }
+            await load()
+            running = false
+        }
+    }
+
+    private var selectedEntrySupportsRequirement: Bool {
+        guard let entry = selectedEntry else { return false }
+        return ["skill", "mcp"].contains(entry.type)
+    }
+
+    private var requirementActionLabel: String {
+        guard let entry = selectedEntry, selectedEntrySupportsRequirement else { return "Require Registry" }
+        return registryRequiredByType[entry.type] == true ? "Make Registry Optional" : "Require Registry"
+    }
+
+    private func relativeTimestamp(_ raw: String) -> String {
+        guard let date = DCDates.parse(raw) else { return raw.isEmpty ? "never" : raw }
+        return DCDates.relative(date)
+    }
+
+    private func cachePath(for source: RegistrySource) -> String {
+        guard let registryDataDirectory else { return "loading" }
+        return (try? RegistryStore.indexURL(dataDirectory: registryDataDirectory, sourceID: source.id).path)
+            ?? "unsafe source ID"
+    }
+
+    private func severityColor(_ raw: String) -> Color {
+        guard let severity = Severity(rawValue: raw.uppercased()) else { return .secondary }
+        return Cisco.severityColor(severity)
+    }
+}
+
+private struct RegistrySourceDraft {
+    static let kinds = ["clawhub", "smithery", "skills_sh", "http_yaml", "http_json", "git", "file"]
+    static let contentTypes = ["skill", "mcp", "both"]
+
+    var id = ""
+    var kind = "http_yaml"
+    var content = "skill"
+    var url = ""
+    var authEnv = ""
+    var enabled = true
+
+    var normalizedID: String { id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+    var requiresURL: Bool { ["http_yaml", "http_json", "git", "file"].contains(kind) }
+    var validID: Bool {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-_")
+        return (2...64).contains(normalizedID.count)
+            && RegistryStore.isSafeSourceID(normalizedID)
+            && normalizedID.unicodeScalars.allSatisfy(allowed.contains)
+    }
+    var isValid: Bool {
+        validID && (!requiresURL || !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+}
+
+private struct AddRegistrySourceSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft = RegistrySourceDraft()
+    let onAdd: (RegistrySourceDraft) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Add Registry Source").font(.headline)
+            Form {
+                TextField("Source ID", text: $draft.id, prompt: Text("corp-skills"))
+                Picker("Kind", selection: $draft.kind) {
+                    ForEach(RegistrySourceDraft.kinds, id: \.self) { Text($0).tag($0) }
+                }
+                Picker("Content", selection: $draft.content) {
+                    ForEach(RegistrySourceDraft.contentTypes, id: \.self) { Text($0).tag($0) }
+                }
+                TextField("URL or path", text: $draft.url)
+                TextField("Authentication environment variable", text: $draft.authEnv)
+                Toggle("Enabled", isOn: $draft.enabled)
+            }
+            .formStyle(.grouped)
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                Button("Add") {
+                    onAdd(draft)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!draft.isValid)
+            }
+        }
+        .padding(18)
+        .frame(width: 500)
+    }
+}

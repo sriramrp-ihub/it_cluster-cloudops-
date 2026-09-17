@@ -1,0 +1,97 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package gateway
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/defenseclaw/defenseclaw/internal/audit"
+	"github.com/defenseclaw/defenseclaw/internal/gatewaylog"
+)
+
+func TestJudgeStore_PersistJudgeEventV7Columns(t *testing.T) {
+	store, err := audit.NewJudgeBodyStore(filepath.Join(t.TempDir(), "judge_bodies.db"))
+	if err != nil {
+		t.Fatalf("NewJudgeBodyStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	js := NewJudgeStoreFromBodyStore(store, nil, 0)
+	t.Cleanup(func() { _ = js.Shutdown(t.Context()) })
+	ctx := ContextWithRequestID(
+		ContextWithSessionID(
+			ContextWithTraceID(
+				ContextWithAgentIdentity(t.Context(), AgentIdentity{
+					AgentID:           "agent-logical",
+					AgentInstanceID:   "agent-inst-1",
+					SidecarInstanceID: "sidecar-uuid",
+				}),
+				"abcdabcdabcdabcdabcdabcdabcdabcd",
+			),
+			"sess-99",
+		),
+		"req-judge-1",
+	)
+
+	t.Setenv("DEFENSECLAW_RUN_ID", "run-judge-test")
+
+	p := gatewaylog.JudgePayload{
+		Kind:        "injection",
+		Model:       "anthropic/claude",
+		InputBytes:  100,
+		LatencyMs:   12,
+		Action:      "allow",
+		Severity:    gatewaylog.SeverityInfo,
+		RawResponse: `{"Instruction Manipulation":{"label":false}}`,
+		// ("Judge input_hash is computed from
+		// the response body") closure: callers now pre-compute
+		// the digest of the inspected judge *input* and put it
+		// in InputHash. The persistor stores this verbatim
+		// instead of hashing the response body, so the audit
+		// row's InputHash genuinely identifies the input.
+		InputHash: "sha256:e9f4a4f5c0b8e0a2cb8a4f3a76b8e0a2cb8a4f3a76b8e0a2cb8a4f3a76b8e0a2",
+	}
+	wantInputHash := p.InputHash
+	if err := js.PersistJudgeEvent(ctx, gatewaylog.DirectionPrompt, p, "my_tool", "tid-1", "pol-1", "app:x"); err != nil {
+		t.Fatalf("PersistJudgeEvent: %v", err)
+	}
+
+	// Async path: drain the queue before asserting rows exist.
+	// Shutdown is idempotent and blocks up to its built-in timeout.
+	if err := js.Shutdown(t.Context()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	rows, err := store.ListJudgeResponses(5)
+	if err != nil {
+		t.Fatalf("ListJudgeResponses: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	r := rows[0]
+	if r.Kind != "injection" || r.Model != "anthropic/claude" {
+		t.Fatalf("kind/model: %+v", r)
+	}
+	if r.RequestID != "req-judge-1" || r.TraceID != "abcdabcdabcdabcdabcdabcdabcdabcd" || r.SessionID != "sess-99" {
+		t.Fatalf("correlation: %+v", r)
+	}
+	if r.RunID != "run-judge-test" {
+		t.Fatalf("run_id=%q", r.RunID)
+	}
+	if r.SchemaVersion == 0 && r.BinaryVersion == "" {
+		t.Fatalf("expected some provenance stamp: %+v", r)
+	}
+	if r.AgentID != "agent-logical" || r.AgentInstanceID != "agent-inst-1" || r.SidecarInstanceID != "sidecar-uuid" {
+		t.Fatalf("identity: %+v", r)
+	}
+	if r.PolicyID != "pol-1" || r.DestinationApp != "app:x" || r.ToolName != "my_tool" || r.ToolID != "tid-1" {
+		t.Fatalf("tool/policy: %+v", r)
+	}
+	if r.InputHash != wantInputHash || r.Raw == "" {
+		t.Fatalf("expected raw+input_hash: %+v", r)
+	}
+}

@@ -1,0 +1,150 @@
+<form version="1.1">
+  <label>Overview</label>
+  <description>Narrow security-operations command center for DefenseClaw and OpenClaw investigations.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="dropdown" token="risk_state" searchWhenChanged="true">
+      <label>Risk state filter</label>
+      <choice value="*">All risk states</choice>
+      <choice value="needs_review">Needs review</choice>
+      <choice value="risky">Risky</choice>
+      <choice value="critical">Critical</choice>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+    <input type="text" token="run_id" searchWhenChanged="true">
+      <label>Direct run_id</label>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+    <input type="text" token="session_id" searchWhenChanged="true">
+      <label>Direct session_id</label>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <html>
+        <h2>Security operations command center</h2>
+        <p>This overview is now the narrow command center for the first DefenseClaw + OpenClaw + Splunk security-operations slice. It shows the current risk distribution, the highest-priority investigations, the packaged detection activity, and a direct path into the run and session workbench.</p>
+        <p>The underlying investigation model is built on the seeded `dcso_*` support layer: DefenseClaw policy decisions, OpenClaw runtime evidence, diagnostics and queue health, usage metrics, and trace spans.</p>
+      </html>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Total investigations</title>
+      <single>
+        <search>
+          <query>`dcso_investigation_rollup` | stats count as total_investigations</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Priority investigations</title>
+      <single>
+        <search>
+          <query>`dcso_top_risky_runs_sessions` | where ("$risk_state$"="*" OR risk_state="$risk_state$") | stats count as priority_investigations</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Critical investigations</title>
+      <single>
+        <search>
+          <query>`dcso_latest_critical_investigations` | stats count as critical_investigations</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </single>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Risk state counts</title>
+      <table>
+        <search>
+          <query>`dcso_command_center_risk_state_counts` | where ("$risk_state$"="*" OR risk_state="$risk_state$") | table risk_state_label risk_state investigation_count</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/runs_and_sessions?form.risk_state=$row.risk_state$</link>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Detection counts by type</title>
+      <table>
+        <search>
+          <query>`dcso_command_center_detection_counts` | table detection_label investigation_count saved_search_name</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/alerts_and_saved_searches</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Latest critical investigations</title>
+      <table>
+        <search>
+          <query>`dcso_latest_critical_investigations` | table run_id session_id risk_state risk_reason deny_count runtime_error_count session_stuck_count session_retried_count max_cost_usd max_duration_ms last_seen</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">12</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/runs_and_sessions?form.run_id=$row.run_id$&amp;form.session_id=$row.session_id$&amp;form.risk_state=$row.risk_state$</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Top risky runs and sessions</title>
+      <table>
+        <search>
+          <query>`dcso_top_risky_runs_sessions` | where ("$risk_state$"="*" OR risk_state="$risk_state$") | table run_id session_id risk_state risk_reason deny_count runtime_error_count session_stuck_count session_retried_count queue_pressure_count max_cost_usd max_duration_ms last_seen | head 20</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/runs_and_sessions?form.run_id=$row.run_id$&amp;form.session_id=$row.session_id$&amp;form.risk_state=$row.risk_state$</link>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Investigation entry</title>
+      <table>
+        <search>
+          <query>| makeresults | eval action="Open run and session workbench", run_id="$run_id$", session_id="$session_id$", risk_state="$risk_state$" | where run_id!="*" OR session_id!="*" | table action run_id session_id risk_state</query>
+          <earliest>0</earliest>
+          <latest></latest>
+        </search>
+        <option name="count">5</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/runs_and_sessions?form.run_id=$row.run_id$&amp;form.session_id=$row.session_id$&amp;form.risk_state=$row.risk_state$</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+</form>

@@ -1,0 +1,352 @@
+/**
+ * Copyright 2026 Cisco Systems, Inc. and its affiliates
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { join } from "node:path";
+
+vi.mock("node:os", () => ({
+  homedir: () => "/mock-home",
+}));
+
+vi.mock("node:fs", () => ({
+  readFileSync: vi.fn(),
+}));
+
+import { readFileSync } from "node:fs";
+import { loadSidecarConfig, _resetSidecarConfigCache } from "../sidecar-config.js";
+
+const mockReadFileSync = vi.mocked(readFileSync);
+
+describe("loadSidecarConfig", () => {
+  const savedDefenseClawHome = process.env.DEFENSECLAW_HOME;
+  const savedE2EGatewayToken = process.env.E2E_GATEWAY_TOKEN;
+
+  beforeEach(() => {
+    _resetSidecarConfigCache();
+    mockReadFileSync.mockReset();
+    delete process.env.DEFENSECLAW_HOME;
+    delete process.env.E2E_GATEWAY_TOKEN;
+  });
+
+  afterEach(() => {
+    _resetSidecarConfigCache();
+    if (savedDefenseClawHome === undefined) {
+      delete process.env.DEFENSECLAW_HOME;
+    } else {
+      process.env.DEFENSECLAW_HOME = savedDefenseClawHome;
+    }
+    if (savedE2EGatewayToken === undefined) {
+      delete process.env.E2E_GATEWAY_TOKEN;
+    } else {
+      process.env.E2E_GATEWAY_TOKEN = savedE2EGatewayToken;
+    }
+  });
+
+  it("returns defaults when config file is missing", () => {
+    mockReadFileSync.mockImplementation(() => {
+      throw new Error("ENOENT: no such file or directory");
+    });
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(cfg.apiPort).toBe(18970);
+    expect(cfg.baseUrl).toBe("http://127.0.0.1:18970");
+  });
+
+  it("reads host and api_port from config.yaml", () => {
+    mockReadFileSync.mockReturnValue(
+      "gateway:\n  host: 10.0.0.5\n  api_port: 9999\n"
+    );
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("10.0.0.5");
+    expect(cfg.apiPort).toBe(9999);
+    expect(cfg.baseUrl).toBe("http://10.0.0.5:9999");
+    expect(mockReadFileSync).toHaveBeenCalledWith(
+      join("/mock-home", ".defenseclaw", "config.yaml"),
+      "utf8"
+    );
+  });
+
+  it("reads config and dotenv from an absolute DEFENSECLAW_HOME", () => {
+    process.env.DEFENSECLAW_HOME = "/isolated-defenseclaw";
+    mockReadFileSync.mockImplementation((path) => {
+      const selectedPath = String(path);
+      if (selectedPath === join("/isolated-defenseclaw", "config.yaml")) {
+        return "gateway:\n  host: 10.0.0.8\n  token_env: E2E_GATEWAY_TOKEN\n";
+      }
+      if (selectedPath === join("/isolated-defenseclaw", ".env")) {
+        return "E2E_GATEWAY_TOKEN=isolated-token\n";
+      }
+      throw new Error(`unexpected path: ${selectedPath}`);
+    });
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("10.0.0.8");
+    expect(cfg.token).toBe("isolated-token");
+    expect(mockReadFileSync).not.toHaveBeenCalledWith(
+      join("/mock-home", ".defenseclaw", "config.yaml"),
+      "utf8"
+    );
+    expect(mockReadFileSync).not.toHaveBeenCalledWith(
+      join("/mock-home", ".defenseclaw", ".env"),
+      "utf8"
+    );
+  });
+
+  it("uses the default home when DEFENSECLAW_HOME is empty", () => {
+    process.env.DEFENSECLAW_HOME = "";
+    mockReadFileSync.mockImplementation((path) => {
+      const selectedPath = String(path);
+      if (selectedPath === join("/mock-home", ".defenseclaw", "config.yaml")) {
+        return "gateway:\n  host: 127.0.0.2\n";
+      }
+      throw new Error(`unexpected path: ${selectedPath}`);
+    });
+
+    expect(loadSidecarConfig().host).toBe("127.0.0.2");
+    expect(mockReadFileSync).toHaveBeenCalledWith(
+      join("/mock-home", ".defenseclaw", "config.yaml"),
+      "utf8"
+    );
+  });
+
+  it("rejects a relative DEFENSECLAW_HOME without reading persistent state", () => {
+    process.env.DEFENSECLAW_HOME = "relative/state";
+
+    expect(() => loadSidecarConfig()).toThrow(
+      "DEFENSECLAW_HOME must be an absolute path"
+    );
+    expect(mockReadFileSync).not.toHaveBeenCalled();
+  });
+
+  it("rejects a whitespace DEFENSECLAW_HOME without reading persistent state", () => {
+    process.env.DEFENSECLAW_HOME = "   ";
+
+    expect(() => loadSidecarConfig()).toThrow(
+      "DEFENSECLAW_HOME must be an absolute path"
+    );
+    expect(mockReadFileSync).not.toHaveBeenCalled();
+  });
+
+  it("reads approval timeout and hilt flag from config.yaml", () => {
+    mockReadFileSync.mockReturnValue(
+      "gateway:\n  approval_timeout_s: 45\nguardrail:\n  hilt:\n    enabled: true\n"
+    );
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.approvalTimeoutS).toBe(45);
+    expect(cfg.hiltEnabled).toBe(true);
+  });
+
+  it("accepts hitl as an alias for hilt", () => {
+    mockReadFileSync.mockReturnValue(
+      "guardrail:\n  hitl:\n    enabled: true\n"
+    );
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.hiltEnabled).toBe(true);
+  });
+
+  it("uses default host when only api_port is set", () => {
+    mockReadFileSync.mockReturnValue("gateway:\n  api_port: 8080\n");
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(cfg.apiPort).toBe(8080);
+    expect(cfg.baseUrl).toBe("http://127.0.0.1:8080");
+  });
+
+  it("uses default api_port when only host is set", () => {
+    mockReadFileSync.mockReturnValue("gateway:\n  host: 192.168.1.1\n");
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("192.168.1.1");
+    expect(cfg.apiPort).toBe(18970);
+    expect(cfg.baseUrl).toBe("http://192.168.1.1:18970");
+  });
+
+  it("returns defaults for empty config file", () => {
+    mockReadFileSync.mockReturnValue("");
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(cfg.apiPort).toBe(18970);
+  });
+
+  it("returns defaults when gateway section is missing", () => {
+    mockReadFileSync.mockReturnValue("audit:\n  enabled: true\n");
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(cfg.apiPort).toBe(18970);
+  });
+
+  it("ignores non-numeric api_port", () => {
+    mockReadFileSync.mockReturnValue('gateway:\n  api_port: "not-a-number"\n');
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.apiPort).toBe(18970);
+  });
+
+  it("ignores empty host string", () => {
+    mockReadFileSync.mockReturnValue('gateway:\n  host: ""\n');
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("127.0.0.1");
+  });
+
+  it("caches result across calls", () => {
+    mockReadFileSync.mockReturnValue("gateway:\n  api_port: 5555\n");
+
+    const first = loadSidecarConfig();
+    const second = loadSidecarConfig();
+
+    expect(first).toBe(second);
+    const callsOnFirstLoad = mockReadFileSync.mock.calls.length;
+    expect(callsOnFirstLoad).toBeGreaterThanOrEqual(1);
+
+    mockReadFileSync.mockClear();
+    loadSidecarConfig();
+    expect(mockReadFileSync).toHaveBeenCalledTimes(0);
+  });
+
+  it("returns fresh result after cache reset", () => {
+    mockReadFileSync.mockReturnValue("gateway:\n  api_port: 5555\n");
+    const first = loadSidecarConfig();
+
+    _resetSidecarConfigCache();
+    mockReadFileSync.mockReturnValue("gateway:\n  api_port: 6666\n");
+    const second = loadSidecarConfig();
+
+    expect(first.apiPort).toBe(5555);
+    expect(second.apiPort).toBe(6666);
+  });
+
+  it("handles malformed YAML gracefully", () => {
+    mockReadFileSync.mockReturnValue("{{invalid yaml");
+
+    const cfg = loadSidecarConfig();
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(cfg.apiPort).toBe(18970);
+  });
+
+  // -------------------------------------------------------------------
+  // S3.HIGH_BUG ("Embedded OpenClaw plugin misses the canonical
+  // first-boot token"): the embedded extension's token resolver MUST
+  // accept the canonical DEFENSECLAW_GATEWAY_TOKEN written by the Go
+  // sidecar's first-boot bootstrap into ~/.defenseclaw/.env, even when
+  // the operator never exported the value into the Node process. Before
+  // the fix the dotenv fallback only looked for OPENCLAW_GATEWAY_TOKEN
+  // and the OpenClaw process had no token, which silently 401'd every
+  // /api/v1/inspect/* request and let tool calls bypass inspection.
+  // -------------------------------------------------------------------
+  describe("token resolution (first-boot regression)", () => {
+    const ENV_KEYS = [
+      "DEFENSECLAW_GATEWAY_TOKEN",
+      "OPENCLAW_GATEWAY_TOKEN",
+    ] as const;
+    const savedEnv: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const k of ENV_KEYS) {
+        savedEnv[k] = process.env[k];
+        delete process.env[k];
+      }
+    });
+
+    afterEach(() => {
+      for (const k of ENV_KEYS) {
+        if (savedEnv[k] === undefined) {
+          delete process.env[k];
+        } else {
+          process.env[k] = savedEnv[k];
+        }
+      }
+    });
+
+    function mockEnvOnlyDotenv(dotenv: string) {
+      // Two readFileSync sites need to be served deterministically:
+      //   1. config.yaml -> return empty so all token resolution falls
+      //      back to env / dotenv lookups (the canonical-first-boot
+      //      scenario from the report).
+      //   2. ~/.defenseclaw/.env -> return the supplied dotenv blob.
+      mockReadFileSync.mockImplementation((path) => {
+        const p = String(path);
+        if (p.endsWith("config.yaml")) {
+          return "";
+        }
+        if (p.endsWith(".env")) {
+          return dotenv;
+        }
+        throw new Error("ENOENT: " + p);
+      });
+    }
+
+    it("reads DEFENSECLAW_GATEWAY_TOKEN from ~/.defenseclaw/.env when env is empty", () => {
+      mockEnvOnlyDotenv(
+        "DEFENSECLAW_GATEWAY_TOKEN=canonical-from-firstboot\n"
+      );
+      const cfg = loadSidecarConfig();
+      expect(cfg.token).toBe("canonical-from-firstboot");
+    });
+
+    it("falls back to legacy OPENCLAW_GATEWAY_TOKEN in dotenv for old installs", () => {
+      mockEnvOnlyDotenv("OPENCLAW_GATEWAY_TOKEN=legacy-only-token\n");
+      const cfg = loadSidecarConfig();
+      expect(cfg.token).toBe("legacy-only-token");
+    });
+
+    it("prefers DEFENSECLAW_GATEWAY_TOKEN over the legacy name when both are present", () => {
+      mockEnvOnlyDotenv(
+        [
+          "DEFENSECLAW_GATEWAY_TOKEN=new-canonical",
+          "OPENCLAW_GATEWAY_TOKEN=legacy-shadow",
+          "",
+        ].join("\n")
+      );
+      const cfg = loadSidecarConfig();
+      expect(cfg.token).toBe("new-canonical");
+    });
+
+    it("returns empty token when neither env nor dotenv has the value", () => {
+      mockReadFileSync.mockImplementation((path) => {
+        const p = String(path);
+        if (p.endsWith("config.yaml")) return "";
+        throw new Error("ENOENT: " + p);
+      });
+      const cfg = loadSidecarConfig();
+      expect(cfg.token).toBe("");
+    });
+
+    it("respects gateway.token_env override and reads that name from dotenv", () => {
+      mockReadFileSync.mockImplementation((path) => {
+        const p = String(path);
+        if (p.endsWith("config.yaml")) {
+          return "gateway:\n  token_env: CUSTOM_TOKEN_ENV\n";
+        }
+        if (p.endsWith(".env")) {
+          return "CUSTOM_TOKEN_ENV=via-token-env-override\n";
+        }
+        throw new Error("ENOENT: " + p);
+      });
+      const cfg = loadSidecarConfig();
+      expect(cfg.token).toBe("via-token-env-override");
+    });
+  });
+});

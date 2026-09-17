@@ -1,0 +1,38 @@
+# Sliding-window correlation patterns.
+#
+# The correlator evaluates these patterns on every new finding insert
+# against the last N findings in the same session. A match writes a
+# synthetic CORR-<PATTERN_ID> finding back into scan_findings at
+# severity_on_match.
+#
+# See internal/guardrail/correlator.go for the matcher semantics.
+
+patterns:
+  - id: LETHAL-TRIFECTA
+    description: |
+      Untrusted content + sensitive data access + external egress in
+      the same session. The three ingredients of Willison's lethal
+      trifecta — any agent exposed to all three has an indirect-prompt-
+      injection exfil path.
+    window_events: 30
+    severity_on_match: CRITICAL
+    # Order-aware: untrusted ingress must precede sensitive access,
+    # which must precede external egress. This is the true exfil
+    # direction and rejects benign windows where egress happened
+    # before any untrusted content entered the session.
+    ordered: true
+    all_of:
+      - axis: ingress_untrusted
+      - axis: sensitive_access
+      - axis: egress_external
+
+  - id: TRIFECTA-WITH-FINGERPRINT-MATCH
+    description: |
+      Stronger variant: the SAME content fingerprint appears in a
+      sensitive_access finding AND a later egress_external finding.
+      This is direct exfil, not just temporal coincidence.
+    window_events: 30
+    severity_on_match: CRITICAL
+    fingerprint_chain:
+      - axis: sensitive_access
+      - axis: egress_external

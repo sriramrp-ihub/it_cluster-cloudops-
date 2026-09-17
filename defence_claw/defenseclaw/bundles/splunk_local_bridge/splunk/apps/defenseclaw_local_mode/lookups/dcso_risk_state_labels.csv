@@ -1,0 +1,6 @@
+value,label,sort_order,color
+normal,Normal,10,#5B8C5A
+observed,Observed,20,#4C6EF5
+needs_review,Needs Review,30,#E0A400
+risky,Risky,40,#D9480F
+critical,Critical,50,#B02A37

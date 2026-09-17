@@ -1,0 +1,39 @@
+{
+  "name": "defenseclaw",
+  "version": "0.8.6",
+  "description": "OpenClaw plugin for DefenseClaw — scan skills/plugins/MCPs, enforce policy, monitor runtime",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "pluginManifest": "./openclaw.plugin.json"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "js-yaml": "^4.3.1"
+  },
+  "peerDependencies": {
+    "@openclaw/plugin-sdk": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^25.5.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@openclaw/plugin-sdk": {
+      "optional": true
+    }
+  },
+  "license": "Apache-2.0",
+  "permissions": [
+    "net:connect:localhost"
+  ]
+}

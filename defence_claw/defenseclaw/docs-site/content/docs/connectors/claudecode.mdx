@@ -1,0 +1,133 @@
+---
+title: Claude Code
+description: Claude Code connector wires the documented lifecycle hook set plus native OTel. Thirteen current events can return block decisions, and PreToolUse supports native HITL ask.
+keywords:
+  - DefenseClaw Claude Code connector
+  - Claude Code hooks
+  - Claude Code PreToolUse
+  - Claude Code observability
+---
+
+The Claude Code connector wires DefenseClaw into [Anthropic's documented hook surfaces](https://docs.anthropic.com/) without inserting a proxy in the data path. Claude Code talks directly to its native upstream; DefenseClaw inspects via hooks + native OTel.
+
+<Callout type="info">
+The Claude Code connector is **hook-only**. There is no LLM-proxy data path — Claude Code talks directly to `api.anthropic.com` and DefenseClaw observes via hooks + native OTel.
+
+**`mode=action` is supported on Claude Code's declared blocking hook events.**
+`PreToolUse` can return deny or native ask before the tool. Post-result events
+are advisory: they preserve findings and shadow `would_block` telemetry without
+stopping Claude's next turn. No proxy listener is involved.
+</Callout>
+
+## Setup
+
+```bash
+defenseclaw setup claude-code                # observe (default) — record only
+defenseclaw setup claude-code --mode action  # block on policy hits via PreToolUse deny
+```
+
+`setup claude-code` is the dedicated Claude Code setup alias. It uses the same
+setup backend as `setup guardrail`, adds or reconfigures `claudecode`, wires
+hooks + native OTel, and can join an existing hook-connector roster when you
+choose **Add**. No proxy listener binds in either mode.
+
+Native OTLP uses managed loopback exporter settings with a Claude-scoped
+Authorization bearer. Logs and metrics are enabled; traces are explicitly
+disabled. The scoped credential cannot authenticate management or another
+connector and must never be printed or copied.
+
+Redaction is configured through the v8 bucket/profile policy: edit
+`observability.destinations[].routes[].selector.buckets` and
+`observability.redaction_profiles`, then follow
+[Redaction → Verify policy](/docs/reference/redaction#verify-policy).
+
+The alias defaults to observe mode and accepts the common hook-connector
+options, including `--mode`, `--workspace`, `--rule-pack`,
+`--human-approval`, `--hilt-min-severity`, `--fail-mode`, `--block-message`,
+`--replace`, `--with-local-stack`, and restart controls. Use the
+[quick-alias reference](/docs/setup/guardrail/aliases) for that surface. Use
+the [full guardrail setup](/docs/setup/guardrail) when you also need scanner,
+detection-strategy, or judge-provider configuration. Defaults are documented
+once on the [Defaults page](/docs/defaults).
+
+## Files DefenseClaw will modify
+
+<Tabs items={['Native Windows', 'macOS/Linux']}>
+  <Tab value="Native Windows">
+
+DefenseClaw manages marked hooks and OTLP environment entries in
+`%CLAUDE_CONFIG_DIR%\settings.json`; the default directory is
+`%USERPROFILE%\.claude`. Generated runtime and protected connector credentials
+live below `%USERPROFILE%\.defenseclaw\hooks`. See the
+[Windows path reference](/docs/get-started/windows/paths-troubleshooting#filesystem-reference).
+
+  </Tab>
+  <Tab value="macOS/Linux">
+
+<Files>
+  <Folder name="~/.claude" defaultOpen>
+    <File name="settings.json (hooks block + managed native OTel environment entries)" />
+  </Folder>
+  <Folder name="~/.defenseclaw" defaultOpen>
+    <Folder name="hooks">
+      <File name="claude-code-hook.sh" />
+      <File name="protected connector credential sidecars" />
+    </Folder>
+  </Folder>
+</Files>
+
+  </Tab>
+</Tabs>
+
+DefenseClaw stores a hash-checked backup of `settings.json` before edits.
+Teardown restores it byte-for-byte when the identity still matches; if the file
+drifted, only DefenseClaw-owned entries are removed.
+
+## Hook capabilities
+
+<HookEventsList connector="claudecode" />
+
+Claude Code's post-result surfaces (`PostToolUse`, `PostToolUseFailure`,
+`PermissionDenied`, and `PostToolBatch`) carry returned content rather than a
+new typed action request. DefenseClaw still scans that content for trust,
+secret, and PII findings, but command, path, cognitive-file, and C2 rules do
+not block on literals found in the returned bytes. For example, source text
+that explains `rm -rf /` can produce telemetry without being mistaken for a
+request to execute it. If Claude later proposes that command, `PreToolUse`
+evaluates the typed tool arguments and can deny it before execution.
+
+A standalone `PostToolUse` response may also use physically verified local
+source provenance to lower source-code trust findings to detection-only
+telemetry. Batch, failure, denial, and mixed outputs remain untrusted content;
+they are still advisory because they cannot be attributed to one executable
+request safely.
+
+<Callout type="info">
+Claude Code is one of the few connectors that supports native PreToolUse ask. HITL approvals surface inside the agent UI itself, so the operator never has to leave Claude Code to decide.
+</Callout>
+
+## Telemetry channels at boot
+
+<Flow
+  direction="LR"
+  compact
+  caption="Two telemetry channels: hooks for per-tool-call decisions and native OTel for raw model/token telemetry."
+>
+  <Node id="cc" kind="agent">Claude Code</Node>
+  <Node id="hooks" kind="connector">{`Current 28-event\nhook contract`}</Node>
+  <Node id="otel" kind="connector">{`Native OTel exporter\n(env-driven)`}</Node>
+  <Node id="gateway" kind="gateway">defenseclaw-gateway</Node>
+  <Edge from="cc" to="hooks" />
+  <Edge from="hooks" to="gateway" />
+  <Edge from="cc" to="otel" />
+  <Edge from="otel" to="gateway" />
+</Flow>
+
+## Disable
+
+```bash
+defenseclaw guardrail disable --connector claudecode --yes
+```
+
+For the exact native Windows event and fail-mode boundary, see
+[Connectors and enforcement](/docs/get-started/windows/connectors-enforcement#claude-code).

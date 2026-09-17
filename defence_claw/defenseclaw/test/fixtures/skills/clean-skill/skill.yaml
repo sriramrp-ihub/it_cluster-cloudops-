@@ -1,0 +1,10 @@
+name: clean-skill
+version: "1.0.0"
+description: A simple skill that passes all security scans
+author: test-user
+
+capabilities:
+  - text-generation
+
+permissions:
+  - read-only

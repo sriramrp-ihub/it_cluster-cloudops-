@@ -1,0 +1,778 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/defenseclaw/defenseclaw/internal/observability/router"
+)
+
+func newTestStore(t *testing.T) (*Store, func()) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Init(); err != nil {
+		t.Fatalf("Store.Init: %v", err)
+	}
+	return store, func() { store.Close() }
+}
+
+// --- NetworkEgressEvent.Validate ---
+
+func TestNetworkEgressEvent_Validate(t *testing.T) {
+	tests := []struct {
+		name    string
+		evt     NetworkEgressEvent
+		wantErr bool
+	}{
+		{
+			name:    "valid allowed event",
+			evt:     NetworkEgressEvent{Hostname: "api.example.com", PolicyOutcome: "Allowed by pattern: *.example.com"},
+			wantErr: false,
+		},
+		{
+			name:    "valid blocked event",
+			evt:     NetworkEgressEvent{Hostname: "evil.io", PolicyOutcome: "Denied: not in allowlist", Blocked: true},
+			wantErr: false,
+		},
+		{
+			name:    "missing hostname",
+			evt:     NetworkEgressEvent{PolicyOutcome: "Allowed by default"},
+			wantErr: true,
+		},
+		{
+			name:    "missing policy outcome",
+			evt:     NetworkEgressEvent{Hostname: "api.example.com"},
+			wantErr: true,
+		},
+		{
+			name:    "whitespace hostname",
+			evt:     NetworkEgressEvent{Hostname: "   ", PolicyOutcome: "ok"},
+			wantErr: true,
+		},
+		{
+			name:    "whitespace policy outcome",
+			evt:     NetworkEgressEvent{Hostname: "api.example.com", PolicyOutcome: "  "},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.evt.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// --- effectiveSeverity ---
+
+func TestNetworkEgressEvent_effectiveSeverity(t *testing.T) {
+	tests := []struct {
+		name    string
+		evt     NetworkEgressEvent
+		wantSev string
+	}{
+		{"explicit severity wins", NetworkEgressEvent{Severity: "CRITICAL"}, "CRITICAL"},
+		{"blocked defaults HIGH", NetworkEgressEvent{Blocked: true}, "HIGH"},
+		{"allowed defaults INFO", NetworkEgressEvent{Blocked: false}, "INFO"},
+		{"explicit on blocked wins", NetworkEgressEvent{Blocked: true, Severity: "MEDIUM"}, "MEDIUM"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.evt.effectiveSeverity(); got != tt.wantSev {
+				t.Errorf("effectiveSeverity() = %q, want %q", got, tt.wantSev)
+			}
+		})
+	}
+}
+
+func TestNetworkEgressEventToRowRedactsURLCredentials(t *testing.T) {
+	rawURL := "https://alice:secret@api.example.test/v1/data?api_key=secret&region=us#fragment"
+	event := NetworkEgressEvent{
+		Hostname:      "api.example.test",
+		URL:           rawURL,
+		PolicyOutcome: "allowed",
+		Details:       "allowed outbound request to " + rawURL,
+	}
+	row := event.toRow()
+	if strings.Contains(row.URL, "alice") || strings.Contains(row.URL, "secret") {
+		t.Fatalf("persisted URL leaked credentials: %q", row.URL)
+	}
+	if strings.Contains(row.Details, "alice") || strings.Contains(row.Details, "secret") {
+		t.Fatalf("persisted details leaked credentials: %q", row.Details)
+	}
+	if !strings.Contains(row.URL, "api_key=%3Credacted%3E") || !strings.Contains(row.URL, "region=us") {
+		t.Fatalf("persisted URL did not retain safe diagnostic context: %q", row.URL)
+	}
+	if !strings.Contains(row.Details, "api_key=%3Credacted%3E") || !strings.Contains(row.Details, "region=us") {
+		t.Fatalf("persisted details did not retain safe diagnostic context: %q", row.Details)
+	}
+}
+
+func TestStore_InsertNetworkEgressEventRedactsURLInDetails(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	rawURL := "https://alice:secret@api.example.test/v1/data?api_key=secret"
+	if err := store.InsertNetworkEgressEvent(NetworkEgressRow{
+		Hostname: "api.example.test", URL: rawURL, PolicyOutcome: "blocked",
+		Details: "blocked outbound request to " + rawURL,
+	}); err != nil {
+		t.Fatalf("InsertNetworkEgressEvent: %v", err)
+	}
+	rows, err := store.QueryNetworkEgressEvents(NetworkEgressFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("QueryNetworkEgressEvents rows=%d err=%v", len(rows), err)
+	}
+	if strings.Contains(rows[0].Details, "alice") || strings.Contains(rows[0].Details, "secret") {
+		t.Fatalf("persisted details leaked URL credentials: %q", rows[0].Details)
+	}
+	if !strings.Contains(rows[0].Details, "%3Credacted%3E") {
+		t.Fatalf("persisted details did not retain redacted URL context: %q", rows[0].Details)
+	}
+}
+
+func TestStore_InsertNetworkEgressEventKeepsTruncatedURLConsistentInDetails(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	rawURL := "https://alice:secret@api.example.test/" + strings.Repeat("a", 600)
+	const prefix = "allowed outbound request to "
+	if err := store.InsertNetworkEgressEvent(NetworkEgressRow{
+		Hostname: "api.example.test", URL: rawURL, PolicyOutcome: "allowed",
+		Details: prefix + rawURL,
+	}); err != nil {
+		t.Fatalf("InsertNetworkEgressEvent: %v", err)
+	}
+	rows, err := store.QueryNetworkEgressEvents(NetworkEgressFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("QueryNetworkEgressEvents rows=%d err=%v", len(rows), err)
+	}
+	if len(rows[0].URL) != 512 || rows[0].Details != prefix+rows[0].URL {
+		t.Fatalf("persisted details URL differs from truncated URL: url=%q details=%q", rows[0].URL, rows[0].Details)
+	}
+}
+
+func TestNetworkEgressDetailsScrubURLsIndependently(t *testing.T) {
+	const sentinel = "details-only-secret"
+	event := NetworkEgressEvent{
+		Hostname:      "api.example.test",
+		PolicyOutcome: "blocked",
+		Details: "first https://api.example.test/a?tok%65n=" + sentinel +
+			" then https://api.example.test/b?api%5Fkey=" + sentinel,
+	}
+	row := event.toRow()
+	if strings.Contains(row.Details, sentinel) {
+		t.Fatalf("toRow details leaked embedded URL credentials: %q", row.Details)
+	}
+	if strings.Count(row.Details, "%3Credacted%3E") != 2 {
+		t.Fatalf("toRow details did not retain two redacted URL contexts: %q", row.Details)
+	}
+}
+
+func TestNetworkEgressWhitespaceURLRemainsEmpty(t *testing.T) {
+	event := NetworkEgressEvent{
+		Hostname:      "api.example.test",
+		URL:           "   ",
+		PolicyOutcome: "allowed",
+		Details:       "safe diagnostic spacing",
+	}
+	row := event.toRow()
+	if row.URL != "" {
+		t.Fatalf("toRow URL = %q, want empty for whitespace-only input", row.URL)
+	}
+	if row.Details != event.Details {
+		t.Fatalf("toRow details = %q, want %q", row.Details, event.Details)
+	}
+}
+
+// --- Store: insert / list / query ---
+
+func TestStore_InsertAndListNetworkEgressEvents(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	base := time.Now().UTC().Truncate(time.Second)
+
+	fixtures := []NetworkEgressRow{
+		{
+			Timestamp:     base,
+			Hostname:      "api.example.com",
+			URL:           "https://api.example.com/v1/data",
+			HTTPMethod:    "POST",
+			Protocol:      "https",
+			PolicyOutcome: "Allowed by pattern: *.example.com",
+			DecisionCode:  "NETWORK_ALLOW_PATTERN",
+			Blocked:       false,
+			Severity:      "INFO",
+		},
+		{
+			Timestamp:     base.Add(-time.Minute),
+			SessionID:     "sess-abc123",
+			Hostname:      "malicious.io",
+			URL:           "http://malicious.io/exfil",
+			HTTPMethod:    "GET",
+			Protocol:      "http",
+			PolicyOutcome: "Denied: hostname on deny list",
+			DecisionCode:  "NETWORK_DENY_PATTERN",
+			Blocked:       true,
+			Severity:      "HIGH",
+		},
+		{
+			Timestamp:     base.Add(-2 * time.Minute),
+			SessionID:     "sess-abc123",
+			Hostname:      "api.example.com",
+			PolicyOutcome: "Allowed by default policy",
+			DecisionCode:  "NETWORK_DEFAULT_ALLOW",
+			Severity:      "INFO",
+		},
+	}
+
+	for _, e := range fixtures {
+		if err := store.InsertNetworkEgressEvent(e); err != nil {
+			t.Fatalf("InsertNetworkEgressEvent: %v", err)
+		}
+	}
+
+	t.Run("list all newest first", func(t *testing.T) {
+		rows, err := store.ListNetworkEgressEvents(100, "")
+		if err != nil {
+			t.Fatalf("ListNetworkEgressEvents: %v", err)
+		}
+		if len(rows) != 3 {
+			t.Errorf("got %d rows, want 3", len(rows))
+		}
+		if rows[0].Hostname != "api.example.com" || rows[0].HTTPMethod != "POST" {
+			t.Errorf("unexpected first row: %+v", rows[0])
+		}
+	})
+
+	t.Run("filter by hostname", func(t *testing.T) {
+		rows, err := store.ListNetworkEgressEvents(100, "api.example.com")
+		if err != nil {
+			t.Fatalf("ListNetworkEgressEvents: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Errorf("got %d rows, want 2", len(rows))
+		}
+		for _, r := range rows {
+			if r.Hostname != "api.example.com" {
+				t.Errorf("unexpected hostname %q in filtered result", r.Hostname)
+			}
+		}
+	})
+
+	t.Run("blocked flag round-trips", func(t *testing.T) {
+		rows, err := store.ListNetworkEgressEvents(100, "malicious.io")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("expected 1 row, got %d (err=%v)", len(rows), err)
+		}
+		if !rows[0].Blocked {
+			t.Error("expected Blocked=true")
+		}
+		if rows[0].SessionID != "sess-abc123" {
+			t.Errorf("session_id round-trip failed: got %q", rows[0].SessionID)
+		}
+	})
+
+	t.Run("limit is honoured", func(t *testing.T) {
+		rows, err := store.ListNetworkEgressEvents(2, "")
+		if err != nil || len(rows) != 2 {
+			t.Errorf("got %d rows with limit=2 (err=%v)", len(rows), err)
+		}
+	})
+
+	t.Run("count blocked", func(t *testing.T) {
+		n, err := store.CountBlockedEgress()
+		if err != nil {
+			t.Fatalf("CountBlockedEgress: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("got %d blocked, want 1", n)
+		}
+	})
+}
+
+func TestStore_QueryNetworkEgressEvents(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	base := time.Now().UTC().Truncate(time.Second)
+	boolTrue := true
+	boolFalse := false
+
+	fixtures := []NetworkEgressRow{
+		{Timestamp: base, Hostname: "a.example.com", SessionID: "s1", PolicyOutcome: "ok", Blocked: false, Severity: "INFO"},
+		{Timestamp: base.Add(-time.Minute), Hostname: "b.example.com", SessionID: "s1", PolicyOutcome: "ok", Blocked: false, Severity: "INFO"},
+		{Timestamp: base.Add(-2 * time.Minute), Hostname: "evil.io", SessionID: "s2", PolicyOutcome: "denied", Blocked: true, Severity: "HIGH"},
+		{Timestamp: base.Add(-3 * time.Minute), Hostname: "a.example.com", SessionID: "s2", PolicyOutcome: "ok", Blocked: false, Severity: "INFO"},
+	}
+	for _, e := range fixtures {
+		if err := store.InsertNetworkEgressEvent(e); err != nil {
+			t.Fatalf("InsertNetworkEgressEvent: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		filter    NetworkEgressFilter
+		wantCount int
+	}{
+		{"no filter returns all", NetworkEgressFilter{}, 4},
+		{"hostname filter", NetworkEgressFilter{Hostname: "a.example.com"}, 2},
+		{"session filter", NetworkEgressFilter{SessionID: "s1"}, 2},
+		{"blocked=true filter", NetworkEgressFilter{Blocked: &boolTrue}, 1},
+		{"blocked=false filter", NetworkEgressFilter{Blocked: &boolFalse}, 3},
+		{"since filter excludes old", NetworkEgressFilter{Since: base.Add(-90 * time.Second)}, 2},
+		{"hostname+session", NetworkEgressFilter{Hostname: "a.example.com", SessionID: "s1"}, 1},
+		{"limit 1", NetworkEgressFilter{Limit: 1}, 1},
+		{"hostname+blocked=true returns empty", NetworkEgressFilter{Hostname: "a.example.com", Blocked: &boolTrue}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows, err := store.QueryNetworkEgressEvents(tt.filter)
+			if err != nil {
+				t.Fatalf("QueryNetworkEgressEvents: %v", err)
+			}
+			if len(rows) != tt.wantCount {
+				t.Errorf("got %d rows, want %d", len(rows), tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestStore_NetworkEgressPreservesAgentLifecycleCorrelation(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	want := NetworkEgressRow{
+		SessionID:        "session-agent-egress",
+		Connector:        "codex",
+		AgentID:          "agent-egress",
+		AgentLifecycleID: "lifecycle-0123456789abcdef",
+		AgentExecutionID: "execution-0123456789abcdef",
+		UserID:           "user-egress",
+		ToolID:           "tool-egress",
+		Hostname:         "docs.example.com",
+		PolicyOutcome:    "allowed",
+		Severity:         "INFO",
+	}
+	if err := store.InsertNetworkEgressEvent(want); err != nil {
+		t.Fatalf("InsertNetworkEgressEvent: %v", err)
+	}
+	rows, err := store.QueryNetworkEgressEvents(NetworkEgressFilter{
+		AgentID: want.AgentID, UserID: want.UserID,
+	})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("QueryNetworkEgressEvents rows=%d err=%v", len(rows), err)
+	}
+	got := rows[0]
+	if got.Connector != want.Connector || got.AgentLifecycleID != want.AgentLifecycleID ||
+		got.AgentExecutionID != want.AgentExecutionID || got.ToolID != want.ToolID {
+		t.Fatalf("egress lifecycle correlation=%+v want=%+v", got, want)
+	}
+}
+
+func TestStore_QueryNetworkEgressEvents_OrdersFractionalTimestampsChronologically(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	rawRows := []struct {
+		id        string
+		timestamp string
+		hostname  string
+	}{
+		{id: "whole-second", timestamp: "2026-03-24T12:00:00Z", hostname: "whole.example"},
+		{id: "fractional", timestamp: "2026-03-24T12:00:00.1Z", hostname: "fractional.example"},
+	}
+
+	for _, row := range rawRows {
+		if _, err := store.db.Exec(
+			`INSERT INTO network_egress_events
+			 (id, timestamp, hostname, policy_outcome, blocked, severity)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			row.id, row.timestamp, row.hostname, "ok", 0, "INFO",
+		); err != nil {
+			t.Fatalf("insert raw row %s: %v", row.id, err)
+		}
+	}
+
+	rows, err := store.QueryNetworkEgressEvents(NetworkEgressFilter{
+		Since: time.Date(2026, 3, 24, 12, 0, 0, 50_000_000, time.UTC),
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("QueryNetworkEgressEvents: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row after since-filter, got %d", len(rows))
+	}
+	if rows[0].Hostname != "fractional.example" {
+		t.Errorf("expected fractional row first, got %q", rows[0].Hostname)
+	}
+}
+func TestStore_GetCounts_IncludesBlockedEgress(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	for _, blocked := range []bool{true, true, false} {
+		row := NetworkEgressRow{
+			Hostname:      "example.com",
+			PolicyOutcome: "test",
+			Blocked:       blocked,
+			Severity:      "INFO",
+		}
+		if blocked {
+			row.Severity = "HIGH"
+		}
+		if err := store.InsertNetworkEgressEvent(row); err != nil {
+			t.Fatalf("InsertNetworkEgressEvent: %v", err)
+		}
+	}
+
+	counts, err := store.GetCounts()
+	if err != nil {
+		t.Fatalf("GetCounts: %v", err)
+	}
+	if counts.BlockedEgressCalls != 2 {
+		t.Errorf("BlockedEgressCalls = %d, want 2", counts.BlockedEgressCalls)
+	}
+}
+
+// TestStore_GetCounts_AlertsUseActiveActionableSemantics pins the IPC
+// ActiveAlerts surface to the same semantic queue operators see and can
+// acknowledge. High-severity audit telemetry alone is not an alert.
+func TestStore_GetCounts_AlertsUseActiveActionableSemantics(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	// Unrelated high-severity telemetry must not inflate ActiveAlerts.
+	if err := store.LogEvent(Event{
+		ID:       "unrelated-high",
+		Action:   "guardrail-inspection",
+		Target:   "gpt-5",
+		Severity: "HIGH",
+	}); err != nil {
+		t.Fatalf("LogEvent guardrail: %v", err)
+	}
+
+	// Benign connector-hook row: column=INFO, envelope severity=NONE.
+	// Must NOT count as an alert.
+	if err := store.LogEvent(Event{
+		Action:   "connector-hook",
+		Target:   "PreToolUse",
+		Severity: "INFO",
+		Structured: map[string]any{
+			"schema":   "defenseclaw.hook.v1",
+			"severity": "NONE",
+		},
+	}); err != nil {
+		t.Fatalf("LogEvent hook NONE: %v", err)
+	}
+
+	// Real blocks from hooks remain actionable even though their outer
+	// severity is INFO.
+	if err := store.LogEvent(Event{
+		ID:       "hook-high",
+		Action:   "connector-hook",
+		Target:   "PreToolUse",
+		Severity: "INFO",
+		Details:  "connector=codex action=block mode=action severity=HIGH",
+		Enforced: true,
+		Structured: map[string]any{
+			"schema":   "defenseclaw.hook.v1",
+			"severity": "HIGH",
+			"action":   "block",
+		},
+	}); err != nil {
+		t.Fatalf("LogEvent hook HIGH: %v", err)
+	}
+
+	if err := store.LogEvent(Event{
+		ID:       "hook-critical",
+		Action:   "connector-hook",
+		Target:   "PreToolUse",
+		Severity: "INFO",
+		Details:  "connector=codex action=block mode=action severity=CRITICAL",
+		Enforced: true,
+		Structured: map[string]any{
+			"schema":   "defenseclaw.hook.v1",
+			"severity": "CRITICAL",
+			"action":   "block",
+		},
+	}); err != nil {
+		t.Fatalf("LogEvent hook CRITICAL: %v", err)
+	}
+	if err := store.LogEvent(Event{
+		ID: "legacy-finding", Action: "scan-finding", Target: "skill:test", Severity: "HIGH",
+	}); err != nil {
+		t.Fatalf("LogEvent legacy finding: %v", err)
+	}
+	if err := store.LogEvent(Event{
+		ID: "reviewed-finding", Action: "scan-finding", Target: "skill:reviewed", Severity: "CRITICAL",
+	}); err != nil {
+		t.Fatalf("LogEvent reviewed finding: %v", err)
+	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := store.db.Exec(`INSERT INTO alert_acknowledgement_projection (
+		alert_id, disposition, actor, disposition_at, projection_version,
+		source, source_event_id, updated_at
+	) VALUES ('reviewed-finding', 'dismissed', 'test', ?, 1, 'modern',
+		'receipt-reviewed', ?)`, stamp, stamp); err != nil {
+		t.Fatalf("insert reviewed projection: %v", err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO audit_events (
+		id, timestamp, action, actor, details, severity, bucket, event_name,
+		payload_json
+	) VALUES
+		('canonical-deny', ?, 'enforcement', 'gateway', '', 'INFO',
+		 'enforcement.action', 'action.applied',
+		 '{"defenseclaw.enforcement.effective_action":"deny"}'),
+		('health-error', ?, 'sink-failure', 'gateway', '', 'ERROR',
+		 'platform.health', 'destination.export_failed', '{}'),
+		('detection-only', ?, 'scan-finding', 'scanner', '', 'HIGH',
+		 'security.finding', 'finding.observed',
+		 '{"defenseclaw.finding.tags":["secret","detection-only"]}')`,
+		stamp, stamp, stamp); err != nil {
+		t.Fatalf("insert canonical alert fixtures: %v", err)
+	}
+
+	counts, err := store.GetCounts()
+	if err != nil {
+		t.Fatalf("GetCounts: %v", err)
+	}
+	// Two enforced hooks, one legacy finding, one canonical deny, and one
+	// important health failure. Clean/unrelated/detection-only/reviewed rows
+	// are excluded.
+	if counts.Alerts != 5 {
+		t.Errorf("Alerts = %d, want 5 active actionable alerts", counts.Alerts)
+	}
+}
+
+// --- Logger ---
+
+func TestLogger_LogNetworkEgress(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	logger := NewLogger(store)
+	logger.SetRuntimeV8Emitter(newTestRuntimeV8Emitter(t, store, router.AdmissionOrdinary))
+	ctx := context.Background()
+
+	t.Run("allowed call stored, no alert", func(t *testing.T) {
+		evt := NetworkEgressEvent{
+			Hostname:      "api.example.com",
+			URL:           "https://api.example.com/completions",
+			HTTPMethod:    "POST",
+			Protocol:      "https",
+			PolicyOutcome: "Allowed by pattern: *.example.com",
+			DecisionCode:  "NETWORK_ALLOW_PATTERN",
+		}
+		if err := logger.LogNetworkEgress(ctx, evt); err != nil {
+			t.Fatalf("LogNetworkEgress: %v", err)
+		}
+		rows, err := store.ListNetworkEgressEvents(10, "api.example.com")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("expected 1 egress row, got %d (err=%v)", len(rows), err)
+		}
+		if rows[0].Severity != "INFO" {
+			t.Errorf("severity = %q, want INFO", rows[0].Severity)
+		}
+		events, _ := store.ListEvents(10)
+		for _, a := range events {
+			if a.Action == "network-egress-blocked" {
+				t.Error("unexpected blocked projection for allowed egress call")
+			}
+		}
+	})
+
+	t.Run("blocked call stored and raises alert", func(t *testing.T) {
+		evt := NetworkEgressEvent{
+			Hostname:      "exfil.bad",
+			URL:           "http://exfil.bad/upload",
+			HTTPMethod:    "PUT",
+			Protocol:      "http",
+			PolicyOutcome: "Denied: hostname on deny list",
+			DecisionCode:  "NETWORK_DENY_PATTERN",
+			Blocked:       true,
+		}
+		if err := logger.LogNetworkEgress(ctx, evt); err != nil {
+			t.Fatalf("LogNetworkEgress: %v", err)
+		}
+		rows, err := store.ListNetworkEgressEvents(10, "exfil.bad")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("expected 1 egress row, got %d (err=%v)", len(rows), err)
+		}
+		if rows[0].Severity != "HIGH" {
+			t.Errorf("severity = %q, want HIGH", rows[0].Severity)
+		}
+		events, _ := store.ListEvents(10)
+		var found bool
+		for _, a := range events {
+			if a.Action == "network-egress-blocked" && a.Structured["defenseclaw.network.target_ref"] == "exfil.bad" {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("expected a canonical network-egress-blocked event-history projection")
+		}
+	})
+
+	t.Run("validation error propagates", func(t *testing.T) {
+		err := logger.LogNetworkEgress(ctx, NetworkEgressEvent{Hostname: "", PolicyOutcome: "x"})
+		if err == nil {
+			t.Error("expected validation error for empty hostname")
+		}
+	})
+
+	t.Run("url truncated to 512 bytes", func(t *testing.T) {
+		long := "https://api.example.com/" + string(make([]byte, 600))
+		if err := logger.LogNetworkEgress(ctx, NetworkEgressEvent{
+			Hostname:      "api.example.com",
+			URL:           long,
+			PolicyOutcome: "Allowed",
+		}); err != nil {
+			t.Fatalf("LogNetworkEgress: %v", err)
+		}
+		rows, _ := store.QueryNetworkEgressEvents(NetworkEgressFilter{Hostname: "api.example.com"})
+		for _, r := range rows {
+			if len(r.URL) > 512 {
+				t.Errorf("URL not truncated: len=%d", len(r.URL))
+			}
+		}
+	})
+
+	t.Run("timestamp defaults to now when zero", func(t *testing.T) {
+		before := time.Now().UTC().Add(-time.Second)
+		if err := logger.LogNetworkEgress(ctx, NetworkEgressEvent{
+			Hostname:      "ts.example.com",
+			PolicyOutcome: "ok",
+		}); err != nil {
+			t.Fatalf("LogNetworkEgress: %v", err)
+		}
+		rows, _ := store.ListNetworkEgressEvents(1, "ts.example.com")
+		if len(rows) == 0 {
+			t.Fatal("expected 1 row")
+		}
+		if rows[0].Timestamp.Before(before) {
+			t.Errorf("timestamp %v is before expected floor %v", rows[0].Timestamp, before)
+		}
+	})
+}
+
+func TestLogger_LogNetworkEgress_BlockedProjectionHasDefaultsWithoutLegacyFanout(t *testing.T) {
+	t.Setenv("DEFENSECLAW_RUN_ID", "network-egress-run")
+
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	logger := NewLogger(store)
+	logger.SetRuntimeV8Emitter(newTestRuntimeV8Emitter(t, store, router.AdmissionOrdinary))
+
+	err := logger.LogNetworkEgress(context.Background(), NetworkEgressEvent{
+		Hostname:      "blocked.example",
+		URL:           "https://blocked.example/upload",
+		HTTPMethod:    "POST",
+		Protocol:      "https",
+		PolicyOutcome: "Denied: hostname on deny list",
+		DecisionCode:  "NETWORK_DENY_PATTERN",
+		Blocked:       true,
+	})
+	if err != nil {
+		t.Fatalf("LogNetworkEgress: %v", err)
+	}
+
+	events, listErr := store.ListEvents(10)
+	if listErr != nil || len(events) != 1 || events[0].Action != "network-egress-blocked" ||
+		events[0].Structured["defenseclaw.network.target_ref"] != "blocked.example" ||
+		events[0].ID == "" || events[0].RunID == "" || events[0].Actor == "" {
+		t.Fatalf("local canonical projection = %#v error=%v", events, listErr)
+	}
+}
+
+func TestAgent360NetworkEgressMigrationUpgradesAlreadyMigratedDatabase(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pre-agent360.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at DATETIME NOT NULL);
+		CREATE TABLE network_egress_events (
+			id TEXT PRIMARY KEY, timestamp DATETIME NOT NULL, session_id TEXT,
+			connector TEXT, agent_id TEXT, agent_lifecycle_id TEXT,
+			agent_execution_id TEXT, user_id TEXT, tool_id TEXT,
+			hostname TEXT NOT NULL, url TEXT, http_method TEXT, protocol TEXT,
+			policy_outcome TEXT NOT NULL, decision_code TEXT, blocked INTEGER NOT NULL DEFAULT 0,
+			severity TEXT NOT NULL DEFAULT 'INFO', details TEXT
+		)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent360Version := 0
+	for index, candidate := range migrations {
+		if candidate.description == "agent360: correlate network egress with root agent, parent agent, and root session" {
+			agent360Version = index + 1
+			break
+		}
+	}
+	if agent360Version == 0 {
+		t.Fatal("agent360 migration not found")
+	}
+	for version := 1; version < agent360Version; version++ {
+		if _, err := db.Exec(`INSERT INTO schema_version(version, applied_at) VALUES (?, CURRENT_TIMESTAMP)`, version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// This is deliberately a table-scoped component fixture, not a production
+	// audit database. Apply the migration under test directly; Store.Init now
+	// enforces the mandatory v8 audit_events readiness anchor and correctly
+	// rejects partial schemas.
+	if err := store.applyMigration(agent360Version, migrations[agent360Version-1]); err != nil {
+		t.Fatalf("apply agent360 upgrade: %v", err)
+	}
+	for _, column := range []string{"root_agent_id", "parent_agent_id", "root_session_id"} {
+		exists, err := store.hasColumn("network_egress_events", column)
+		if err != nil || !exists {
+			t.Fatalf("column %s after upgrade: exists=%v err=%v", column, exists, err)
+		}
+	}
+	if err := store.InsertNetworkEgressEvent(NetworkEgressRow{
+		SessionID: "child-session", AgentID: "child", RootAgentID: "root",
+		ParentAgentID: "root", RootSessionID: "root-session",
+		Hostname: "example.com", PolicyOutcome: "allowed",
+	}); err != nil {
+		t.Fatalf("insert correlated egress after upgrade: %v", err)
+	}
+}

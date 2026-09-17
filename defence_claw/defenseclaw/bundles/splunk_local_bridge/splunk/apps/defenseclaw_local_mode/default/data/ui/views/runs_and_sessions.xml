@@ -1,0 +1,200 @@
+<form version="1.1">
+  <label>Runs And Sessions</label>
+  <description>Primary run and session investigation workbench for the seeded security-operations slice.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="dropdown" token="risk_state" searchWhenChanged="true">
+      <label>Candidate risk state</label>
+      <choice value="*">All candidates</choice>
+      <choice value="needs_review">Needs review</choice>
+      <choice value="risky">Risky</choice>
+      <choice value="critical">Critical</choice>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+    <input type="text" token="run_id" searchWhenChanged="true">
+      <label>run_id</label>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+    <input type="text" token="session_id" searchWhenChanged="true">
+      <label>session_id</label>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <html>
+        <h2>Run and session investigation workbench</h2>
+        <p>This is the primary investigation surface for the seeded DefenseClaw + OpenClaw security-operations slice. Start with the candidate queue, pick one run or session, and then inspect the correlated policy, runtime, diagnostics, usage, and trace evidence for that investigation.</p>
+        <p>The workbench stays narrow on purpose: the seeded contract is detect, explain, investigate, and recommend the next useful check. It does not imply automated response or unsupported enrichment domains.</p>
+      </html>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Candidate investigations</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_candidates($run_id|s$,$session_id|s$,$risk_state|s$)` | table run_id session_id risk_state risk_reason deny_count runtime_error_count session_stuck_count session_retried_count queue_pressure_count max_cost_usd max_duration_ms last_seen</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <set token="run_id">$row.run_id$</set>
+          <set token="session_id">$row.session_id$</set>
+          <set token="risk_state">$row.risk_state$</set>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Summary header</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_summary($run_id|s$,$session_id|s$,$risk_state|s$)` | eval selected_investigation=run_id . " / " . session_id | table selected_investigation risk_state_label risk_reason first_seen last_seen deny_count runtime_error_count session_stuck_count session_retried_count queue_pressure_count max_cost_usd max_duration_ms risk_rule_ids</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">1</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=all</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Policy decision summary</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_policy_summary($run_id|s$,$session_id|s$)` | table run_id session_id action status severity policy_event_count policy_ids dispositions reasons actors targets</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">15</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=policy</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Correlated event timeline</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_timeline($run_id|s$,$session_id|s$)` | table timestamp evidence_family event_type component action status severity actor target message request_id trace_id</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">25</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=event_type:$row.event_type$</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Runtime evidence</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_runtime_evidence($run_id|s$,$session_id|s$)` | table timestamp event_type component action status severity target error_code request_id trace_id message details</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=runtime</link>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Diagnostics and health</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_diagnostics_health($run_id|s$,$session_id|s$)` | table timestamp event_type component action status severity target queue_name retry_count health_state wait_ms queue_depth message details</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=diagnostics</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Metrics and cost</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_metrics_cost($run_id|s$,$session_id|s$)` | table run_id session_id session_key max_cost_usd max_duration_ms total_tokens providers models usage_event_types</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=usage</link>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Usage evidence</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_usage_evidence($run_id|s$,$session_id|s$)` | table timestamp event_type provider model cost token_count duration_ms metric_name metric_value status severity message</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=usage</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Trace panel</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_trace_spans($run_id|s$,$session_id|s$)` | table timestamp trace_id span_id parent_span_id span_name duration_ms status component message</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=trace</link>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Recommendations</title>
+      <table>
+        <search>
+          <query>`dcso_workbench_recommendations($run_id|s$,$session_id|s$)` | table recommendation_key why next_check search_target pivot_target operator_action</query>
+          <earliest>-24h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">15</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_self">/app/defenseclaw_local_mode/search_and_drilldown?form.run_id=$run_id$&amp;form.session_id=$session_id$&amp;form.pivot=$row.pivot_target$</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+</form>

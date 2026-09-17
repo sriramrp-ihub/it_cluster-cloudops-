@@ -1,0 +1,4292 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package inventory
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
+
+	"github.com/defenseclaw/defenseclaw/internal/config"
+	"github.com/defenseclaw/defenseclaw/internal/enforce"
+	"github.com/defenseclaw/defenseclaw/internal/inventory/lockparse"
+	"github.com/defenseclaw/defenseclaw/internal/managed"
+	"github.com/defenseclaw/defenseclaw/internal/safefile"
+	"github.com/defenseclaw/defenseclaw/internal/telemetry"
+)
+
+const (
+	SignalSupportedConnector = "supported_connector"
+	SignalAICLI              = "ai_cli"
+	SignalActiveProcess      = "active_process"
+	SignalEditorExtension    = "editor_extension"
+	SignalMCPServer          = "mcp_server"
+	SignalSkill              = "skill"
+	SignalRule               = "rule"
+	SignalPlugin             = "plugin"
+	SignalPackageDependency  = "package_dependency"
+	SignalEnvVarName         = "env_var_name"
+	SignalShellHistoryMatch  = "shell_history_match"
+	SignalProviderDomain     = "provider_domain"
+	SignalWorkspaceArtifact  = "workspace_artifact"
+	SignalDesktopApp         = "desktop_app"
+	SignalLocalAIEndpoint    = "local_ai_endpoint"
+	SignalLocalModel         = "local_model"
+)
+
+const (
+	AIStateNew     = "new"
+	AIStateSeen    = "seen"
+	AIStateChanged = "changed"
+	AIStateGone    = "gone"
+
+	maxIndeterminateModelAPIMisses   = 1
+	maxPersistedLocalModelAPISignals = 2 * maxLocalModelAPIItems
+)
+
+// aiDiscoveryStateVersion is the schema version of the on-disk state file
+// (`ai_discovery_state.json`). v2 introduced per-signal `evidence_hash`,
+// `evidence`, `last_active_at`, `component`, and `runtime` so that:
+//
+//   - `Changed` detection survives sidecar restarts (v1 stripped
+//     EvidenceHash via `json:"-"`, so every signal looked "changed"
+//     after Load());
+//   - non-process detectors can carry a separate "last invoked" timestamp
+//     independent of "last scanned and still matched";
+//   - the package_manifest detector can promote the catch-all
+//     `ai-sdks` signature into per-component (e.g. openai==1.45.0) rows
+//     without dropping data on restart.
+//
+// v1 state files are migrated transparently on Load() — old entries land
+// in v2 with empty EvidenceHash, which makes the first post-upgrade scan
+// behave like a `seen` (we explicitly skip the `!=` comparison when the
+// stored hash is empty so an upgrade does not produce a flood of
+// `changed` events the operator never asked for).
+const aiDiscoveryStateVersion = 2
+
+var allowedAISignalCategories = map[string]bool{
+	SignalSupportedConnector: true,
+	SignalAICLI:              true,
+	SignalActiveProcess:      true,
+	SignalEditorExtension:    true,
+	SignalMCPServer:          true,
+	SignalSkill:              true,
+	SignalRule:               true,
+	SignalPlugin:             true,
+	SignalPackageDependency:  true,
+	SignalEnvVarName:         true,
+	SignalShellHistoryMatch:  true,
+	SignalProviderDomain:     true,
+	SignalWorkspaceArtifact:  true,
+	SignalDesktopApp:         true,
+	SignalLocalAIEndpoint:    true,
+	SignalLocalModel:         true,
+}
+
+// AIDiscoveryOptions is the sidecar-local runtime view of config.AIDiscoveryConfig.
+type AIDiscoveryOptions struct {
+	Enabled                     bool
+	Mode                        string
+	ScanInterval                time.Duration
+	ProcessInterval             time.Duration
+	ScanRoots                   []string
+	SignaturePacks              []string
+	AllowWorkspaceSignatures    bool
+	DisabledSignatureIDs        []string
+	IncludeShellHistory         bool
+	IncludePackageManifests     bool
+	IncludeEnvVarNames          bool
+	IncludeNetworkDomains       bool
+	LookupModelProvenanceOnline bool
+	MaxFilesPerScan             int
+	MaxFileBytes                int64
+	StoreRawLocalPaths          bool
+	ConfidencePolicyPath        string
+	RequireTrustedBinaryPaths   bool
+	TrustedBinaryPrefixes       []string
+	// DisableRedaction mirrors config.Privacy.DisableRedaction. When
+	// true, on-the-wire AIDiscovery payloads (gateway events, OTel
+	// logs) carry full Evidence rows including the raw_path field
+	// (raw_path further requires StoreRawLocalPaths). When false (the
+	// default), evidence is sanitized before leaving this process so
+	// remote sinks never see local filesystem paths or unhashed
+	// values.
+	DisableRedaction bool
+	DataDir          string
+	HomeDir          string
+	// HomeDirs is the full set of user homes to walk for per-user
+	// detectors (editor_extension, mcp_server, config paths, shell
+	// history, applications). When empty, detectors fall back to
+	// HomeDir. In managed_enterprise the packaging layer populates
+	// this from the enumerator's eligible-users pass so a root-launched
+	// daemon does not silently miss every human user's dotfiles.
+	// HomeDir is kept for backward compatibility and continues to
+	// anchor "~" expansion in candidate paths.
+	HomeDirs []string
+	// ManagedEnterprise mirrors deployment_mode == managed_enterprise. It
+	// controls only the managed endpoint-inventory callback; canonical v8
+	// telemetry remains owned by the bound observability runtime.
+	ManagedEnterprise bool
+}
+
+// AIEvidence is an internal normalized evidence record. RawPath is never
+// exported outside the local state file, and only when StoreRawLocalPaths is
+// explicitly enabled.
+//
+// Quality and MatchKind are inputs to the Bayesian confidence engine in
+// confidence.go: each detector's likelihood-ratio contribution is
+// exponentiated by `Quality * signature.Specificity` (and additionally
+// by a recency factor for presence). A `Quality=1.0, MatchKind="exact"`
+// observation contributes the full LR; `Quality=0.4, MatchKind="heuristic"`
+// is treated as substantially weaker evidence per row even though the
+// detector class is the same. Populated by the detector that produced the
+// evidence; the engine treats missing values as Quality=1.0,
+// MatchKind="exact" so legacy detectors that have not been migrated keep
+// their pre-engine semantics.
+type AIEvidence struct {
+	Type          string  `json:"type"`
+	Basename      string  `json:"basename,omitempty"`
+	PathHash      string  `json:"path_hash,omitempty"`
+	ValueHash     string  `json:"value_hash,omitempty"`
+	WorkspaceHash string  `json:"workspace_hash,omitempty"`
+	RawPath       string  `json:"raw_path,omitempty"`
+	Quality       float64 `json:"quality,omitempty"`    // 0..1, default 1.0 when unset (defaultEvidenceQuality)
+	MatchKind     string  `json:"match_kind,omitempty"` // exact | substring | heuristic; engine reads to weight contributions
+	// Origin distinguishes vendor-managed bundled entries from
+	// user-installed ones. Emitted for skill/plugin item rows so
+	// downstream mutation surfaces (block, disable, quarantine) can
+	// hard-refuse any action targeting a bundled entry — a vendor
+	// component the operator cannot restore. Empty means the walker
+	// did not classify this row; callers of mutation APIs MUST treat
+	// missing origin as non-actionable (fail-safe), not as user-owned.
+	// Values: "user" | "bundled".
+	Origin string `json:"origin,omitempty"`
+	// Bundled is a convenience boolean derived from Origin so wire
+	// consumers that only want a yes/no gate don't have to string-match.
+	// Kept in sync with Origin at emit time; either both are set or
+	// both are absent.
+	Bundled bool `json:"bundled,omitempty"`
+}
+
+// Match-kind constants. Stamped by detectors so the confidence engine
+// (and audit log readers) can reason about why we trusted this row.
+const (
+	MatchKindExact     = "exact"
+	MatchKindSubstring = "substring"
+	MatchKindHeuristic = "heuristic"
+)
+
+// defaultEvidenceQuality is what the confidence engine assumes when a
+// detector did not stamp a Quality value (zero-valued field on the
+// struct). Pinning the default to 1.0 means legacy detectors get the
+// same per-observation weight they always had; new detectors must
+// explicitly downgrade their evidence quality if it is weak.
+const defaultEvidenceQuality = 1.0
+
+// AIComponent is the high-fidelity identifier for a specific SDK / framework
+// / package surfaced by a signal. The catch-all "AI SDKs / Multiple"
+// signature historically hid which package matched (`openai` vs `langchain`
+// vs `llama-index` …); when a signature pack declares `components` and the
+// matched value resolves to one, the detector now stamps that resolved
+// identity here. Consumers can pivot on `(Ecosystem, Name, Version)` to
+// answer "do we have openai==1.45.0 anywhere?" without scraping prose.
+type AIComponent struct {
+	Ecosystem string `json:"ecosystem,omitempty"` // pypi | npm | cargo | go | dotnet | rubygems | maven | gradle | …
+	Name      string `json:"name,omitempty"`      // e.g. "openai", "@anthropic-ai/sdk"
+	Version   string `json:"version,omitempty"`   // populated when a co-located lockfile is parsed
+	Framework string `json:"framework,omitempty"` // human-readable framework label, e.g. "OpenAI Python SDK"
+}
+
+// ProcessRuntime is the per-process liveness block emitted only by the
+// `process` detector. It intentionally never carries the full argv (which
+// can contain secrets, prompts, or workspace paths) — that surface is
+// gated behind the existing `StoreRawLocalPaths` privacy switch via
+// per-evidence raw paths, not here.
+type ProcessRuntime struct {
+	PID       int        `json:"pid"`
+	PPID      int        `json:"ppid,omitempty"`
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	UptimeSec int64      `json:"uptime_sec,omitempty"`
+	User      string     `json:"user,omitempty"`
+	Comm      string     `json:"comm,omitempty"`
+}
+
+// LocalModelInfo describes one model observed through a vetted local-server
+// metadata endpoint or as an on-disk model artifact. Model IDs deliberately
+// live outside Product and AIComponent: both of those fields are used as OTel
+// metric labels, while model names are user-controlled and effectively
+// unbounded. Keeping the identity in this dedicated block makes it available
+// to local API/CLI/TUI consumers without creating a high-cardinality metric.
+type LocalModelInfo struct {
+	ID                  string                `json:"id"`
+	Status              string                `json:"status"` // installed | loaded
+	Format              string                `json:"format,omitempty"`
+	Provider            string                `json:"provider,omitempty"`
+	Recipe              string                `json:"recipe,omitempty"`
+	Modality            string                `json:"modality,omitempty"`
+	Device              string                `json:"device,omitempty"`
+	SizeBytes           int64                 `json:"size_bytes,omitempty"`
+	Pinned              bool                  `json:"pinned,omitempty"`
+	OwnerApplication    string                `json:"owner_application,omitempty"`
+	Relevance           string                `json:"relevance,omitempty"`
+	DiscoveryConfidence *float64              `json:"discovery_confidence,omitempty"`
+	Provenance          *LocalModelProvenance `json:"provenance,omitempty"`
+	// huggingFaceRepoIDs contains repository identifiers copied directly from
+	// trusted local metadata surfaces (for example a Hugging Face cache path or
+	// an embedded GGUF base-model record). It is deliberately never serialized:
+	// the list exists only long enough for an explicitly enabled Hub lookup and
+	// prevents a catalog-family guess derived from a private filename from
+	// becoming an outbound request.
+	huggingFaceRepoIDs []string
+}
+
+// LocalModelProvenance is bounded, deterministic lineage metadata derived
+// from local model metadata and the embedded publisher catalog. CountryCode
+// is the publisher's ISO 3166-1 alpha-2 code; presentation layers derive the
+// flag emoji so the wire format has one canonical country representation.
+//
+// Quantized and Distilled are pointers on purpose: nil means "unknown", while
+// false is reserved for metadata that positively identifies an original,
+// non-derived artifact. This prevents an absent hint from becoming a false
+// provenance claim.
+type LocalModelProvenance struct {
+	Publisher    string   `json:"publisher,omitempty"`
+	CountryCode  string   `json:"country_code,omitempty"`
+	RootModel    string   `json:"root_model,omitempty"`
+	BaseModels   []string `json:"base_models,omitempty"`
+	Quantized    *bool    `json:"quantized,omitempty"`
+	Quantization string   `json:"quantization,omitempty"`
+	Distilled    *bool    `json:"distilled,omitempty"`
+	Derivation   string   `json:"derivation,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	Confidence   string   `json:"confidence,omitempty"`
+}
+
+// AISignal is the sanitized signal shape returned by API responses and used
+// in gateway/OTel telemetry. It carries hashes and basenames, never raw file
+// paths, command lines, prompt text, or secret values (unless the operator
+// has explicitly opted into `StoreRawLocalPaths`).
+//
+// The `Component`, `Model`, and `Runtime` blocks are nil-omitted: only
+// detectors that actually have framework, local-model, or liveness fidelity
+// populate them (today: `package_manifest` for components, local model API /
+// artifact detectors for models, and process/model-runtime detectors for
+// runtimes).
+// `LastActiveAt` is a separate timestamp from `LastSeen` so consumers
+// can distinguish "we scanned and the signature still exists on disk"
+// (`LastSeen`) from "the underlying thing was running / used since the
+// previous scan" (`LastActiveAt`).
+type AISignal struct {
+	Fingerprint        string          `json:"fingerprint"`
+	SignalID           string          `json:"signal_id"`
+	SignatureID        string          `json:"signature_id"`
+	Name               string          `json:"name"`
+	Vendor             string          `json:"vendor"`
+	Product            string          `json:"product"`
+	Category           string          `json:"category"`
+	SupportedConnector string          `json:"supported_connector,omitempty"`
+	Confidence         float64         `json:"confidence"`
+	State              string          `json:"state"`
+	Detector           string          `json:"detector"`
+	Source             string          `json:"source"`
+	EvidenceTypes      []string        `json:"evidence_types,omitempty"`
+	PathHashes         []string        `json:"path_hashes,omitempty"`
+	Basenames          []string        `json:"basenames,omitempty"`
+	WorkspaceHash      string          `json:"workspace_hash,omitempty"`
+	Version            string          `json:"version,omitempty"`
+	Component          *AIComponent    `json:"component,omitempty"`
+	Model              *LocalModelInfo `json:"model,omitempty"`
+	Runtime            *ProcessRuntime `json:"runtime,omitempty"`
+	FirstSeen          time.Time       `json:"first_seen"`
+	LastSeen           time.Time       `json:"last_seen"`
+	LastActiveAt       *time.Time      `json:"last_active_at,omitempty"`
+	EvidenceHash       string          `json:"-"`
+	// ModelProvenanceHubResolvedAt is an internal freshness marker for optional
+	// Hub enrichment. It is mirrored by aiStoredSignal but never returned by the
+	// API or sent to telemetry sinks.
+	ModelProvenanceHubResolvedAt time.Time `json:"-"`
+	// ModelProvenanceHubHash participates in lifecycle classification without
+	// changing detector EvidenceHash. This lets late, rotating Hub enrichment
+	// emit one `changed` event to gateway/OTel consumers while keeping detector
+	// evidence semantics stable.
+	ModelProvenanceHubHash string `json:"-"`
+	// ModelAPISourceHash is an internal, privacy-preserving origin key used
+	// to apply lifecycle decisions only to the exact local server that was
+	// conclusively inventoried. It is persisted via aiStoredSignal but never
+	// returned by the API or emitted to remote sinks.
+	ModelAPISourceHash string `json:"-"`
+	// Identity / Presence are populated by
+	// EnrichSignalsWithComponentConfidence() at API-response time
+	// (NOT during scan/persist). They mirror the per-component
+	// scores `/api/v1/ai-usage/components` returns so the CLI's
+	// `agent usage --detail` view can render the same numbers
+	// without a second round-trip. Signals without a Component
+	// block (catch-all process / shell-history rows) leave the
+	// fields zero; `omitempty` keeps them off the wire so older
+	// API consumers that don't know about the fields don't see
+	// noisy nulls. Persistence (`aiStoredSignal`) ignores these
+	// fields too -- they're recomputed on every API call from the
+	// authoritative confidence engine.
+	IdentityScore float64 `json:"identity_score,omitempty"`
+	IdentityBand  string  `json:"identity_band,omitempty"`
+	PresenceScore float64 `json:"presence_score,omitempty"`
+	PresenceBand  string  `json:"presence_band,omitempty"`
+	// Evidence is the per-row breakdown that the confidence engine
+	// and the gateway components endpoint consume. It ships on the
+	// wire so remote destinations and webhooks can render the same "what we
+	// saw" view the operator gets locally. RawPath is always scrubbed by
+	// SanitizeEvidenceForWire; size is bounded by maxEvidencePerSignal so a
+	// hostile pack cannot blow up payload size.
+	Evidence []AIEvidence `json:"evidence,omitempty"`
+	// Partial reports that the evidence rows do not cover everything
+	// the detector saw. Set to true when a per-signal cap was hit, a
+	// read failed on a subtree, a permission bit prevented full
+	// enumeration, or a config parser reported malformed input. Any
+	// consumer that promises "authoritative snapshot" must fail-close
+	// on Partial=true — the operator's view is incomplete. Absent /
+	// false means "everything the detector could see is present".
+	Partial bool `json:"partial,omitempty"`
+	// CoverageReason names WHY the snapshot is partial. Enumerated so
+	// downstream consumers can route diagnostics: cap_exceeded (bump
+	// the cap or page), permission_denied (chown / rerun as owner),
+	// read_error (transient / rescan), parse_error (config invalid;
+	// rescan won't help). Empty when Partial=false. Kept as a stable
+	// string so telemetry destinations can pivot on it without
+	// pattern-matching prose.
+	CoverageReason string `json:"coverage_reason,omitempty"`
+}
+
+// Coverage-reason enum. Kept in sync with the schema documented in
+// schemas/telemetry/v8/operations.yaml (see the v8 telemetry spec
+// update landed with the v8-only managed-egress refactor). Consumers
+// that see an unknown value MUST NOT treat the snapshot as complete —
+// unknown reasons are still reasons.
+const (
+	CoverageReasonCapExceeded      = "cap_exceeded"
+	CoverageReasonReadError        = "read_error"
+	CoverageReasonPermissionDenied = "permission_denied"
+	CoverageReasonParseError       = "parse_error"
+)
+
+// maxEvidencePerSignal caps the number of evidence rows the engine
+// will accept on a single signal. The bound is generous (manifests
+// + lockfiles + version pins for one component rarely produce more
+// than a dozen rows in practice) but it is finite so a malicious
+// pack cannot DOS the gateway or the SQLite store via a single
+// pathological signal.
+const maxEvidencePerSignal = 32
+
+type AIDiscoverySummary struct {
+	ScanID            string            `json:"scan_id"`
+	ScannedAt         time.Time         `json:"scanned_at"`
+	DurationMs        int64             `json:"duration_ms"`
+	PrivacyMode       string            `json:"privacy_mode"`
+	Source            string            `json:"source"`
+	Result            string            `json:"result"`
+	TotalSignals      int               `json:"total_signals"`
+	ActiveSignals     int               `json:"active_signals"`
+	NewSignals        int               `json:"new_signals"`
+	ChangedSignals    int               `json:"changed_signals"`
+	GoneSignals       int               `json:"gone_signals"`
+	FilesScanned      int               `json:"files_scanned"`
+	DedupeSuppressed  int               `json:"dedupe_suppressed"`
+	Errors            int               `json:"errors"`
+	DetectorErrors    map[string]string `json:"detector_errors,omitempty"`
+	DetectorDurations map[string]int    `json:"detector_durations_ms,omitempty"`
+}
+
+type AIDiscoveryReport struct {
+	Summary AIDiscoverySummary `json:"summary"`
+	Signals []AISignal         `json:"signals"`
+}
+
+// AIDiscoveryReportObserver receives a clone of each completed discovery
+// report after the service has persisted state and emitted telemetry/events.
+type AIDiscoveryReportObserver func(context.Context, AIDiscoveryReport)
+
+// aiStoredSignal is the on-disk shape persisted under the data dir's
+// `ai_discovery_state.json`. v2 added `StoredEvidenceHash` and
+// `StoredEvidence` because `AISignal.{EvidenceHash,Evidence}` are
+// `json:"-"` (kept out of API responses for privacy reasons), but we
+// MUST persist the hash to make `Changed` detection survive restarts.
+//
+// The `Stored…` fields mirror the in-memory `AISignal` fields rather
+// than dropping the `json:"-"` tag, so the public API contract on
+// `AISignal` is unchanged: API consumers still never see the raw
+// per-evidence blob.
+type aiStoredSignal struct {
+	AISignal
+	RawPaths                           []string     `json:"raw_paths,omitempty"`
+	StoredEvidenceHash                 string       `json:"evidence_hash,omitempty"`
+	StoredEvidence                     []AIEvidence `json:"evidence,omitempty"`
+	StoredModelAPISourceHash           string       `json:"model_api_source_hash,omitempty"`
+	StoredModelProvenanceHubResolvedAt *time.Time   `json:"model_provenance_hub_resolved_at,omitempty"`
+	StoredModelProvenanceHubHash       string       `json:"model_provenance_hub_hash,omitempty"`
+	// ModelAPIMisses provides one-scan hysteresis for model inventory read
+	// failures. A valid empty provider response is still conclusive and marks
+	// the old model gone immediately; an unreachable/malformed provider gets
+	// one grace scan so a transient restart does not flap seen -> gone -> new.
+	ModelAPIMisses int `json:"model_api_misses,omitempty"`
+}
+
+type aiStateFile struct {
+	Version   int                       `json:"version"`
+	UpdatedAt time.Time                 `json:"updated_at"`
+	Signals   map[string]aiStoredSignal `json:"signals"`
+}
+
+type aiDiscoveryLifecycleState uint8
+
+const (
+	aiDiscoveryPrepared aiDiscoveryLifecycleState = iota
+	aiDiscoveryClaimed
+	aiDiscoveryRunning
+	aiDiscoveryClosed
+)
+
+// ContinuousDiscoveryService owns device-level AI visibility. It is deliberately
+// sidecar-scoped so CLI/TUI/API callers all see the same state and OTel fanout.
+type ContinuousDiscoveryService struct {
+	opts    AIDiscoveryOptions
+	catalog []AISignature
+	store   *AIStateStore
+	// lifecycleMu makes claiming Run and retiring a prepared-but-never-run
+	// service atomic. Sidecar config reload uses this to close an intermediate
+	// generation that was superseded before the restart worker could run it,
+	// without ever closing a service that has already been claimed.
+	lifecycleMu    sync.Mutex
+	lifecycleState aiDiscoveryLifecycleState
+	// invStore is the optional SQLite-backed history. It is created
+	// during NewContinuousDiscoveryServiceWithOptions when the data
+	// dir is writable. When nil (open failed, disk full, etc.) the
+	// service degrades to "current snapshot only" -- the JSON state
+	// file remains the authoritative current view, and only history
+	// queries are disabled.
+	invStore         *InventoryStore
+	confidenceParams ConfidenceParams
+
+	mu              sync.RWMutex
+	last            AIDiscoveryReport
+	lastErr         error
+	triggers        chan chan scanResponse
+	observerMu      sync.RWMutex
+	reportObservers []AIDiscoveryReportObserver
+	// managedInventoryEmit is the sidecar-owned connector/MCP snapshot hook.
+	// It is kept independent from canonical discovery telemetry so the v8
+	// runtime remains the sole owner of signal records.
+	managedInventoryEmitMu sync.RWMutex
+	managedInventoryEmit   func(context.Context)
+	// modelAPIProbeCursor rotates origins and catalogs across bounded passes so
+	// a stalled or over-cap loopback provider cannot starve later providers.
+	modelAPIProbeCursor  atomic.Uint64
+	modelAPIItemCursorMu sync.Mutex
+	modelAPIItemCursors  map[string]int
+	modelAPICycleMu      sync.Mutex
+	modelAPICycles       map[string]*localModelAPICycle
+	// modelFileRootCursor rotates the first filesystem root. A busy cache can
+	// otherwise consume the global match budget on every pass and permanently
+	// starve later Ollama, LM Studio, MLX, or configured roots.
+	modelFileRootCursor atomic.Uint64
+	modelFileCursorMu   sync.Mutex
+	modelFileCursors    map[string]string
+	modelFileCycleMu    sync.Mutex
+	modelFileCycles     map[string]*modelFileCycle
+	// modelProvenanceHub exists only after the operator explicitly opts in to
+	// public model-card lookups. The cursor rotates the bounded online page so
+	// inventories larger than one request budget make progress across scans.
+	modelProvenanceHub       *huggingFaceProvenanceResolver
+	modelProvenanceHubCursor atomic.Uint64
+
+	// scanMu serializes runScan invocations so the scheduled-tick
+	// path, the process-tick path, and the API-triggered ScanNow
+	// path cannot race on the state store / detector fanout.
+	//
+	// Without this guard, ScanNow's `default:` branch (taken when
+	// the triggers channel is full) would execute runScan directly
+	// and concurrently with whichever ticker also fired, producing:
+	//
+	//   1. classifyAndPersist racing on the same prev snapshot —
+	//      two goroutines compute different `new`/`gone` deltas
+	//      from divergent baselines, emit conflicting events, and
+	//      the second store.Save overwrites the first;
+	//
+	//   2. invStore.RecordScan fan-out doubled up, breaking
+	//      history-row uniqueness invariants;
+	//
+	//   3. s.last clobbered non-deterministically (Snapshot()
+	//      callers see whichever scan happened to win the race).
+	//
+	// The mutex is per-service (not global) because the sidecar
+	// only constructs one ContinuousDiscoveryService; if that ever
+	// changes, each instance still gets its own serialization.
+	scanMu sync.Mutex
+
+	observabilityV8Mu sync.RWMutex
+	observabilityV8   AIDiscoveryObservabilityV8
+}
+
+type scanResponse struct {
+	report AIDiscoveryReport
+	err    error
+}
+
+// NewContinuousDiscoveryService builds a sidecar discovery service from the
+// full gateway config. It returns nil when ai_discovery.enabled is false.
+func NewContinuousDiscoveryService(cfg *config.Config) (*ContinuousDiscoveryService, error) {
+	if cfg == nil || !cfg.AIDiscovery.Enabled {
+		return nil, nil
+	}
+	catalog, err := LoadAISignaturesForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	opts := AIDiscoveryOptionsFromConfig(cfg)
+	return NewContinuousDiscoveryServiceWithOptions(opts, catalog), nil
+}
+
+func NewContinuousDiscoveryServiceWithOptions(opts AIDiscoveryOptions, catalog []AISignature, legacy ...any) *ContinuousDiscoveryService {
+	// Historical constructors accepted optional telemetry collaborators. The
+	// v8 runtime binds observability explicitly after construction, but keeping
+	// the optional arguments source-compatible lets older native tests build.
+	_ = legacy
+	opts = normalizeAIDiscoveryOptions(opts)
+	svc := &ContinuousDiscoveryService{
+		opts:     opts,
+		catalog:  catalog,
+		store:    NewAIStateStore(filepath.Join(opts.DataDir, "ai_discovery_state.json")),
+		triggers: make(chan chan scanResponse, 1),
+	}
+	if opts.LookupModelProvenanceOnline {
+		svc.modelProvenanceHub = newHuggingFaceProvenanceResolver()
+	}
+	// Try to open the SQLite history store. Failure is logged but
+	// not fatal -- the service stays functional, only history
+	// queries are disabled.
+	if opts.DataDir != "" {
+		dbPath := filepath.Join(opts.DataDir, "inventory.db")
+		if inv, err := NewInventoryStore(dbPath); err == nil {
+			svc.invStore = inv
+		} else {
+			fmt.Fprintf(os.Stderr, "[ai-discovery] inventory history disabled: %v\n", err)
+		}
+	}
+	// Load the confidence policy. Missing override files fall back
+	// to the embedded default; unreadable or invalid overrides
+	// degrade to defaults with a stderr diagnostic because this
+	// constructor cannot currently return initialization errors.
+	policy, err := LoadConfidencePolicyFromFile(opts.ConfidencePolicyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ai-discovery] confidence policy degraded to defaults: %v\n", err)
+		if fallback, fallbackErr := LoadDefaultConfidencePolicy(); fallbackErr == nil {
+			policy = fallback
+		} else {
+			fmt.Fprintf(os.Stderr, "[ai-discovery] embedded confidence policy failed to load: %v\n", fallbackErr)
+		}
+	}
+	svc.confidenceParams = ConfidenceParams{
+		Policy:               policy,
+		SignatureSpecificity: buildSignatureSpecificityIndex(catalog),
+	}
+	return svc
+}
+
+// buildSignatureSpecificityIndex projects the SignatureID ->
+// Specificity mapping out of a loaded catalog so the confidence
+// engine can honour curator-tuned per-signature specificity. We
+// build it once at constructor time (catalogs are immutable after
+// load) so the hot path doesn't re-scan O(N) signatures per signal.
+// Returns nil when the catalog is empty so resolveSpecificity falls
+// straight through to the heuristic.
+func buildSignatureSpecificityIndex(catalog []AISignature) map[string]float64 {
+	if len(catalog) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(catalog))
+	for _, sig := range catalog {
+		id := strings.TrimSpace(sig.ID)
+		if id == "" || sig.Specificity <= 0 {
+			continue
+		}
+		out[id] = sig.Specificity
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func AIDiscoveryOptionsFromConfig(cfg *config.Config) AIDiscoveryOptions {
+	home, _ := platformDiscoveryHomeDir()
+	ad := cfg.AIDiscovery
+	return normalizeAIDiscoveryOptions(AIDiscoveryOptions{
+		Enabled:                     ad.Enabled,
+		Mode:                        ad.Mode,
+		ScanInterval:                time.Duration(ad.ScanIntervalMin) * time.Minute,
+		ProcessInterval:             time.Duration(ad.ProcessIntervalSec) * time.Second,
+		ScanRoots:                   append([]string{}, ad.ScanRoots...),
+		SignaturePacks:              append([]string{}, ad.SignaturePacks...),
+		AllowWorkspaceSignatures:    ad.AllowWorkspaceSignatures,
+		DisabledSignatureIDs:        append([]string{}, ad.DisabledSignatureIDs...),
+		IncludeShellHistory:         ad.IncludeShellHistory,
+		IncludePackageManifests:     ad.IncludePackageManifests,
+		IncludeEnvVarNames:          ad.IncludeEnvVarNames,
+		IncludeNetworkDomains:       ad.IncludeNetworkDomains,
+		LookupModelProvenanceOnline: ad.LookupModelProvenanceOnline,
+		MaxFilesPerScan:             ad.MaxFilesPerScan,
+		MaxFileBytes:                int64(ad.MaxFileBytes),
+		StoreRawLocalPaths:          ad.StoreRawLocalPaths,
+		ConfidencePolicyPath:        ad.ConfidencePolicyPath,
+		RequireTrustedBinaryPaths:   ad.RequireTrustedBinaryPaths,
+		TrustedBinaryPrefixes:       append([]string{}, ad.TrustedBinaryPrefixes...),
+		// DisableRedaction is left at the zero value here: main's
+		// config.Config has no Privacy subtree yet (cf. the release
+		// branch which added cfg.Privacy.DisableRedaction). When the
+		// redaction subtree lands on main, wire it as
+		// `DisableRedaction: cfg.Privacy.DisableRedaction`.
+		DataDir:           cfg.DataDir,
+		HomeDir:           home,
+		HomeDirs:          append([]string{}, ad.HomeDirs...),
+		ManagedEnterprise: managed.IsManagedEnterprise(cfg.DeploymentMode),
+	})
+}
+
+func normalizeAIDiscoveryOptions(opts AIDiscoveryOptions) AIDiscoveryOptions {
+	if opts.Mode == "" {
+		opts.Mode = "enhanced"
+	}
+	opts.Mode = normalizeAIID(opts.Mode)
+	if opts.ScanInterval <= 0 {
+		opts.ScanInterval = 5 * time.Minute
+	}
+	if opts.ProcessInterval <= 0 {
+		opts.ProcessInterval = 60 * time.Second
+	}
+	// In managed_enterprise every scan tick (full or process-only) fans
+	// out through managedInventoryEmit, so a 60s process interval becomes
+	// a 60s connector/MCP snapshot push to AI Defense. Push volume, not
+	// process-detection cost, dominates the operational spend on managed
+	// installs — align the process cadence with the full-scan cadence so
+	// the two tickers produce one push per 5 min instead of six. Operators
+	// can still configure a longer interval; the floor only lifts values
+	// below the full-scan default.
+	if opts.ManagedEnterprise && opts.ProcessInterval < 5*time.Minute {
+		opts.ProcessInterval = 5 * time.Minute
+	}
+	if opts.MaxFilesPerScan <= 0 {
+		opts.MaxFilesPerScan = 1000
+	}
+	if opts.MaxFileBytes <= 0 {
+		opts.MaxFileBytes = 512 * 1024
+	}
+	if opts.DataDir == "" {
+		opts.DataDir = config.DefaultDataPath()
+	}
+	if opts.ConfidencePolicyPath == "" {
+		opts.ConfidencePolicyPath = filepath.Join(opts.DataDir, "confidence.yaml")
+	}
+	if opts.HomeDir == "" {
+		opts.HomeDir, _ = platformDiscoveryHomeDir()
+	}
+	// Dedupe HomeDirs and ensure HomeDir participates so single-user
+	// installs (unmanaged / dev) keep working without a config change.
+	// Order-preserving so detectors return signals in a stable order
+	// across scans — the ai_discovery state store keys on fingerprint,
+	// but callers that watch the raw output benefit from stability.
+	seenHome := make(map[string]struct{}, len(opts.HomeDirs)+1)
+	deduped := make([]string, 0, len(opts.HomeDirs)+1)
+	if opts.HomeDir != "" {
+		seenHome[opts.HomeDir] = struct{}{}
+		deduped = append(deduped, opts.HomeDir)
+	}
+	for _, h := range opts.HomeDirs {
+		h = strings.TrimRight(strings.TrimSpace(h), string(filepath.Separator))
+		if h == "" {
+			continue
+		}
+		if _, ok := seenHome[h]; ok {
+			continue
+		}
+		seenHome[h] = struct{}{}
+		deduped = append(deduped, h)
+	}
+	opts.HomeDirs = deduped
+	if len(opts.ScanRoots) == 0 && opts.HomeDir != "" {
+		opts.ScanRoots = []string{"~"}
+	}
+	return opts
+}
+
+// ClaimRun reserves this service for exactly one Run invocation. Sidecar calls
+// it while holding the same lock used to swap the current discovery pointer,
+// which closes the snapshot-vs-swap race for coalesced config reloads.
+//
+// The returned runner is itself once-only: duplicate calls wait for and return
+// the first call's result rather than starting a second scan loop.
+func (s *ContinuousDiscoveryService) ClaimRun() (func(context.Context) error, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.lifecycleMu.Lock()
+	if s.lifecycleState != aiDiscoveryPrepared {
+		s.lifecycleMu.Unlock()
+		return nil, false
+	}
+	s.lifecycleState = aiDiscoveryClaimed
+	s.lifecycleMu.Unlock()
+
+	var once sync.Once
+	done := make(chan struct{})
+	var runErr error
+	runner := func(ctx context.Context) error {
+		once.Do(func() {
+			defer close(done)
+			runErr = s.runClaimed(ctx)
+		})
+		<-done
+		return runErr
+	}
+	return runner, true
+}
+
+// CloseIfNeverStarted releases a prepared service that was superseded before
+// the restart worker claimed it. It deliberately refuses claimed/running
+// services; their Run defer remains the sole close boundary.
+func (s *ContinuousDiscoveryService) CloseIfNeverStarted() (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	s.lifecycleMu.Lock()
+	if s.lifecycleState != aiDiscoveryPrepared {
+		s.lifecycleMu.Unlock()
+		return false, nil
+	}
+	s.lifecycleState = aiDiscoveryClosed
+	s.lifecycleMu.Unlock()
+	return true, s.invStore.Close()
+}
+
+// Close releases a service that was prepared for an explicit scan but never
+// claimed by Run. Running services remain owned by their Run lifecycle.
+func (s *ContinuousDiscoveryService) Close() error {
+	closed, err := s.CloseIfNeverStarted()
+	if err != nil {
+		return err
+	}
+	if !closed && s != nil {
+		return errors.New("ai discovery service is running or already closed")
+	}
+	return nil
+}
+
+// homesToScan returns every user home the per-user detectors should
+// walk. Never empty when HomeDir was resolvable (normalizeAIDiscoveryOptions
+// always includes HomeDir in HomeDirs); callers can iterate without a
+// separate fallback.
+func (s *ContinuousDiscoveryService) homesToScan() []string {
+	if s == nil {
+		return nil
+	}
+	if len(s.opts.HomeDirs) > 0 {
+		return s.opts.HomeDirs
+	}
+	if s.opts.HomeDir != "" {
+		return []string{s.opts.HomeDir}
+	}
+	return nil
+}
+
+func (s *ContinuousDiscoveryService) Run(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	runner, ok := s.ClaimRun()
+	if !ok {
+		return errors.New("ai discovery service has already been started or closed")
+	}
+	return runner(ctx)
+}
+
+func (s *ContinuousDiscoveryService) runClaimed(ctx context.Context) (runErr error) {
+	s.lifecycleMu.Lock()
+	if s.lifecycleState != aiDiscoveryClaimed {
+		s.lifecycleMu.Unlock()
+		return errors.New("ai discovery service run was not claimed")
+	}
+	s.lifecycleState = aiDiscoveryRunning
+	s.lifecycleMu.Unlock()
+
+	// The service owns the optional history store for its complete running
+	// lifetime. Close only after the active scan has observed cancellation and
+	// Run is unwinding; config reloads can therefore publish the replacement
+	// service before retiring this one without invalidating in-flight queries.
+	defer func() {
+		closeErr := s.invStore.Close()
+		s.lifecycleMu.Lock()
+		s.lifecycleState = aiDiscoveryClosed
+		s.lifecycleMu.Unlock()
+		if closeErr != nil {
+			wrapped := fmt.Errorf("ai discovery inventory store close: %w", closeErr)
+			if runErr == nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+				runErr = wrapped
+			} else {
+				runErr = errors.Join(runErr, wrapped)
+			}
+		}
+	}()
+	_, _ = s.runScan(ctx, true, "startup")
+
+	fullTicker := time.NewTicker(s.opts.ScanInterval)
+	defer fullTicker.Stop()
+	processTicker := time.NewTicker(s.opts.ProcessInterval)
+	defer processTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-fullTicker.C:
+			_, _ = s.runScan(ctx, true, "scheduled")
+		case <-processTicker.C:
+			_, _ = s.runScan(ctx, false, "process")
+		case resp := <-s.triggers:
+			report, err := s.runScan(ctx, true, "api")
+			resp <- scanResponse{report: report, err: err}
+		}
+	}
+}
+
+func (s *ContinuousDiscoveryService) ScanNow(ctx context.Context) (AIDiscoveryReport, error) {
+	if s == nil {
+		return AIDiscoveryReport{}, errors.New("ai discovery disabled")
+	}
+	resp := make(chan scanResponse, 1)
+	select {
+	case s.triggers <- resp:
+	case <-ctx.Done():
+		return AIDiscoveryReport{}, ctx.Err()
+	default:
+		return s.runScan(ctx, true, "api")
+	}
+	select {
+	case out := <-resp:
+		return out.report, out.err
+	case <-ctx.Done():
+		return AIDiscoveryReport{}, ctx.Err()
+	}
+}
+
+func (s *ContinuousDiscoveryService) Snapshot() AIDiscoveryReport {
+	if s == nil {
+		return AIDiscoveryReport{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneAIDiscoveryReport(s.last)
+}
+
+// LookupModelProvenanceOnline reports the immutable runtime opt-in used by
+// this service generation. Gateway status responses expose this value so an
+// operator can distinguish saved config from the behavior of the running
+// sidecar after a no-restart update or failed restart.
+func (s *ContinuousDiscoveryService) LookupModelProvenanceOnline() bool {
+	return s != nil && s.opts.LookupModelProvenanceOnline
+}
+
+// InventoryStore exposes the optional SQLite history backend so
+// gateway handlers can serve `/components/{ecosystem}/{name}/locations`
+// and `…/history` endpoints. Returns nil when the store could not
+// be opened on this host -- callers must handle that.
+func (s *ContinuousDiscoveryService) InventoryStore() *InventoryStore {
+	if s == nil {
+		return nil
+	}
+	return s.invStore
+}
+
+// ConfidenceParams returns the policy + tunables the engine uses
+// when scoring components. Gateway handlers call ComputeComponentConfidence
+// with this value to get scores for the live snapshot.
+func (s *ContinuousDiscoveryService) ConfidenceParams() ConfidenceParams {
+	if s == nil {
+		return ConfidenceParams{}
+	}
+	return s.confidenceParams
+}
+
+func (s *ContinuousDiscoveryService) LastError() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastErr
+}
+
+// AddReportObserver registers a post-scan observer. Observers are called
+// asynchronously with a cloned report so slow setup/reconcile work cannot
+// block discovery persistence or telemetry fanout.
+func (s *ContinuousDiscoveryService) AddReportObserver(fn AIDiscoveryReportObserver) {
+	if s == nil || fn == nil {
+		return
+	}
+	s.observerMu.Lock()
+	defer s.observerMu.Unlock()
+	s.reportObservers = append(s.reportObservers, fn)
+}
+
+func (s *ContinuousDiscoveryService) runScan(ctx context.Context, full bool, source string) (AIDiscoveryReport, error) {
+	// Single-flight: the scheduled-tick path, the process-tick
+	// path, and the API-triggered ScanNow path can all reach this
+	// function concurrently. Without the mutex, classifyAndPersist
+	// races on the prev snapshot and store.Save (atomic per call,
+	// but two callers can leapfrog with stale data). See the
+	// comment on ContinuousDiscoveryService.scanMu for details.
+	//
+	// We honor ctx.Done() before blocking so a cancelled caller
+	// (e.g. an API request whose client disconnected) returns
+	// promptly instead of queueing behind a slow scheduled scan.
+	if err := ctx.Err(); err != nil {
+		return AIDiscoveryReport{}, err
+	}
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return AIDiscoveryReport{}, err
+	}
+
+	start := time.Now()
+	scanID := newScanID()
+	ctx, scanObservation := s.startScanObservation(ctx, AIDiscoveryV8ScanStart{
+		ScanID: scanID, Source: source, PrivacyMode: s.opts.Mode, StartedAt: start,
+	})
+	defer scanObservation.abort()
+
+	prev, prevErr := s.store.Load()
+	if prevErr != nil {
+		// Loading the previous-scan snapshot is best-effort — a
+		// missing file is the cold-start case (handled inside
+		// Load), an unsupported version (e.g. a forward-rolled
+		// state file) returns an error here and we MUST log it
+		// instead of silently treating the world as new. The
+		// downstream scanSignals call will start with stats.Errors
+		// at zero; we bump it AFTER the scan returns so the regression
+		// is visible on dashboards.
+		fmt.Fprintf(os.Stderr, "[ai-discovery] previous-scan load failed (treating workspace as new): %v\n", prevErr)
+		prev = aiStateFile{}
+	}
+	signals, stats := s.scanSignals(
+		ctx,
+		scanID,
+		scanObservation,
+		full,
+		priorModelAPIFingerprints(prev.Signals),
+	)
+	var hubOutcomes []huggingFaceLookupOutcome
+	if full && s.modelProvenanceHub != nil {
+		started := time.Now()
+		pageStart := s.modelProvenanceHubCursor.Load()
+		var attempted int
+		hubOutcomes, attempted = enrichModelSignalsFromHuggingFace(
+			ctx, s.modelProvenanceHub, signals, pageStart,
+		)
+		if attempted > 0 {
+			s.modelProvenanceHubCursor.Add(uint64(attempted))
+		}
+		preserveHuggingFaceProvenance(signals, prev.Signals, hubOutcomes, time.Now().UTC())
+		refreshHuggingFaceProvenanceHashes(signals)
+		stats.DetectorDurations["model_provenance_huggingface"] = int(time.Since(started).Milliseconds())
+	}
+	preserveHuggingFaceComparisonHashes(signals, prev.Signals, hubOutcomes)
+	if err := ctx.Err(); err != nil {
+		// A canceled refresh/client request is not a complete inventory
+		// observation. The deferred v8 abort terminates the scan trace; do not
+		// classify omissions or overwrite the last durable snapshot from this
+		// partial pass.
+		s.mu.Lock()
+		s.lastErr = err
+		s.mu.Unlock()
+		return AIDiscoveryReport{}, err
+	}
+	if prevErr != nil {
+		stats.Errors++
+	}
+	report := s.classifyAndPersist(scanID, source, start, signals, stats, prev, full)
+
+	s.mu.Lock()
+	s.last = cloneAIDiscoveryReport(report)
+	s.lastErr = nil
+	s.mu.Unlock()
+
+	s.fanoutReport(ctx, report)
+	s.notifyReportObservers(ctx, report)
+	scanObservation.end(report)
+	return report, nil
+}
+
+func (s *ContinuousDiscoveryService) notifyReportObservers(ctx context.Context, report AIDiscoveryReport) {
+	if s == nil {
+		return
+	}
+	s.observerMu.RLock()
+	observers := append([]AIDiscoveryReportObserver(nil), s.reportObservers...)
+	s.observerMu.RUnlock()
+	if len(observers) == 0 {
+		return
+	}
+	baseCtx := context.WithoutCancel(ctx)
+	for _, observer := range observers {
+		observer := observer
+		cloned := cloneAIDiscoveryReport(report)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "[ai-discovery] report observer panic: %v\n", r)
+				}
+			}()
+			observer(baseCtx, cloned)
+		}()
+	}
+}
+
+// fanoutReport runs the OTel + gateway-events emitters off a
+// SINGLE rollup snapshot so the two paths never disagree on the
+// per-component identity / presence numbers (would happen if each
+// path called ComputeComponentConfidence with its own
+// time.Now()). The snapshot is built lazily so default-config
+// installs (no OTel, redaction enabled) don't pay for a rollup
+// they'd discard.
+func (s *ContinuousDiscoveryService) fanoutReport(ctx context.Context, report AIDiscoveryReport) {
+	observer := s.observabilityV8Snapshot()
+	v8On := observer != nil
+	// The generated v8 observer is the sole telemetry owner. Skip the rollup
+	// entirely when no canonical runtime is bound.
+	var snap componentRollupSnapshot
+	if v8On {
+		snap = buildComponentRollupSnapshot(report.Signals, s.confidenceParams)
+	}
+	if v8On {
+		components := make([]AIDiscoveryV8ComponentObservation, 0, len(snap.Groups))
+		for _, group := range snap.Groups {
+			if confidence, ok := snap.ScoreFor(group); ok {
+				if len(group.Signals) == 0 || strings.TrimSpace(group.Signals[0].Category) == "" {
+					continue
+				}
+				componentKey := strings.ToLower(group.Ecosystem) + "\x00" + strings.ToLower(group.Name)
+				components = append(components, AIDiscoveryV8ComponentObservation{
+					ComponentID: stableSignalID(componentKey), ComponentType: group.Signals[0].Category,
+					HasLifecycleChange: group.HasLifecycleChange,
+					Metrics:            buildComponentConfidenceAttrs(group, confidence, s.confidenceParams.Policy.Version),
+				})
+			}
+		}
+		_ = observer.EmitReport(ctx, reportForObservabilityV8(report), components)
+	}
+	// Hook installation is the live managed-mode gate. Deployment mode can
+	// change without rebuilding this service, so construction-time options
+	// must not suppress a callback installed by a later config generation.
+	s.managedInventoryEmitMu.RLock()
+	emit := s.managedInventoryEmit
+	s.managedInventoryEmitMu.RUnlock()
+	if emit != nil {
+		emit(ctx)
+	}
+}
+
+// SetManagedInventoryEmitHook installs the sidecar callback that publishes the
+// connector and MCP endpoint snapshot after each managed discovery scan. A nil
+// callback clears it. The callback does not emit discovery signals; those flow
+// exclusively through the canonical v8 observer above.
+func (s *ContinuousDiscoveryService) SetManagedInventoryEmitHook(fn func(context.Context)) {
+	if s == nil {
+		return
+	}
+	s.managedInventoryEmitMu.Lock()
+	s.managedInventoryEmit = fn
+	s.managedInventoryEmitMu.Unlock()
+}
+
+// reportForObservabilityV8 projects local-model lifecycle identities onto an
+// installation-keyed namespace before they cross the canonical telemetry
+// adapter boundary. The local API report keeps its ordinary signal ID, while
+// remote lifecycle correlation cannot be dictionary-tested against a guessed
+// model name. If no installation key is available, correlation is omitted.
+func reportForObservabilityV8(report AIDiscoveryReport) AIDiscoveryReport {
+	out := report
+	out.Signals = append([]AISignal(nil), report.Signals...)
+	for i := range out.Signals {
+		if out.Signals[i].Category == SignalLocalModel || out.Signals[i].Model != nil {
+			out.Signals[i].SignalID = modelLifecycleSignalID(out.Signals[i])
+		}
+	}
+	return out
+}
+
+func modelLifecycleSignalID(signal AISignal) string {
+	key := currentPathHashKey()
+	if len(key) == 0 {
+		return ""
+	}
+	identity := signal.Fingerprint
+	if identity == "" {
+		identity = signal.SignalID
+	}
+	if identity == "" {
+		return ""
+	}
+	return "model_" + keyedHashHex(key, "ai-discovery/model-signal/v1\x00"+identity)
+}
+
+type scanStats struct {
+	FilesScanned      int
+	Errors            int
+	DetectorErrors    map[string]string
+	DedupeSuppressed  int
+	DetectorDurations map[string]int
+	// ModelAPIConclusive keys are provider + detector pairs for which a
+	// valid metadata response was decoded during this pass. The lifecycle
+	// classifier uses this to distinguish a definitive empty list from an
+	// indeterminate network/auth/parse failure.
+	ModelAPIConclusive  map[string]bool
+	ModelAPIAttempted   map[string]bool
+	ModelAPIDeferred    map[string]bool
+	ModelAPICycleSeen   map[string]map[string]struct{}
+	ModelFileConclusive map[string]bool
+	ModelFileAttempted  map[string]bool
+	ModelFileDeferred   map[string]bool
+}
+
+func (s *ContinuousDiscoveryService) scanSignals(
+	ctx context.Context,
+	scanID string,
+	scanObservation *aiDiscoveryScanObservation,
+	full bool,
+	priorModelAPI map[string]map[string]struct{},
+) ([]AISignal, scanStats) {
+	stats := scanStats{DetectorErrors: map[string]string{}, DetectorDurations: map[string]int{}}
+	var signals []AISignal
+	seen := map[string]bool{}
+
+	add := func(in []AISignal) {
+		for _, sig := range in {
+			if !allowedAISignalCategories[sig.Category] {
+				continue
+			}
+			if seen[sig.Fingerprint] {
+				stats.DedupeSuppressed++
+				continue
+			}
+			seen[sig.Fingerprint] = true
+			signals = append(signals, sig)
+		}
+	}
+	measure := func(name string, fn func() ([]AISignal, int, error)) {
+		start := time.Now()
+		child := scanObservation.startDetector(ctx, s, AIDiscoveryV8DetectorStart{
+			ScanID: scanID, Detector: name, StartedAt: start,
+		})
+		out, files, err := fn()
+		if err != nil {
+			stats.Errors++
+			if name == "process" || name == "model_file" {
+				stats.DetectorErrors[name] = err.Error()
+			}
+		}
+		endedAt := time.Now()
+		child.end(AIDiscoveryV8DetectorResult{
+			EndedAt: endedAt, DurationMs: endedAt.Sub(start).Milliseconds(),
+			SignalsTotal: int64(len(out)), FilesScanned: int64(files), Failed: err != nil,
+		})
+		stats.FilesScanned += files
+		stats.DetectorDurations[name] = int(time.Since(start).Milliseconds())
+		add(out)
+	}
+
+	measure("process", func() ([]AISignal, int, error) {
+		out, err := s.detectProcesses()
+		return out, 0, err
+	})
+	if !full {
+		sortAISignals(signals)
+		return signals, stats
+	}
+
+	measure("config", func() ([]AISignal, int, error) { return s.detectConfigPaths(), 0, nil })
+	measure("binary", func() ([]AISignal, int, error) { return s.detectBinaries(), 0, nil })
+	measure("application", func() ([]AISignal, int, error) { return s.detectApplications(), 0, nil })
+	measure("editor_extension", func() ([]AISignal, int, error) { return s.detectEditorExtensions(), 0, nil })
+	measure("mcp", func() ([]AISignal, int, error) { return s.detectMCPPaths(), 0, nil })
+	measure("skill", func() ([]AISignal, int, error) { return s.detectSkills(), 0, nil })
+	measure("rule", func() ([]AISignal, int, error) { return s.detectRules(), 0, nil })
+	measure("plugin", func() ([]AISignal, int, error) { return s.detectPlugins(), 0, nil })
+	if s.opts.IncludeNetworkDomains {
+		measure("local_endpoint", func() ([]AISignal, int, error) { return s.detectLocalEndpoints(), 0, nil })
+		measure("local_model_api", func() ([]AISignal, int, error) {
+			out, files, outcome, err := s.detectLocalAPIModelsWithPrior(ctx, priorModelAPI)
+			stats.ModelAPIConclusive = outcome.conclusive
+			stats.ModelAPIAttempted = outcome.attempted
+			stats.ModelAPIDeferred = outcome.deferred
+			stats.ModelAPICycleSeen = outcome.cycleSeen
+			return out, files, err
+		})
+	}
+	measure("model_file", func() ([]AISignal, int, error) {
+		out, files, outcome, err := s.detectModelFilesWithOutcome(ctx)
+		stats.ModelFileConclusive = outcome.conclusive
+		stats.ModelFileAttempted = outcome.attempted
+		stats.ModelFileDeferred = outcome.deferred
+		for rootKey, detail := range outcome.rootErrors {
+			stats.DetectorErrors["model_file:"+rootKey] = detail
+		}
+		return out, files, err
+	})
+	if s.opts.IncludeEnvVarNames {
+		measure("env", func() ([]AISignal, int, error) { return s.detectEnvVars(), 0, nil })
+	}
+	if s.opts.IncludePackageManifests {
+		measure("package_manifest", func() ([]AISignal, int, error) { return s.detectPackageManifests(ctx) })
+	}
+	if s.opts.IncludeShellHistory {
+		measure("shell_history", func() ([]AISignal, int, error) { return s.detectShellHistory() })
+	}
+
+	sortAISignals(signals)
+	return signals, stats
+}
+
+func (s *ContinuousDiscoveryService) classifyAndPersist(scanID, source string, start time.Time, signals []AISignal, stats scanStats, prev aiStateFile, full bool) AIDiscoveryReport {
+	now := time.Now().UTC()
+	prevMap := prev.Signals
+	if prevMap == nil {
+		prevMap = map[string]aiStoredSignal{}
+	}
+
+	// On non-full scans (the process-only ticker), we must MERGE
+	// onto the prior persisted map instead of replacing it. The v1
+	// implementation rebuilt `current` from `signals` only, which on
+	// a process-only tick erased every config / binary / manifest
+	// fingerprint until the next full scan — flapping `gone`/`new`
+	// rows and resetting FirstSeen continuity. The fix preserves
+	// non-process fingerprints across process-only ticks and only
+	// overwrites the entries the current scan actually re-emitted.
+	current := map[string]aiStoredSignal{}
+	if !full {
+		for fp, stored := range prevMap {
+			current[fp] = stored
+		}
+	}
+
+	out := make([]AISignal, 0, len(signals))
+	counts := map[string]int{}
+	// emittedFps tracks fingerprints classified by THIS scan tick.
+	// On a process-only (non-full) tick we use it to append the
+	// carried-forward inventory rows below, so report.Signals
+	// always reflects len(current) == summary.ActiveSignals (the
+	// CLI relies on this invariant: the table header reports
+	// active_signals while the body iterates Signals -- when the
+	// two diverge the operator sees a 4-vs-755 mismatch on every
+	// process-only tick).
+	emittedFps := make(map[string]bool, len(signals))
+	for _, sig := range signals {
+		sig.SignalID = stableSignalID(sig.Fingerprint)
+		sig.FirstSeen = now
+		sig.LastSeen = now
+		// LastActiveAt: process detector pre-stamps Runtime.StartedAt
+		// when known; for any non-process detector that supplied an
+		// `mtime`-style hint via signal.LastActiveAt, keep that
+		// value; otherwise default LastActiveAt to `now` so consumers
+		// always have *some* "freshness" timestamp to render.
+		if sig.LastActiveAt == nil && !(sig.Model != nil && sig.Model.Status == "installed") {
+			t := now
+			sig.LastActiveAt = &t
+		}
+		if old, ok := prevMap[sig.Fingerprint]; ok {
+			if full && sig.Detector == "model_file" && sig.WorkspaceHash != "" &&
+				stats.ModelFileDeferred[sig.WorkspaceHash] {
+				// A cursor page can contain only part of a sharded model. Preserve
+				// the last cycle-complete aggregate until this root reaches EOF;
+				// otherwise every prefix/suffix page would alternate size/hash and
+				// emit a false `changed` transition.
+				preserved := old.AISignal
+				preserved.SignalID = stableSignalID(sig.Fingerprint)
+				preserved.LastSeen = now
+				sig = preserved
+			}
+			sig.FirstSeen = old.FirstSeen
+			storedHash := old.EvidenceHash
+			if storedHash == "" {
+				storedHash = old.StoredEvidenceHash
+			}
+			storedHubHash := old.ModelProvenanceHubHash
+			if storedHubHash == "" {
+				storedHubHash = old.StoredModelProvenanceHubHash
+			}
+			// v1 → v2 grace: if the stored hash is empty (v1 migration
+			// or first scan), treat as `seen` to avoid a flood of
+			// spurious `changed` rows on the first post-upgrade scan.
+			switch {
+			case storedHash == "":
+				sig.State = AIStateSeen
+			case storedHash != sig.EvidenceHash || storedHubHash != sig.ModelProvenanceHubHash:
+				sig.State = AIStateChanged
+			default:
+				sig.State = AIStateSeen
+			}
+		} else {
+			sig.State = AIStateNew
+		}
+		// Include every active signal in the report (not just deltas)
+		// so callers like `defenseclaw agent usage` can render the
+		// full live inventory without a second round-trip. The `state`
+		// field still tells consumers what changed since last scan, so
+		// downstream filters that only care about deltas keep working.
+		out = append(out, sig)
+		counts[sig.State]++
+		emittedFps[sig.Fingerprint] = true
+		current[sig.Fingerprint] = aiStoredSignal{
+			AISignal: sig, RawPaths: rawPathsForSignal(sig, s.opts.StoreRawLocalPaths),
+			StoredModelAPISourceHash: sig.ModelAPISourceHash,
+		}
+	}
+
+	if full {
+		apiCurrent, fileCurrent := 0, 0
+		for _, stored := range current {
+			switch stored.Detector {
+			case "model_api", "model_runtime":
+				if stored.Model != nil {
+					apiCurrent++
+				}
+			case "model_file":
+				if stored.Model != nil {
+					fileCurrent++
+				}
+			}
+		}
+		apiCarryRemaining := maxPersistedLocalModelAPISignals - apiCurrent
+		if apiCarryRemaining < 0 {
+			apiCarryRemaining = 0
+		}
+		filePersistLimit := s.opts.MaxFilesPerScan * 2
+		if s.opts.MaxFilesPerScan > maxModelFileVisitedEntries/2 {
+			filePersistLimit = maxModelFileVisitedEntries
+		}
+		fileCarryRemaining := filePersistLimit - fileCurrent
+		if fileCarryRemaining < 0 {
+			fileCarryRemaining = 0
+		}
+		prevFingerprints := make([]string, 0, len(prevMap))
+		for fp := range prevMap {
+			prevFingerprints = append(prevFingerprints, fp)
+		}
+		sort.Strings(prevFingerprints)
+		carry := carryForwardAccumulator{
+			current:    current,
+			out:        &out,
+			counts:     counts,
+			emittedFps: emittedFps,
+		}
+		for _, fp := range prevFingerprints {
+			old := prevMap[fp]
+			if _, ok := current[fp]; ok {
+				continue
+			}
+			if carry.handleModelAPICarryForward(fp, old, stats, &apiCarryRemaining) {
+				continue
+			}
+			if carry.handleModelFileCarryForward(fp, old, stats, &fileCarryRemaining) {
+				continue
+			}
+			gone := old.AISignal
+			gone.State = AIStateGone
+			gone.LastSeen = now
+			out = append(out, gone)
+			counts[AIStateGone]++
+		}
+	} else {
+		// Non-full ticker tick: extend report.Signals with the
+		// carried-forward inventory so consumers see the same
+		// count the summary advertises. The carried-forward rows
+		// ship as state=seen regardless of what they were last
+		// classified as, so the OTel + gateway-events emitters
+		// (which fire only on new/changed/gone) don't replay
+		// lifecycle events on every 5-second process tick. The
+		// persistence map (`current`) is left untouched so the
+		// next FULL scan still sees the prior state for proper
+		// reclassification.
+		for fp, stored := range current {
+			if emittedFps[fp] {
+				continue
+			}
+			carried := stored.AISignal
+			carried.State = AIStateSeen
+			out = append(out, carried)
+		}
+	}
+
+	if err := s.store.Save(aiStateFile{Version: aiDiscoveryStateVersion, UpdatedAt: now, Signals: current}); err != nil {
+		stats.Errors++
+		stats.DetectorErrors["state_store"] = err.Error()
+	}
+
+	summary := AIDiscoverySummary{
+		ScanID:            scanID,
+		ScannedAt:         now,
+		DurationMs:        time.Since(start).Milliseconds(),
+		PrivacyMode:       s.opts.Mode,
+		Source:            source,
+		Result:            "ok",
+		TotalSignals:      len(signals),
+		ActiveSignals:     len(current),
+		NewSignals:        counts[AIStateNew],
+		ChangedSignals:    counts[AIStateChanged],
+		GoneSignals:       counts[AIStateGone],
+		FilesScanned:      stats.FilesScanned,
+		DedupeSuppressed:  stats.DedupeSuppressed,
+		Errors:            stats.Errors,
+		DetectorErrors:    stats.DetectorErrors,
+		DetectorDurations: stats.DetectorDurations,
+	}
+	if stats.Errors > 0 {
+		summary.Result = "partial"
+	}
+	sortAISignals(out)
+	report := AIDiscoveryReport{Summary: summary, Signals: out}
+	// Best-effort SQL persistence of the scan + computed
+	// confidence snapshots. Failures are logged via stderr but
+	// never fail the scan: the JSON state file remains the
+	// authoritative current snapshot.
+	s.recordScanIfPossible(report)
+	return report
+}
+
+func storedModelAPICoverageKey(stored aiStoredSignal) (string, bool) {
+	sig := stored.AISignal
+	if sig.Model == nil || (sig.Detector != "model_api" && sig.Detector != "model_runtime") {
+		return "", false
+	}
+	provider := strings.TrimSpace(sig.Model.Provider)
+	sourceHash := strings.TrimSpace(sig.ModelAPISourceHash)
+	if sourceHash == "" {
+		sourceHash = strings.TrimSpace(stored.StoredModelAPISourceHash)
+	}
+	if provider == "" || sourceHash == "" {
+		return "", false
+	}
+	return localModelAPIOutcomeKey(provider, sourceHash, sig.Detector), true
+}
+
+type carryForwardAccumulator struct {
+	current    map[string]aiStoredSignal
+	out        *[]AISignal
+	counts     map[string]int
+	emittedFps map[string]bool
+}
+
+func (c carryForwardAccumulator) persist(fp string, old aiStoredSignal, budget *int) {
+	carried := old.AISignal
+	carried.State = AIStateSeen
+	old.AISignal = carried
+	c.current[fp] = old
+	*budget = *budget - 1
+	*c.out = append(*c.out, carried)
+	c.counts[AIStateSeen]++
+	c.emittedFps[fp] = true
+}
+
+// handleModelAPICarryForward owns the lifecycle rules for an API model that
+// was not emitted on this scan. Its return value means the omission was
+// handled and must not become a gone transition; a bounded carry set may
+// intentionally handle an item without persisting it.
+func (c carryForwardAccumulator) handleModelAPICarryForward(
+	fp string,
+	old aiStoredSignal,
+	stats scanStats,
+	budget *int,
+) bool {
+	coverageKey, ok := storedModelAPICoverageKey(old)
+	if !ok {
+		return false
+	}
+	if stats.ModelAPIConclusive[coverageKey] {
+		if _, seenDuringCycle := stats.ModelAPICycleSeen[coverageKey][fp]; !seenDuringCycle {
+			return false
+		}
+		if *budget > 0 {
+			old.ModelAPIMisses = 0
+			c.persist(fp, old, budget)
+		}
+		return true
+	}
+
+	deferred := stats.ModelAPIDeferred[coverageKey]
+	attempted := stats.ModelAPIAttempted[coverageKey]
+	eligible := deferred || (attempted && old.ModelAPIMisses < maxIndeterminateModelAPIMisses)
+	if !eligible {
+		return false
+	}
+	if *budget > 0 {
+		// A deferred source was not fully observed because an earlier
+		// response exhausted an item/time/endpoint budget. Keep it until
+		// that exact source receives a conclusive observation. A request
+		// that was attempted but failed gets one grace pass for ordinary
+		// local-server restarts.
+		if attempted && !deferred {
+			old.ModelAPIMisses++
+		}
+		c.persist(fp, old, budget)
+	}
+	// Persistence is deliberately bounded. If the carry budget is full,
+	// evict silently rather than emit an unsupported gone transition from
+	// an incomplete observation.
+	return true
+}
+
+func (c carryForwardAccumulator) handleModelFileCarryForward(
+	fp string,
+	old aiStoredSignal,
+	stats scanStats,
+	budget *int,
+) bool {
+	if old.Detector != "model_file" || old.Model == nil || old.WorkspaceHash == "" ||
+		!stats.ModelFileDeferred[old.WorkspaceHash] {
+		return false
+	}
+	// The artifact's root was only partially walked (entry/match cap,
+	// cancellation-adjacent error, or permission failure). Preserve prior
+	// inventory until that exact hashed root is observed conclusively.
+	if *budget > 0 {
+		c.persist(fp, old, budget)
+	}
+	// If the bounded carry set is full, omit the row without a gone event.
+	// A partial walk cannot prove deletion.
+	return true
+}
+
+func priorModelAPIFingerprints(signals map[string]aiStoredSignal) map[string]map[string]struct{} {
+	out := make(map[string]map[string]struct{})
+	for fingerprint, stored := range signals {
+		coverageKey, ok := storedModelAPICoverageKey(stored)
+		if !ok {
+			continue
+		}
+		if out[coverageKey] == nil {
+			out[coverageKey] = make(map[string]struct{})
+		}
+		out[coverageKey][fingerprint] = struct{}{}
+	}
+	return out
+}
+
+// recordScanIfPossible writes a scan to the optional inventory
+// store. It exists as a separate helper because the call needs to
+// degrade silently when invStore is nil (DB unavailable on this
+// host) and we do not want that branch noise in the middle of
+// classifyAndPersist.
+func (s *ContinuousDiscoveryService) recordScanIfPossible(report AIDiscoveryReport) {
+	if s == nil || s.invStore == nil {
+		return
+	}
+	if err := s.invStore.RecordScan(context.Background(), report, s.confidenceParams); err != nil {
+		fmt.Fprintf(os.Stderr, "[ai-discovery] inventory record failed: %v\n", err)
+	}
+}
+
+func (s *ContinuousDiscoveryService) detectConfigPaths() []AISignal {
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, candidate := range sig.ConfigPaths {
+			for _, path := range s.expandCandidatePath(candidate) {
+				if pathExists(path) {
+					category := SignalWorkspaceArtifact
+					if sig.SupportedConnector != "" {
+						category = SignalSupportedConnector
+					}
+					out = append(out, s.signalFromPath(sig, category, "config", path))
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) detectMCPPaths() []AISignal {
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, candidate := range sig.MCPPaths {
+			for _, path := range s.expandCandidatePath(candidate) {
+				if pathExists(path) {
+					out = append(out, s.signalFromMCPConfigPath(sig, path))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// signalFromMCPConfigPath builds a SignalMCPServer signal for an MCP
+// configuration file, extending signalFromPath by parsing the file
+// and folding each declared server name into Evidence + Basenames.
+// The base config-file evidence row is preserved so PathHashes still
+// identifies the physical file (needed for lifecycle stability and
+// operator triage). Parse failures fall back to the plain file-only
+// signal so a malformed config never suppresses the "endpoint has
+// MCP configured" signal itself.
+func (s *ContinuousDiscoveryService) signalFromMCPConfigPath(sig AISignature, path string) AISignal {
+	base := AIEvidence{Type: "mcp", Basename: filepath.Base(path), PathHash: hashPath(path)}
+	if s.opts.StoreRawLocalPaths {
+		base.RawPath = path
+	}
+	evidence := []AIEvidence{base}
+	// Coverage state: two independent early-exit paths (parse failure
+	// vs. per-signal evidence cap). Both must surface as partial=true
+	// so managed remediation can distinguish "31 servers is really
+	// what's in this config" from "there are 40 servers and we
+	// silently dropped 9" (Vineet's [P1] inline on this function). A
+	// parse error also propagates because a malformed MCP config
+	// leaves the operator with zero item rows for a real surface,
+	// which downstream must not read as "no MCP servers configured".
+	names, parseErr := readMCPServerNamesWithErr(path)
+	var partial bool
+	var coverageReason string
+	if parseErr != nil {
+		// Parse failure — the base "mcp" evidence row remains so the
+		// operator sees the endpoint has MCP configured, but no
+		// server-name rows will follow. Marking partial signals the
+		// gap.
+		partial = true
+		coverageReason = CoverageReasonParseError
+	}
+	// Reserve one slot for the parent row (evidence[0]) by capping
+	// server-name rows at maxEvidencePerSignal - 1. Explicit constant
+	// so the intent is grep-able — the previous behaviour just fell
+	// off the end of the same cap that the parent row already
+	// occupies and dropped the 32nd real server without a signal.
+	const maxMCPServerRowsPerSignal = maxEvidencePerSignal - 1
+	added := 0
+	for _, name := range names {
+		if added >= maxMCPServerRowsPerSignal {
+			partial = true
+			if coverageReason == "" {
+				coverageReason = CoverageReasonCapExceeded
+			}
+			break
+		}
+		if name = sanitizeBasenameValue(name); name == "" {
+			continue
+		}
+		evidence = append(evidence, AIEvidence{
+			Type:      "mcp_server",
+			Basename:  name,
+			ValueHash: hashValue(name),
+		})
+		added++
+	}
+	out := s.signalFromEvidence(sig, SignalMCPServer, "mcp", evidence)
+	out.Partial = partial
+	out.CoverageReason = coverageReason
+	if st, err := os.Stat(path); err == nil {
+		mt := st.ModTime().UTC()
+		out.LastActiveAt = &mt
+	}
+	return out
+}
+
+// readMCPServerNamesWithErr wraps readMCPServerNames with the parser's
+// error state so signalFromMCPConfigPath can distinguish
+// "unparseable" from "no servers declared". The plain readMCPServerNames
+// remains for callers that don't need the reason.
+func readMCPServerNamesWithErr(path string) ([]string, error) {
+	entries, err := parseMCPConfigForNames(path)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name := strings.TrimSpace(e.Name)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+// readMCPServerNames parses `path` with the appropriate format-specific
+// reader and returns the declared MCP server names. Best-effort: an
+// unreadable/unparseable/format-unknown file yields nil.
+func readMCPServerNames(path string) []string {
+	entries, err := parseMCPConfigForNames(path)
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name := strings.TrimSpace(e.Name)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// parseMCPConfigForNames dispatches to the right config parser for
+// `path` and returns MCP server entries. Kept alongside the detector
+// so future signature-catalog additions (new MCP config shapes) can
+// extend the switch in one place without changing the caller.
+func parseMCPConfigForNames(path string) ([]config.MCPServerEntry, error) {
+	lower := strings.ToLower(path)
+	base := strings.ToLower(filepath.Base(path))
+	switch {
+	case strings.HasSuffix(lower, ".toml"):
+		return config.ReadMCPFromCodexConfigTOML(path)
+	case strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml"):
+		return config.ReadMCPFromYAMLPath(path, []string{"mcp", "servers"}, []string{"mcpServers"})
+	case base == ".claude.json":
+		// ~/.claude.json holds user-scope (top-level `mcpServers`) *and*
+		// per-project local-scope (`projects.<path>.mcpServers`) entries.
+		// Prefer the union reader so we only decode the (often multi-MB)
+		// conversation-state file once and basenames covers both scopes.
+		return config.ReadMCPFromClaudeJSONBothScopes(path)
+	case base == "settings.json" || base == "settings.local.json":
+		return config.ReadMCPFromClaudeSettings(path)
+	default:
+		return config.ReadMCPFromDotMCPJSON(path)
+	}
+}
+
+// dirHasEntry reports whether path exists AND, if it's a directory,
+// contains at least one entry. Non-directory targets (a file at the
+// path) count as "populated" so operator-authored single-file surfaces
+// (e.g. `~/.claude/CLAUDE.md` used as a rule scalar) still trigger.
+// Empty directories return false — the "reserved for future use" case
+// we don't want polluting the dashboard.
+//
+// Uses ReadDir with a bounded read so a pathological directory (millions
+// of entries, e.g. `~/.cache`) doesn't stall a scan: os.ReadDir slurps
+// the whole thing, but here we only need to know "is len > 0" so we
+// call the lower-level (*File).ReadDir(1) shortcut which stops after
+// the first entry.
+func dirHasEntry(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if !fi.IsDir() {
+		return true
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	// ReadDir(1) returns io.EOF when the directory is empty; any
+	// successful read of >=1 entry proves populated.
+	entries, err := f.ReadDir(1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	return len(entries) > 0
+}
+
+// detectSkills / detectRules / detectPlugins mirror detectMCPPaths but
+// require the target path to contain at least one entry (see
+// dirHasEntry). This distinguishes "surface configured with skills /
+// rules / plugins" from "the agent left an empty scaffold directory".
+// The three functions are kept separate rather than parameterized so
+// each maps cleanly to a signature-catalog field name and a category
+// constant — trivial to grep, trivial to disable via
+// disabled_signature_ids per surface.
+func (s *ContinuousDiscoveryService) detectSkills() []AISignal {
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, candidate := range sig.SkillPaths {
+			for _, path := range s.expandCandidatePath(candidate) {
+				if dirHasEntry(path) {
+					out = append(out, s.signalFromDirectoryChildren(sig, SignalSkill, "skill", path))
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) detectRules() []AISignal {
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, candidate := range sig.RulePaths {
+			for _, path := range s.expandCandidatePath(candidate) {
+				if dirHasEntry(path) {
+					out = append(out, s.signalFromDirectoryChildren(sig, SignalRule, "rule", path))
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) detectPlugins() []AISignal {
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, candidate := range sig.PluginPaths {
+			for _, path := range s.expandCandidatePath(candidate) {
+				if dirHasEntry(path) {
+					out = append(out, s.signalFromDirectoryChildren(sig, SignalPlugin, "plugin", path))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// signalFromDirectoryChildren emits a signal whose Evidence enumerates
+// the *direct children* of a skills / rules / plugins directory, so
+// Basenames carries the actual skill / rule / plugin names on the wire
+// rather than the constant string "skills" / "rules" / "plugins" that
+// filepath.Base returns for the parent directory itself. When `path`
+// is a single file (the operator-authored scalar case, e.g.
+// `~/.claude/CLAUDE.md` as a rule), the child enumeration is skipped
+// and behaviour matches signalFromPath.
+//
+// The parent-directory row is retained as evidence[0] so PathHashes
+// still identifies the parent surface — needed for lifecycle stability
+// across scans where the child set changes but the surface does not.
+// Evidence is capped at maxEvidencePerSignal so a pathological skill
+// directory with thousands of children cannot blow up payload size.
+func (s *ContinuousDiscoveryService) signalFromDirectoryChildren(sig AISignature, category, detector, path string) AISignal {
+	base := AIEvidence{Type: detector, Basename: filepath.Base(path), PathHash: hashPath(path)}
+	if s.opts.StoreRawLocalPaths {
+		base.RawPath = path
+	}
+	evidence := []AIEvidence{base}
+	// Track coverage so a consumer that acts on the snapshot (managed
+	// remediation, dashboards, alert rules) can distinguish "no more
+	// entries" from "we stopped early because <reason>". Set by every
+	// early-exit path below.
+	var partial bool
+	var coverageReason string
+	fi, statErr := os.Stat(path)
+	switch {
+	case statErr != nil && os.IsPermission(statErr):
+		partial = true
+		coverageReason = CoverageReasonPermissionDenied
+	case statErr != nil && !os.IsNotExist(statErr):
+		partial = true
+		coverageReason = CoverageReasonReadError
+	case statErr == nil && fi.IsDir():
+		entries, readErr := os.ReadDir(path)
+		switch {
+		case readErr != nil && os.IsPermission(readErr):
+			partial = true
+			coverageReason = CoverageReasonPermissionDenied
+		case readErr != nil:
+			partial = true
+			coverageReason = CoverageReasonReadError
+		default:
+			for _, entry := range entries {
+				if len(evidence) >= maxEvidencePerSignal {
+					// Cap hit before we processed every child.
+					// Downstream must render "N of M" and must not
+					// treat this as authoritative.
+					partial = true
+					coverageReason = CoverageReasonCapExceeded
+					break
+				}
+				name := sanitizeBasenameValue(entry.Name())
+				if name == "" {
+					continue
+				}
+				// Skill-only special case: a `.system` container is a
+				// vendor-shipped bundled-skill directory (see Codex's
+				// bundled-skills contract). Do NOT emit the container
+				// itself as an ordinary skill_entry — recurse one
+				// level and emit each of its children with
+				// origin="bundled" so downstream mutation surfaces
+				// can hard-refuse. Any other detector (rule / plugin)
+				// treats `.system` as an ordinary child.
+				if detector == "skill" && enforce.IsBundledSkillContainerName(entry.Name()) {
+					systemDir := filepath.Join(path, entry.Name())
+					if childPartial, childReason := s.appendBundledSkillChildren(&evidence, systemDir); childPartial {
+						partial = true
+						if coverageReason == "" {
+							coverageReason = childReason
+						}
+					}
+					continue
+				}
+				child := filepath.Join(path, entry.Name())
+				ev := AIEvidence{
+					Type:     detector + "_entry",
+					Basename: name,
+					PathHash: hashPath(child),
+				}
+				if detector == "skill" {
+					// Explicit user origin so mutation surfaces can
+					// tell "walker classified this as user-installed"
+					// apart from "walker didn't stamp an origin"
+					// (latter must fail-safe).
+					ev.Origin = "user"
+				}
+				if s.opts.StoreRawLocalPaths {
+					ev.RawPath = child
+				}
+				evidence = append(evidence, ev)
+			}
+		}
+	}
+	out := s.signalFromEvidence(sig, category, detector, evidence)
+	out.Partial = partial
+	out.CoverageReason = coverageReason
+	if statErr == nil {
+		mt := fi.ModTime().UTC()
+		out.LastActiveAt = &mt
+	}
+	return out
+}
+
+// appendBundledSkillChildren enumerates one level below a `.system`
+// container and emits each child as a skill_entry with
+// origin="bundled", bundled=true. Nested bundled subtrees are not
+// recursed into — Codex's contract is one level of vendor children,
+// not a general bundled-tree. Cap check mirrors the parent walker so
+// a pathological bundled directory can't blow up payload size.
+//
+// Returns (partial, coverageReason) so the caller can propagate
+// truncation state up to the outer signal — a bundled read error
+// leaves the operator's snapshot incomplete just as a user-skill
+// read error does.
+func (s *ContinuousDiscoveryService) appendBundledSkillChildren(evidence *[]AIEvidence, systemDir string) (bool, string) {
+	entries, err := os.ReadDir(systemDir)
+	if err != nil {
+		switch {
+		case os.IsPermission(err):
+			return true, CoverageReasonPermissionDenied
+		default:
+			return true, CoverageReasonReadError
+		}
+	}
+	for _, entry := range entries {
+		if len(*evidence) >= maxEvidencePerSignal {
+			return true, CoverageReasonCapExceeded
+		}
+		name := sanitizeBasenameValue(entry.Name())
+		if name == "" {
+			continue
+		}
+		child := filepath.Join(systemDir, entry.Name())
+		ev := AIEvidence{
+			Type:     "skill_entry",
+			Basename: name,
+			PathHash: hashPath(child),
+			Origin:   "bundled",
+			Bundled:  true,
+		}
+		if s.opts.StoreRawLocalPaths {
+			ev.RawPath = child
+		}
+		*evidence = append(*evidence, ev)
+	}
+	return false, ""
+}
+
+// sanitizeBasenameValue returns the trimmed name if it is a legitimate
+// single-component basename (no path separators, no unicode control
+// chars) and does not exceed the wire-schema length bound. Empty
+// values, dotfiles that are OS metadata (`.DS_Store`, `Thumbs.db`),
+// and separator-bearing values are rejected. Kept in the detector
+// package so the sanitized value matches what
+// ValidateSanitizedAIDiscoveryReport will accept — a leaked separator
+// would trip the validator and drop the entire report.
+func sanitizeBasenameValue(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return ""
+	}
+	if containsUnicodeControl(name) {
+		return ""
+	}
+	switch name {
+	case ".DS_Store", "Thumbs.db", "desktop.ini":
+		return ""
+	}
+	if len(name) > 255 {
+		return ""
+	}
+	return name
+}
+
+func (s *ContinuousDiscoveryService) detectBinaries() []AISignal {
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, bin := range sig.BinaryNames {
+			if path, err := exec.LookPath(bin); err == nil && path != "" {
+				out = append(out, s.signalFromPath(sig, SignalAICLI, "binary", path))
+			}
+		}
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) detectProcesses() ([]AISignal, error) {
+	procs, err := processSnapshot()
+	if err != nil {
+		return nil, fmt.Errorf("process snapshot: %w", err)
+	}
+	if len(procs) == 0 {
+		return nil, nil
+	}
+	windowsSnapshot := procs[0].Windows
+	if windowsSnapshot {
+		classifyWindowsProcesses(procs, s.catalog)
+	}
+	now := time.Now().UTC()
+	var out []AISignal
+	for _, sig := range s.catalog {
+		if windowsSnapshot {
+			for i := range procs {
+				if procs[i].Connector != sig.ID {
+					continue
+				}
+				out = append(out, s.signalFromProcess(sig, procs[i], now, MatchKindExact, 1.0))
+			}
+			continue
+		}
+		for _, want := range sig.ProcessNames {
+			want = strings.ToLower(strings.TrimSpace(want))
+			if want == "" {
+				continue
+			}
+			// Pick the *most recently started* matching process so
+			// the rendered Runtime block is the freshest invocation,
+			// not whichever ps row sorted first. This makes "Last
+			// active" intuitive when a long-lived helper process and
+			// a fresh agent run share the same comm.
+			var best *processInfo
+			for i := range procs {
+				if !processNameMatches(procs[i].Comm, want) {
+					continue
+				}
+				if best == nil || procs[i].StartedAt.After(best.StartedAt) {
+					p := procs[i]
+					best = &p
+				}
+			}
+			if best == nil {
+				continue
+			}
+			// Quality reflects how confident this row is *as evidence
+			// of the named SDK*. Exact comm match (the kernel-reported
+			// process name equals a catalog `process_names` entry) is
+			// the strongest signal a `ps` snapshot can give us;
+			// substring matches (e.g. "claude-code" containing "claude")
+			// are still useful but less specific, so the engine
+			// down-weights them via Quality.
+			quality := 1.0
+			matchKind := MatchKindExact
+			if !processCommExactlyEquals(best.Comm, want) {
+				quality = 0.5
+				matchKind = MatchKindSubstring
+			}
+			out = append(out, s.signalFromProcess(sig, *best, now, matchKind, quality))
+		}
+	}
+	return out, nil
+}
+
+func (s *ContinuousDiscoveryService) signalFromProcess(sig AISignature, proc processInfo, now time.Time, matchKind string, quality float64) AISignal {
+	// Keep multiple Windows instances distinct without retaining command lines
+	// or executable paths. POSIX fingerprints preserve their existing contract.
+	evidenceValue := proc.Comm
+	if proc.Windows {
+		evidenceValue = fmt.Sprintf("%s:%d", proc.Comm, proc.PID)
+	}
+	ev := AIEvidence{Type: "process", ValueHash: hashValue(evidenceValue), Quality: quality, MatchKind: matchKind}
+	signal := s.signalFromEvidence(sig, SignalActiveProcess, "process", []AIEvidence{ev})
+	runtimeInfo := &ProcessRuntime{PID: proc.PID, PPID: proc.PPID, User: proc.User, Comm: proc.Comm}
+	if !proc.StartedAt.IsZero() {
+		started := proc.StartedAt
+		runtimeInfo.StartedAt = &started
+		if uptime := now.Sub(proc.StartedAt); uptime >= 0 {
+			runtimeInfo.UptimeSec = int64(uptime.Seconds())
+		}
+		signal.LastActiveAt = &started
+	}
+	signal.Runtime = runtimeInfo
+	return signal
+}
+
+func (s *ContinuousDiscoveryService) detectApplications() []AISignal {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, home := range s.homesToScan() {
+		for _, n := range installedApplicationNames(home) {
+			if _, ok := seen[n]; ok {
+				continue
+			}
+			seen[n] = struct{}{}
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, want := range sig.ApplicationNames {
+			want = strings.ToLower(strings.TrimSpace(want))
+			if want == "" {
+				continue
+			}
+			for _, have := range names {
+				if applicationNameMatches(have, want) {
+					out = append(out, s.signalFromValue(sig, SignalDesktopApp, "application", have))
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) detectEditorExtensions() []AISignal {
+	// Every path below is per-user; iterate every eligible home so a
+	// root-launched daemon picks up all local users' installed
+	// extensions, not just root's (which is empty on a real endpoint).
+	var roots []string
+	for _, home := range s.homesToScan() {
+		roots = append(roots,
+			filepath.Join(home, ".vscode", "extensions"),
+			filepath.Join(home, ".vscode-insiders", "extensions"),
+			filepath.Join(home, ".vscodium", "extensions"),
+			filepath.Join(home, ".cursor", "extensions"),
+			filepath.Join(home, ".windsurf", "extensions"),
+			filepath.Join(home, "Library", "Application Support", "Code", "User", "globalStorage"),
+			filepath.Join(home, "Library", "Application Support", "Code - Insiders", "User", "globalStorage"),
+			filepath.Join(home, "Library", "Application Support", "VSCodium", "User", "globalStorage"),
+			filepath.Join(home, "Library", "Application Support", "Cursor", "User", "globalStorage"),
+			filepath.Join(home, "Library", "Application Support", "Windsurf", "User", "globalStorage"),
+		)
+		for _, pattern := range []string{
+			filepath.Join(home, "Library", "Application Support", "JetBrains", "*", "plugins"),
+			filepath.Join(home, ".local", "share", "JetBrains", "*", "plugins"),
+		} {
+			if matches, err := filepath.Glob(pattern); err == nil {
+				roots = append(roots, matches...)
+			}
+		}
+	}
+	roots = append(roots, platformEditorExtensionRoots(s.opts.HomeDir)...)
+	var entries []string
+	for _, root := range roots {
+		children, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, child := range children {
+			entries = append(entries, strings.ToLower(child.Name()))
+		}
+	}
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, ext := range sig.ExtensionIDs {
+			ext = strings.ToLower(ext)
+			for _, entry := range entries {
+				if editorExtensionNameMatches(entry, ext) {
+					out = append(out, s.signalFromValue(sig, SignalEditorExtension, "editor_extension", ext))
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+func editorExtensionNameMatches(entry, extensionID string) bool {
+	entry = strings.ToLower(strings.TrimSpace(entry))
+	extensionID = strings.ToLower(strings.TrimSpace(extensionID))
+	if entry == "" || extensionID == "" {
+		return false
+	}
+	if entry == extensionID {
+		return true
+	}
+	version := strings.TrimPrefix(entry, extensionID+"-")
+	return version != entry && version != "" && version[0] >= '0' && version[0] <= '9'
+}
+
+// safeLocalEndpointPaths is the allow-list of URL paths that
+// detectLocalEndpoints will GET as a fallback when a HEAD probe is not
+// supported by the local AI server. Every entry here MUST be a
+// purely-metadata, idempotent endpoint that cannot, under any vendor's
+// deployment, run inference, mutate state, or trigger billing.
+//
+// The list is keyed exact (case-sensitive). Adding to it requires
+// (1) confirming with the vendor's docs that the path is read-only
+// metadata, and (2) matching the path against the same vendor's
+// signature.local_endpoints entry in ai_signatures.json.
+var safeLocalEndpointPaths = map[string]struct{}{
+	"/api/tags":      {}, // Ollama-compatible — list installed models
+	"/api/ps":        {}, // Ollama-compatible — list loaded models
+	"/api/version":   {}, // Ollama — server version
+	"/v1/models":     {}, // OpenAI-compatible — list locally available models
+	"/api/v1/models": {}, // Lemonade legacy-compatible route
+	"/v1/health":     {}, // Lemonade — server status + loaded models
+	"/api/v1/health": {}, // Lemonade legacy-compatible route
+	"/live":          {}, // Lemonade unauthenticated liveness
+	"/health":        {}, // common health endpoint
+	"/healthz":       {}, // Kubernetes-style health
+}
+
+// detectLocalEndpoints probes the loopback HTTP endpoints declared in
+// each AISignature.LocalEndpoints and emits a SignalLocalAIEndpoint when
+// a server responds.
+//
+// SECURITY (M-3): the previous implementation issued an unauthenticated
+// HTTP GET against every signature's endpoint. For OpenAI-compatible
+// servers (`/v1/models`) and Ollama (`/api/tags`) those URLs are
+// metadata only, but:
+//   - operator-supplied signature packs may add custom endpoints, and a
+//     misconfigured pack could end up GETing an inference URL with an
+//     empty body, triggering work or billing on the local server;
+//   - even on safe paths, the request signals "DefenseClaw is here" to
+//     whatever process happens to be listening on that port, which is a
+//     fingerprinting concern;
+//   - many OpenAI-compatible servers return very large payloads on
+//     `/v1/models` (full model metadata) that we don't actually need.
+//
+// We now (a) prefer HEAD which never carries a body and which most
+// OpenAI/Ollama metadata endpoints support; (b) fall back to GET only
+// when the URL path is in safeLocalEndpointPaths AND HEAD failed in a
+// way that suggests "method not allowed" rather than "host unreachable";
+// (c) advertise ourselves with a stable User-Agent so server access
+// logs make the source obvious; (d) cap the discarded response body
+// hard. The endpoint allow-list is enforced even for HEAD as a
+// defense-in-depth check against operator-supplied packs probing
+// surprise URLs.
+func (s *ContinuousDiscoveryService) detectLocalEndpoints() []AISignal {
+	client := &http.Client{
+		Timeout: 750 * time.Millisecond,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	probe := func(method, endpoint string) (int, bool) {
+		req, err := http.NewRequest(method, endpoint, nil)
+		if err != nil {
+			return 0, false
+		}
+		req.Header.Set("User-Agent", "defenseclaw-discovery/1.0 (+https://defenseclaw.com/discovery)")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Cache-Control", "no-store")
+		req.Header.Set("Connection", "close")
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, false
+		}
+		defer resp.Body.Close()
+		// Best-effort drain. Cap MUCH lower than the previous 1 KiB —
+		// we only care about the status code; the body is irrelevant
+		// and may be megabytes on some /v1/models responses.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256))
+		return resp.StatusCode, true
+	}
+	var out []AISignal
+	for _, sig := range s.catalog {
+		isLemonade := localModelProviderForSignature(sig) == localModelProviderLemonade
+		for _, endpoint := range localEndpointsForSignature(sig) {
+			endpoint = strings.TrimSpace(endpoint)
+			if endpoint == "" || !isSafeLoopbackEndpoint(endpoint) {
+				continue
+			}
+			// Defense-in-depth: only probe paths the project has
+			// explicitly cleared as metadata-only. Operator packs that
+			// drift outside this allow-list silently skip the probe.
+			u, err := url.Parse(endpoint)
+			if err != nil {
+				continue
+			}
+			if _, ok := safeLocalEndpointPaths[u.Path]; !ok {
+				continue
+			}
+			// Lemonade exposes an unauthenticated, provider-specific
+			// liveness route. Restrict presence identification to that
+			// route so an unrelated service returning 404 from /v1/models
+			// on port 13305 is not misidentified as Lemonade. The dedicated
+			// model API detector handles /v1/models and /v1/health bodies.
+			if isLemonade && u.Path != "/live" {
+				continue
+			}
+			status, ok := probe(http.MethodHead, endpoint)
+			if !ok || status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented ||
+				(isLemonade && (status < 200 || status >= 300)) {
+				// HEAD wasn't accepted; try GET as a fallback.
+				// (Already gated by safeLocalEndpointPaths above.)
+				status, ok = probe(http.MethodGet, endpoint)
+				if !ok {
+					continue
+				}
+			}
+			reachable := status >= 200 && status < 500
+			if isLemonade {
+				reachable = status >= 200 && status < 300
+			}
+			if reachable {
+				ev := AIEvidence{Type: "local_endpoint", ValueHash: hashValue(endpoint)}
+				out = append(out, s.signalFromEvidence(sig, SignalLocalAIEndpoint, "local_endpoint", []AIEvidence{ev}))
+				break
+			}
+		}
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) detectEnvVars() []AISignal {
+	present := map[string]bool{}
+	for _, kv := range os.Environ() {
+		if idx := strings.IndexByte(kv, '='); idx > 0 {
+			present[strings.ToUpper(kv[:idx])] = true
+		}
+	}
+	var out []AISignal
+	for _, sig := range s.catalog {
+		for _, name := range sig.EnvVarNames {
+			name = strings.ToUpper(strings.TrimSpace(name))
+			if present[name] {
+				out = append(out, s.signalFromValue(sig, SignalEnvVarName, "env", name))
+			}
+		}
+	}
+	return out
+}
+
+// packageManifestNames is the allow-list of basenames the
+// `package_manifest` detector treats as ecosystem-relevant. It includes
+// both manifests (declared deps) and lockfiles (resolved deps); the
+// lockfile entries are read to enrich co-located manifest matches with
+// concrete versions via internal/inventory/lockparse.
+var packageManifestNames = map[string]bool{
+	"package.json":             true,
+	"pyproject.toml":           true,
+	"requirements.txt":         true,
+	"requirements-dev.txt":     true,
+	"requirements.in":          true,
+	"constraints.txt":          true,
+	"poetry.lock":              true,
+	"uv.lock":                  true,
+	"Pipfile":                  true,
+	"Pipfile.lock":             true,
+	"environment.yml":          true,
+	"environment.yaml":         true,
+	"go.mod":                   true,
+	"go.sum":                   true,
+	"Gemfile":                  true,
+	"Gemfile.lock":             true,
+	"composer.json":            true,
+	"composer.lock":            true,
+	"pom.xml":                  true,
+	"build.gradle":             true,
+	"build.gradle.kts":         true,
+	"Cargo.toml":               true,
+	"Cargo.lock":               true,
+	"deno.json":                true,
+	"deno.lock":                true,
+	"bun.lock":                 true,
+	"bun.lockb":                true,
+	"yarn.lock":                true,
+	"pnpm-lock.yaml":           true,
+	"package-lock.json":        true,
+	"Directory.Packages.props": true,
+	"packages.config":          true,
+	"Dockerfile":               true,
+	"docker-compose.yml":       true,
+	"docker-compose.yaml":      true,
+	"compose.yml":              true,
+	"compose.yaml":             true,
+}
+
+// pkgManifestEntry is one matched manifest file in a directory the
+// detector visits. The lockfile→version index is computed once per dir
+// so multiple manifests in the same dir don't reparse the lockfile.
+type pkgManifestEntry struct {
+	path             string
+	basename         string
+	body             string
+	bodyLower        string
+	pathHash         string
+	wsHash           string
+	ecosystem        string
+	parsedComponents map[string]map[string]string
+}
+
+func (s *ContinuousDiscoveryService) detectPackageManifests(ctx context.Context) ([]AISignal, int, error) {
+	var out []AISignal
+	files := 0
+	walkErrs := 0
+	// Walk each scan root; collect entries grouped by dir so we can
+	// compute lockfile-based version indexes once per dir.
+	for _, root := range s.scanRoots() {
+		if err := ctx.Err(); err != nil {
+			// Caller cancelled (sidecar shutdown / scan timeout).
+			// Stop honestly rather than continue queuing work.
+			break
+		}
+		if files >= s.opts.MaxFilesPerScan {
+			break
+		}
+		// dirEntries: dir path -> manifest entries inside that dir.
+		dirEntries := map[string][]pkgManifestEntry{}
+		walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			// Cancellation check on every entry — large monorepo
+			// walks otherwise block shutdown for tens of seconds.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if err != nil {
+				// Permission errors / vanished entries are
+				// expected in long-running scans; record one bump
+				// per error so dashboards see the regression but
+				// keep going. Walking is best-effort.
+				walkErrs++
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if files >= s.opts.MaxFilesPerScan {
+				return filepath.SkipAll
+			}
+			if d.IsDir() {
+				if shouldSkipDiscoveryDir(d.Name()) && path != root {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !packageManifestNames[d.Name()] && !isProjectPackageManifest(d.Name()) {
+				return nil
+			}
+			files++
+			body, ok := readBoundedText(path, s.opts.MaxFileBytes)
+			if !ok {
+				return nil
+			}
+			// wsHash is the PROJECT ROOT hash, not the
+			// manifest's immediate dir. This is the big
+			// dedup lever: every `node_modules/<dep>/package.json`
+			// inside one project shares one wsHash (= the project
+			// root), so 358 transitive package.json hits collapse
+			// to one signal per (component, project) instead of
+			// per file. See projectRootForManifest for the
+			// cache-segment walk-up rules.
+			entry := pkgManifestEntry{
+				path:      path,
+				basename:  filepath.Base(path),
+				body:      body,
+				bodyLower: strings.ToLower(body),
+				pathHash:  hashPath(path),
+				wsHash:    hashPath(projectRootForManifest(path)),
+				ecosystem: lockparse.Ecosystem(filepath.Base(path)),
+			}
+			comps, _ := lockparse.Parse(path, s.opts.MaxFileBytes)
+			entry.parsedComponents = indexParsedManifestComponents(comps, entry.ecosystem)
+			dir := filepath.Dir(path)
+			dirEntries[dir] = append(dirEntries[dir], entry)
+			return nil
+		})
+		// WalkDir returns the first error returned by the visit
+		// callback (other than ErrSkipDir / ErrSkipAll). Cancellation
+		// surfaces as ctx.Err(); anything else is the visit-fn's
+		// per-entry diagnostic which we already counted in walkErrs.
+		if walkErr != nil && ctx.Err() != nil {
+			return out, files, ctx.Err()
+		}
+		// Per-dir: build version index from any parseable lockfile,
+		// then emit one signal per (manifest entry, matched component).
+		// We collect emissions into `raw` first and then aggregate
+		// by (sigID, componentKey, wsHash) below so transitive
+		// `node_modules/<dep>/package.json` records inside one project
+		// collapse to a single per-project signal instead of N
+		// near-identical fingerprints.
+		var raw []AISignal
+		for dir, entries := range dirEntries {
+			versionsByEcosystem := map[string]map[string]string{}
+			for _, entry := range entries {
+				for eco, components := range entry.parsedComponents {
+					if _, ok := versionsByEcosystem[eco]; !ok {
+						versionsByEcosystem[eco] = map[string]string{}
+					}
+					for name, version := range components {
+						if existing := versionsByEcosystem[eco][name]; existing == "" {
+							versionsByEcosystem[eco][name] = version
+						}
+					}
+				}
+			}
+			_ = dir // kept for future per-dir caching; intentionally unused
+			for _, entry := range entries {
+				raw = append(raw, s.matchManifestEntry(entry, versionsByEcosystem)...)
+			}
+		}
+		out = append(out, aggregateManifestSignalsByProjectRoot(raw)...)
+	}
+	if walkErrs > 0 {
+		// Surface the count via the (signal-count, file-count, error)
+		// tuple so scanStats can record it; fmt.Errorf is intentionally
+		// terse — operators don't need the per-file detail, just the
+		// fact that something went wrong during walking.
+		return out, files, fmt.Errorf("manifest walk encountered %d errors (permission / vanished entries)", walkErrs)
+	}
+	return out, files, nil
+}
+
+func indexParsedManifestComponents(comps []lockparse.Component, fallbackEcosystem string) map[string]map[string]string {
+	if len(comps) == 0 {
+		return nil
+	}
+	out := map[string]map[string]string{}
+	for _, c := range comps {
+		name := strings.ToLower(strings.TrimSpace(c.Name))
+		if name == "" {
+			continue
+		}
+		eco := strings.ToLower(strings.TrimSpace(c.Ecosystem))
+		if eco == "" {
+			eco = strings.ToLower(strings.TrimSpace(fallbackEcosystem))
+		}
+		if eco == "" {
+			continue
+		}
+		if _, ok := out[eco]; !ok {
+			out[eco] = map[string]string{}
+		}
+		if existing := out[eco][name]; existing == "" {
+			out[eco][name] = c.Version
+		}
+	}
+	return out
+}
+
+func parsedManifestComponentVersion(index map[string]map[string]string, ecosystem, name string) (string, bool) {
+	if len(index) == 0 {
+		return "", false
+	}
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return "", false
+	}
+	if eco := strings.ToLower(strings.TrimSpace(ecosystem)); eco != "" {
+		if components := index[eco]; components != nil {
+			version, ok := components[name]
+			return version, ok
+		}
+		return "", false
+	}
+	for _, components := range index {
+		if version, ok := components[name]; ok {
+			return version, true
+		}
+	}
+	return "", false
+}
+
+// aggregateManifestSignalsByProjectRoot collapses N near-identical
+// signals from one project into ONE signal per (signature,
+// component, workspace) tuple. This is the second half of Fix B
+// alongside `projectRootForManifest`: walking up to the project
+// root gave us a stable wsHash per project, but the fingerprint
+// in `signalFromEvidenceWithComponent` still depends on the per-
+// path `evidenceHash`, so two transitive manifests that resolve
+// to the same SDK still produced two signals.
+//
+// We re-key by `(sigID, componentKey, wsHash, ecosystem, version)`
+// and merge the per-path evidence into one combined evidence
+// slice, then re-emit through `signalFromEvidenceWithComponent`
+// so the fingerprint, evidence hash, and downstream wire shape
+// stay consistent. Result: 358 transitive `package.json` hits
+// for `ai` become ~5 signals (one per real project).
+//
+// Component-less signals (legacy catch-all packs) and signals
+// from other detectors are left untouched -- this is a manifest-
+// detector-specific dedup.
+// manifestAggKey is the (signature, component, workspace, version,
+// category) tuple `aggregateManifestSignalsByProjectRoot` folds
+// emissions on. Promoted to package scope so the new signal's
+// fingerprint string can be built from its fields without a
+// method-on-anonymous-struct workaround.
+type manifestAggKey struct {
+	sigID    string
+	compKey  string
+	wsHash   string
+	version  string
+	category string
+}
+
+func aggregateManifestSignalsByProjectRoot(raw []AISignal) []AISignal {
+	if len(raw) == 0 {
+		return nil
+	}
+	type bucket struct {
+		first    AISignal
+		evidence []AIEvidence
+		paths    map[string]bool
+	}
+	by := map[manifestAggKey]*bucket{}
+	order := []manifestAggKey{}
+	passthrough := []AISignal{}
+	for _, sig := range raw {
+		// Only fold rows that have a component AND a wsHash --
+		// without those we can't safely declare two rows
+		// equivalent. Catch-all (component-less) rows pass
+		// through unchanged so legacy packs don't regress.
+		if sig.Component == nil || sig.WorkspaceHash == "" {
+			passthrough = append(passthrough, sig)
+			continue
+		}
+		k := manifestAggKey{
+			sigID: sig.SignatureID,
+			compKey: strings.ToLower(sig.Component.Ecosystem) + "/" +
+				strings.ToLower(sig.Component.Name),
+			wsHash:   sig.WorkspaceHash,
+			version:  sig.Version,
+			category: sig.Category,
+		}
+		b, ok := by[k]
+		if !ok {
+			b = &bucket{
+				first: sig,
+				paths: map[string]bool{},
+			}
+			by[k] = b
+			order = append(order, k)
+		}
+		// Dedupe evidence rows by `(type, pathHash, valueHash)`
+		// so the same manifest contributing twice (e.g. parsed
+		// once as JSON and once as raw text in a future detector
+		// extension) doesn't grow the evidence slice unbounded.
+		for _, ev := range sig.Evidence {
+			key := ev.Type + "|" + ev.PathHash + "|" + ev.ValueHash
+			if b.paths[key] {
+				continue
+			}
+			b.paths[key] = true
+			b.evidence = append(b.evidence, ev)
+		}
+	}
+	out := make([]AISignal, 0, len(by)+len(passthrough))
+	for _, k := range order {
+		b := by[k]
+		// Re-stamp the signal: keep the first emit's identity
+		// (product/vendor/component/version) and rebuild the
+		// fingerprint so the SAME merged (sig, component,
+		// project) produces the SAME fingerprint across scans
+		// -- otherwise the inventory store would treat each
+		// scan as a brand-new signal and lifecycle (`new` /
+		// `seen` / `gone`) tracking would break.
+		merged := b.first
+		merged.Evidence = b.evidence
+		merged.PathHashes = nil
+		merged.Basenames = nil
+		merged.EvidenceTypes = nil
+		for _, ev := range b.evidence {
+			if ev.Type != "" {
+				merged.EvidenceTypes = appendUnique(merged.EvidenceTypes, ev.Type)
+			}
+			if ev.PathHash != "" {
+				merged.PathHashes = appendUnique(merged.PathHashes, ev.PathHash)
+			}
+			if ev.Basename != "" {
+				merged.Basenames = appendUnique(merged.Basenames, ev.Basename)
+			}
+		}
+		sort.Strings(merged.EvidenceTypes)
+		sort.Strings(merged.PathHashes)
+		sort.Strings(merged.Basenames)
+		fpInputs := []string{
+			merged.SignatureID,
+			k.category,
+			merged.Detector,
+			"component:" + k.compKey,
+			"ws:" + k.wsHash,
+			"v:" + k.version,
+		}
+		merged.Fingerprint = hashValue(strings.Join(fpInputs, "|"))
+		merged.EvidenceHash = hashEvidence(b.evidence)
+		out = append(out, merged)
+	}
+	out = append(out, passthrough...)
+	return out
+}
+
+// matchManifestEntry resolves every catalog signature against one
+// manifest body. When the matched package resolves to a declared
+// component on the signature, the emitted signal carries the
+// component's framework label and any co-located lockfile version.
+//
+// Backward compatibility: signatures without `components` keep their
+// previous "first match wins" behaviour (emitting the catch-all
+// signature row), so this change is purely additive for old packs.
+func (s *ContinuousDiscoveryService) matchManifestEntry(entry pkgManifestEntry, versions map[string]map[string]string) []AISignal {
+	var out []AISignal
+	for _, sig := range s.catalog {
+		emittedComponents := map[string]bool{}
+		emittedFallback := false
+		for _, pkg := range sig.PackageNames {
+			pkgLower := strings.ToLower(strings.TrimSpace(pkg))
+			if pkgLower == "" {
+				continue
+			}
+			component := sig.resolveComponent(pkgLower, entry.ecosystem)
+			if component == nil {
+				if !strings.Contains(entry.bodyLower, pkgLower) {
+					continue
+				}
+				// CRITICAL: when the signature DOES declare components
+				// but the matched package didn't resolve to any of
+				// them for THIS ecosystem, we MUST drop the match.
+				// Otherwise a 2-character npm package name like "ai"
+				// substring-matches the body of a Cargo.toml /
+				// pyproject.toml / build.gradle.kts and the
+				// catch-all emit attributes the hit to "Vercel AI
+				// SDK" with the wrong basename + ecosystem on the
+				// wire. Real-world repro that landed this guard:
+				// 685 "Vercel AI SDK" rows on a fresh scan, 209 of
+				// which were Cargo.toml hits (Rust files) and only
+				// ~365 actual npm manifests.
+				//
+				// Legacy signatures without `components` keep their
+				// historical "first match wins" catch-all behaviour
+				// so the wire shape doesn't regress for old packs.
+				if len(sig.Components) > 0 {
+					continue
+				}
+				if emittedFallback {
+					continue
+				}
+				ev := AIEvidence{
+					Type:          "package",
+					Basename:      entry.basename,
+					PathHash:      entry.pathHash,
+					WorkspaceHash: entry.wsHash,
+					ValueHash:     hashValue(pkgLower),
+					// Catch-all: we matched a package-name *substring*
+					// inside the manifest body without resolving to a
+					// declared component. Treat it as a substring
+					// match with reduced quality so the engine
+					// down-weights legacy catch-all packs.
+					Quality:   0.6,
+					MatchKind: MatchKindSubstring,
+				}
+				out = append(out, s.signalFromEvidence(sig, SignalPackageDependency, "package_manifest", []AIEvidence{ev}))
+				emittedFallback = true
+				continue
+			}
+			version, ok := parsedManifestComponentVersion(entry.parsedComponents, component.Ecosystem, component.Name)
+			if !ok {
+				continue
+			}
+			componentKey := strings.ToLower(component.Ecosystem) + "/" + strings.ToLower(component.Name)
+			if emittedComponents[componentKey] {
+				continue
+			}
+			emittedComponents[componentKey] = true
+			// Enrich with the parsed lockfile version when available.
+			if eco := strings.ToLower(component.Ecosystem); eco != "" {
+				if vs, ok := versions[eco]; ok {
+					if v := vs[strings.ToLower(component.Name)]; v != "" {
+						version = v
+					}
+				}
+			}
+			if version == "" {
+				// Fallback: search across all collected ecosystems
+				// (handles the case where a lockfile didn't tag its
+				// ecosystem precisely).
+				for _, vs := range versions {
+					if v := vs[strings.ToLower(component.Name)]; v != "" {
+						version = v
+						break
+					}
+				}
+			}
+			resolved := AIComponent{
+				Ecosystem: component.Ecosystem,
+				Name:      component.Name,
+				Framework: component.Framework,
+				Version:   version,
+			}
+			// Apply the per-component vendor override too: when the
+			// catalog component declares its own vendor (e.g.
+			// `OpenAI` for the `openai` package), it wins over the
+			// signature-level "Multiple" catch-all.
+			componentSig := sig
+			if component.Vendor != "" {
+				componentSig.Vendor = component.Vendor
+			}
+			// Component-resolved match: the package name in the
+			// manifest body matched a declared component
+			// (e.g. `openai`). Treat this as the strongest possible
+			// manifest evidence (Quality=1.0, MatchKind=exact).
+			// When a co-located lockfile pinned a version, we have
+			// even more certainty -- the engine adds a small bonus
+			// internally for "version present", but the Quality
+			// stamp remains 1.0 so old policies stay calibrated.
+			ev := AIEvidence{
+				Type:          "package",
+				Basename:      entry.basename,
+				PathHash:      entry.pathHash,
+				WorkspaceHash: entry.wsHash,
+				ValueHash:     hashValue(componentKey),
+				Quality:       1.0,
+				MatchKind:     MatchKindExact,
+			}
+			out = append(out, s.signalFromEvidenceWithComponent(componentSig, SignalPackageDependency, "package_manifest", []AIEvidence{ev}, &resolved))
+		}
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) detectShellHistory() ([]AISignal, int, error) {
+	var paths []string
+	for _, home := range s.homesToScan() {
+		paths = append(paths,
+			filepath.Join(home, ".zsh_history"),
+			filepath.Join(home, ".bash_history"),
+			filepath.Join(home, ".config", "fish", "fish_history"),
+		)
+	}
+	paths = append(paths, platformShellHistoryPaths(s.opts.HomeDir)...)
+	var out []AISignal
+	files := 0
+	for _, path := range paths {
+		body, ok := readBoundedTail(path, s.opts.MaxFileBytes)
+		if !ok {
+			continue
+		}
+		files++
+		lower := strings.ToLower(body)
+		for _, sig := range s.catalog {
+			for _, pattern := range sig.HistoryPatterns {
+				pattern = strings.ToLower(strings.TrimSpace(pattern))
+				if pattern == "" || !strings.Contains(lower, pattern) {
+					continue
+				}
+				// M-2: the evidence ID is a *stable identity* for "this
+				// signature's pattern matched in this history file". The
+				// previous implementation hashed the entire history tail
+				// into the ValueHash, so every additional shell command
+				// the user ran shifted the fingerprint and the signal
+				// looked like a fresh detection on every scan. That
+				// broke deduplication, NewSignals counts, and downstream
+				// alert "since last seen" semantics. Identity should
+				// only depend on what was detected (signature + pattern
+				// + which history file), not on how many other commands
+				// happen to live in the tail.
+				ev := AIEvidence{
+					Type:      "history",
+					Basename:  filepath.Base(path),
+					PathHash:  hashPath(path),
+					ValueHash: hashValue(sig.ID + ":" + pattern),
+					// Shell-history matches are a substring scan
+					// over a flat command log -- there is no
+					// structured guarantee that the pattern was
+					// invoked as a real command (it could appear in
+					// a comment, an env-var expansion, or a `grep`
+					// argument). Quality 0.5 + heuristic kind tells
+					// the engine to treat this as weak corroborating
+					// evidence rather than a primary signal.
+					Quality:   0.5,
+					MatchKind: MatchKindHeuristic,
+				}
+				out = append(out, s.signalFromEvidence(sig, SignalShellHistoryMatch, "shell_history", []AIEvidence{ev}))
+				break
+			}
+			if !s.opts.IncludeNetworkDomains {
+				continue
+			}
+			for _, domain := range sig.DomainPatterns {
+				domain = strings.ToLower(strings.TrimSpace(domain))
+				if domain == "" || !strings.Contains(lower, domain) {
+					continue
+				}
+				ev := AIEvidence{
+					Type:      "domain",
+					Basename:  filepath.Base(path),
+					PathHash:  hashPath(path),
+					ValueHash: hashValue(sig.ID + ":" + domain),
+				}
+				out = append(out, s.signalFromEvidence(sig, SignalProviderDomain, "shell_history", []AIEvidence{ev}))
+				break
+			}
+		}
+	}
+	return out, files, nil
+}
+
+func (s *ContinuousDiscoveryService) signalFromPath(sig AISignature, category, detector, path string) AISignal {
+	ev := AIEvidence{Type: detector, Basename: filepath.Base(path), PathHash: hashPath(path)}
+	if s.opts.StoreRawLocalPaths {
+		ev.RawPath = path
+	}
+	out := s.signalFromEvidence(sig, category, detector, []AIEvidence{ev})
+	// "Last active" for path-evidence detectors (config / binary /
+	// MCP / extension) defaults to the file's modification time when
+	// available. That's a meaningful liveness proxy: an `~/.codex/`
+	// config touched 30 seconds ago indicates current use; one
+	// stale for 6 months indicates dormant install. Process and
+	// package_manifest detectors override this with their own
+	// timestamps.
+	if st, err := os.Stat(path); err == nil {
+		mt := st.ModTime().UTC()
+		out.LastActiveAt = &mt
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) signalFromValue(sig AISignature, category, detector, value string) AISignal {
+	ev := AIEvidence{Type: detector, ValueHash: hashValue(value)}
+	return s.signalFromEvidence(sig, category, detector, []AIEvidence{ev})
+}
+
+func (s *ContinuousDiscoveryService) signalFromEvidence(sig AISignature, category, detector string, evidence []AIEvidence) AISignal {
+	return s.signalFromEvidenceWithComponent(sig, category, detector, evidence, nil)
+}
+
+// signalFromEvidenceWithComponent is the per-component variant: when the
+// caller resolved the matched value (e.g. the package name in a
+// manifest body) to a known signature component, the resulting signal
+// carries that identity in `Component`, overrides `Product`/`Vendor`
+// with the component's framework labels, and folds the component name
+// into the fingerprint so per-component rows from the same signature
+// (`openai` vs `langchain` vs `llama-index` under `ai-sdks`) get
+// distinct, stable fingerprints.
+func (s *ContinuousDiscoveryService) signalFromEvidenceWithComponent(sig AISignature, category, detector string, evidence []AIEvidence, component *AIComponent) AISignal {
+	sort.Slice(evidence, func(i, j int) bool {
+		return evidence[i].Type+evidence[i].PathHash+evidence[i].ValueHash < evidence[j].Type+evidence[j].PathHash+evidence[j].ValueHash
+	})
+	evidenceHash := hashEvidence(evidence)
+	fpInputs := []string{sig.ID, category, detector, evidenceHash}
+	if component != nil && component.Name != "" {
+		// Component name (lowercased ecosystem-qualified) participates
+		// in the fingerprint so the same manifest matching multiple
+		// AI SDK packages produces distinct, stable per-package rows.
+		fpInputs = append(fpInputs, "component:"+strings.ToLower(component.Ecosystem)+"/"+strings.ToLower(component.Name))
+	}
+	fp := hashValue(strings.Join(fpInputs, "|"))
+	product := sig.Name
+	vendor := sig.Vendor
+	if component != nil && component.Framework != "" {
+		product = component.Framework
+	}
+	// Component-level vendor override is applied by the *caller*
+	// (detectPackageManifests) on a copy of `sig` before invoking
+	// this helper, since the runtime AIComponent view does not
+	// carry the catalog Vendor field. See signalFromEvidenceWithComponent
+	// callers in detectPackageManifests for the exact pattern.
+	out := AISignal{
+		Fingerprint:        fp,
+		SignatureID:        sig.ID,
+		Name:               sig.Name,
+		Vendor:             vendor,
+		Product:            product,
+		Category:           category,
+		SupportedConnector: sig.SupportedConnector,
+		Confidence:         sig.Confidence,
+		Detector:           detector,
+		Source:             "sidecar",
+		EvidenceHash:       evidenceHash,
+		Evidence:           evidence,
+		Component:          component,
+	}
+	if component != nil && component.Version != "" {
+		// Surface the parsed lockfile version on the existing
+		// `version` field too so older API/TUI clients that don't
+		// know about `component.version` still get the data.
+		out.Version = component.Version
+	}
+	for _, ev := range evidence {
+		if ev.Type != "" {
+			out.EvidenceTypes = appendUnique(out.EvidenceTypes, ev.Type)
+		}
+		if ev.PathHash != "" {
+			out.PathHashes = appendUnique(out.PathHashes, ev.PathHash)
+		}
+		if ev.Basename != "" {
+			out.Basenames = appendUnique(out.Basenames, ev.Basename)
+		}
+		if out.WorkspaceHash == "" && ev.WorkspaceHash != "" {
+			out.WorkspaceHash = ev.WorkspaceHash
+		}
+	}
+	sort.Strings(out.EvidenceTypes)
+	sort.Strings(out.PathHashes)
+	sort.Strings(out.Basenames)
+	return out
+}
+
+func (s *ContinuousDiscoveryService) scanRoots() []string {
+	var roots []string
+	seen := make(map[string]struct{})
+	for _, root := range s.opts.ScanRoots {
+		for _, expanded := range s.expandCandidatePath(root) {
+			if _, ok := seen[expanded]; ok {
+				continue
+			}
+			if st, err := os.Stat(expanded); err == nil && st.IsDir() {
+				seen[expanded] = struct{}{}
+				roots = append(roots, expanded)
+			}
+		}
+	}
+	if len(roots) == 0 {
+		for _, home := range s.homesToScan() {
+			if _, ok := seen[home]; ok {
+				continue
+			}
+			seen[home] = struct{}{}
+			roots = append(roots, home)
+		}
+	}
+	return roots
+}
+
+func (s *ContinuousDiscoveryService) expandCandidatePath(candidate string) []string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return nil
+	}
+	missingEnv := false
+	candidate = os.Expand(candidate, func(name string) string {
+		value, ok := platformDiscoveryVariable(name, s.opts.HomeDir)
+		if !ok || strings.TrimSpace(value) == "" {
+			missingEnv = true
+		}
+		return value
+	})
+	if missingEnv {
+		return nil
+	}
+	if strings.HasPrefix(candidate, "~") {
+		tail := strings.TrimPrefix(candidate, "~")
+		homes := s.homesToScan()
+		if len(homes) == 0 {
+			return nil
+		}
+		out := make([]string, 0, len(homes))
+		seen := make(map[string]struct{}, len(homes))
+		for _, home := range homes {
+			p := filepath.Clean(filepath.Join(home, tail))
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+		return out
+	}
+	if filepath.IsAbs(candidate) {
+		return []string{filepath.Clean(candidate)}
+	}
+	var out []string
+	for _, root := range s.scanRootsForRelative() {
+		out = append(out, filepath.Clean(filepath.Join(root, candidate)))
+	}
+	return out
+}
+
+func (s *ContinuousDiscoveryService) scanRootsForRelative() []string {
+	var roots []string
+	for _, root := range s.opts.ScanRoots {
+		if root == "" || root == "." {
+			if cwd, err := os.Getwd(); err == nil {
+				roots = append(roots, cwd)
+			}
+			continue
+		}
+		if strings.HasPrefix(root, "~") {
+			tail := strings.TrimPrefix(root, "~")
+			for _, home := range s.homesToScan() {
+				roots = append(roots, filepath.Clean(filepath.Join(home, tail)))
+			}
+			continue
+		}
+		if filepath.IsAbs(root) {
+			roots = append(roots, filepath.Clean(root))
+		}
+	}
+	if len(roots) == 0 {
+		if cwd, err := os.Getwd(); err == nil {
+			roots = append(roots, cwd)
+		}
+	}
+	return roots
+}
+
+// componentSignalGroup is one rollup row's worth of state used by
+// the OTel emitter. Capturing the canonical ecosystem / name
+// strings (first non-empty wins, matching gateway.rollupComponents)
+// keeps the OTel labels stable across scans even when a later
+// signal in the same group has the field zeroed.
+type componentSignalGroup struct {
+	Ecosystem          string
+	Name               string
+	Framework          string
+	Signals            []AISignal
+	WorkspaceCount     int
+	HasLifecycleChange bool
+}
+
+// componentKey is the dedupe key for AI components. Lowercased
+// ecosystem + name so the OTel emitter and the API rollup
+// (gateway.rollupComponents) always agree on which signals belong
+// to the same SDK regardless of detector capitalization.
+//
+// We intentionally use a struct (rather than a delimited string)
+// so untrusted input can't collide via an embedded NUL byte.
+type componentKey struct {
+	ecosystem string
+	name      string
+}
+
+func keyForComponent(c *AIComponent) (componentKey, bool) {
+	if c == nil || c.Name == "" {
+		return componentKey{}, false
+	}
+	return componentKey{
+		ecosystem: strings.ToLower(c.Ecosystem),
+		name:      strings.ToLower(c.Name),
+	}, true
+}
+
+// productKey is the secondary dedupe key for AI products that
+// don't map to an (ecosystem, name) component -- CLI binaries
+// (Claude Code, Cursor, Codex), desktop apps (Claude Desktop),
+// MCP-only entries (Hermes Agent), and shell-history-derived
+// products (Open WebUI, LocalAI). The confidence engine still
+// computes one score per product so the API / CLI / TUI can
+// surface high-fidelity identity / presence on those rows the
+// same way they do for component-bearing SDKs.
+//
+// Lowercased so vendor casing inconsistencies in the catalog
+// (e.g. "Anysphere" vs "anysphere") don't fragment the rollup.
+// Vendor is part of the key so two different vendors that ship a
+// product with the same name (rare but possible) stay separate.
+type productKey struct {
+	vendor  string
+	product string
+}
+
+// keyForProduct extracts the (vendor, product) pair from a
+// signal. Returns ok=false when EITHER side is empty -- those
+// signals stay un-enriched on the wire (the engine has no
+// stable identity to attach the score to). The catch-all
+// "AI SDKs" / "Multiple" rollup signal does have both fields, so
+// it gets a score too even though it's not super meaningful;
+// the alternative (special-casing it) was deemed worse than the
+// occasional misleading number.
+func keyForProduct(sig AISignal) (productKey, bool) {
+	v := strings.ToLower(strings.TrimSpace(sig.Vendor))
+	p := strings.ToLower(strings.TrimSpace(sig.Product))
+	if v == "" || p == "" {
+		return productKey{}, false
+	}
+	return productKey{vendor: v, product: p}, true
+}
+
+// productSignalGroup is the product-keyed analogue of
+// componentSignalGroup. Kept separate so the OTel emission path
+// can continue to iterate `Groups` (component-only) without
+// suddenly producing per-product metric series -- expanding OTel
+// cardinality is a separate decision from extending the
+// API/CLI/TUI confidence surface, which is what the operator
+// actually asked for.
+type productSignalGroup struct {
+	Vendor             string
+	Product            string
+	Signals            []AISignal
+	WorkspaceCount     int
+	HasLifecycleChange bool
+}
+
+// componentRollupSnapshot bundles the per-(ecosystem, name)
+// signal grouping and the matching scored confidence into one
+// pass-by-value blob. Built ONCE per scan in fanoutReport so the
+// OTel metrics, OTel logs, and gateway-events fanout all share
+// the same numbers (would drift otherwise because each emitter
+// would call ComputeComponentConfidence with its own
+// time.Now()-derived recency factor). When the consumer doesn't
+// need scores (default-config installs with redaction on), the
+// Scores map is left nil so emitters know to skip the lookup
+// and the rollup work is itself skipped at the call site.
+//
+// `ProductGroups` / `ProductScores` carry the parallel
+// per-(vendor, product) rollup for signals that do NOT have a
+// component (CLI binaries, desktop apps, MCP entries, etc.).
+// These exist so the API / CLI / TUI can surface confidence on
+// every row -- including Claude Code / Cursor / Codex -- not
+// just SDK rows. They are intentionally NOT consumed by the
+// OTel emitter so per-product cardinality doesn't leak into
+// metric series without an explicit decision.
+type componentRollupSnapshot struct {
+	Groups        []componentSignalGroup
+	Scores        map[componentKey]*ConfidenceResult
+	ProductGroups []productSignalGroup
+	ProductScores map[productKey]*ConfidenceResult
+}
+
+// ScoreFor returns the precomputed confidence for one group.
+// ok=false means the snapshot was built without scores (because
+// no consumer needed them) or the engine produced no result for
+// this key (defensive — should never happen in practice).
+func (s componentRollupSnapshot) ScoreFor(g componentSignalGroup) (ConfidenceResult, bool) {
+	if s.Scores == nil {
+		return ConfidenceResult{}, false
+	}
+	c, ok := s.Scores[componentKey{
+		ecosystem: strings.ToLower(g.Ecosystem),
+		name:      strings.ToLower(g.Name),
+	}]
+	if !ok || c == nil {
+		return ConfidenceResult{}, false
+	}
+	return *c, true
+}
+
+// LookupSignal returns the score pointer for the component this
+// signal belongs to. Falls through to the per-(vendor, product)
+// rollup when the signal has no component block so non-SDK
+// rows (Claude Code, Cursor, Codex, ...) get confidence on the
+// API / CLI / TUI surfaces too. Returns nil only for signals
+// that have neither a component nor a vendor+product pair. Canonical v8
+// adapters treat nil as the absence of a confidence observation.
+func (s componentRollupSnapshot) LookupSignal(sig AISignal) *ConfidenceResult {
+	// Local model IDs deliberately do not participate in product/component
+	// confidence rollups: they are unbounded identities held in sig.Model,
+	// while Product is the bounded serving runtime (for example, Lemonade
+	// Server). Reusing the runtime's confidence for every model would imply
+	// that a server binary proves each individual model is installed. The
+	// model status is instead asserted directly by the model_api,
+	// model_runtime, or model_file detector.
+	if sig.Model != nil {
+		return nil
+	}
+	if k, ok := keyForComponent(sig.Component); ok && s.Scores != nil {
+		if c, found := s.Scores[k]; found && c != nil {
+			return c
+		}
+	}
+	if s.ProductScores != nil {
+		if k, ok := keyForProduct(sig); ok {
+			return s.ProductScores[k]
+		}
+	}
+	return nil
+}
+
+// groupSignalsForRollup buckets signals by lowercased (ecosystem,
+// name) -- matching gateway.rollupComponents so a single
+// "openai" emission covers PyPI's openai package no matter how
+// many manifests / processes contributed. Workspace and lifecycle
+// metadata is summarized inline to avoid a second pass.
+func groupSignalsForRollup(signals []AISignal) []componentSignalGroup {
+	type bucket struct {
+		group      componentSignalGroup
+		workspaces map[string]struct{}
+	}
+	by := map[componentKey]*bucket{}
+	order := []componentKey{}
+	for _, sig := range signals {
+		if sig.State == AIStateGone {
+			continue
+		}
+		// A model ID is an unbounded, user-controlled identity. It must never
+		// become an ecosystem/name metric label, even if an external report
+		// supplies a Component block on a local-model signal.
+		if sig.Model != nil || sig.Category == SignalLocalModel {
+			continue
+		}
+		k, ok := keyForComponent(sig.Component)
+		if !ok {
+			continue
+		}
+		b := by[k]
+		if b == nil {
+			b = &bucket{
+				group: componentSignalGroup{
+					Ecosystem: sig.Component.Ecosystem,
+					Name:      sig.Component.Name,
+					Framework: sig.Component.Framework,
+				},
+				workspaces: map[string]struct{}{},
+			}
+			by[k] = b
+			order = append(order, k)
+		}
+		// First-non-empty wins for Framework so the OTel label
+		// matches the API rollup even when the first signal in
+		// the group lacks the field.
+		if b.group.Framework == "" && sig.Component.Framework != "" {
+			b.group.Framework = sig.Component.Framework
+		}
+		if sig.WorkspaceHash != "" {
+			b.workspaces[sig.WorkspaceHash] = struct{}{}
+		}
+		if sig.State == AIStateNew || sig.State == AIStateChanged || sig.State == AIStateGone {
+			b.group.HasLifecycleChange = true
+		}
+		b.group.Signals = append(b.group.Signals, sig)
+	}
+	out := make([]componentSignalGroup, 0, len(by))
+	for _, k := range order {
+		b := by[k]
+		b.group.WorkspaceCount = len(b.workspaces)
+		out = append(out, b.group)
+	}
+	return out
+}
+
+// groupSignalsByProduct buckets signals WITHOUT a component
+// block by lowercased (vendor, product). Signals that DO have a
+// component are deliberately excluded -- they're already scored
+// by `groupSignalsForRollup`, and double-counting them via a
+// product-keyed group would inflate the LR sum. Workspace and
+// lifecycle metadata is summarized inline (mirrors
+// `groupSignalsForRollup`) so the per-product OTel attrs we may
+// add in the future have the same shape as the per-component
+// ones.
+func groupSignalsByProduct(signals []AISignal) []productSignalGroup {
+	type bucket struct {
+		group      productSignalGroup
+		workspaces map[string]struct{}
+	}
+	by := map[productKey]*bucket{}
+	order := []productKey{}
+	for _, sig := range signals {
+		if sig.State == AIStateGone {
+			continue
+		}
+		// Model observations have their own unbounded identity in
+		// sig.Model and must not multiply the confidence of the bounded
+		// serving-runtime Product when several models are installed.
+		if sig.Model != nil {
+			continue
+		}
+		// Skip component-bearing signals -- those are already
+		// covered by the per-component rollup and adding them
+		// here would double-count their LR contributions.
+		if _, hasComp := keyForComponent(sig.Component); hasComp {
+			continue
+		}
+		k, ok := keyForProduct(sig)
+		if !ok {
+			continue
+		}
+		b := by[k]
+		if b == nil {
+			b = &bucket{
+				group: productSignalGroup{
+					Vendor:  sig.Vendor,
+					Product: sig.Product,
+				},
+				workspaces: map[string]struct{}{},
+			}
+			by[k] = b
+			order = append(order, k)
+		}
+		if sig.WorkspaceHash != "" {
+			b.workspaces[sig.WorkspaceHash] = struct{}{}
+		}
+		if sig.State == AIStateNew || sig.State == AIStateChanged || sig.State == AIStateGone {
+			b.group.HasLifecycleChange = true
+		}
+		b.group.Signals = append(b.group.Signals, sig)
+	}
+	out := make([]productSignalGroup, 0, len(by))
+	for _, k := range order {
+		b := by[k]
+		b.group.WorkspaceCount = len(b.workspaces)
+		out = append(out, b.group)
+	}
+	return out
+}
+
+// buildComponentRollupSnapshot is the single source of truth for
+// per-component AND per-(vendor, product) scoring during one
+// scan. Both the OTel emitter and the gateway-events fanout
+// consume the component half of the result so they publish
+// byte-identical numbers. The product half is consumed by
+// `EnrichSignalsWithComponentConfidence` so the API / CLI / TUI
+// surface confidence on rows that don't have a component (CLI
+// binaries, desktop apps, MCP entries, etc.). `now` is captured
+// ONCE so the recency factor in ComputeComponentConfidence is
+// the same across every group's presence calculation in this
+// scan -- otherwise an SDK row computed at t and a CLI row
+// computed at t+ε could differ by tenths of a percent and the
+// "engine numbers must agree across surfaces" invariant breaks.
+func buildComponentRollupSnapshot(signals []AISignal, params ConfidenceParams) componentRollupSnapshot {
+	groups := groupSignalsForRollup(signals)
+	productGroups := groupSignalsByProduct(signals)
+	// Both empty: nothing to score. Returning the zero value
+	// preserves the documented "snap.Scores == nil means skip
+	// emission" contract for downstream emitters.
+	if len(groups) == 0 && len(productGroups) == 0 {
+		return componentRollupSnapshot{}
+	}
+	now := time.Now().UTC()
+	var scores map[componentKey]*ConfidenceResult
+	if len(groups) > 0 {
+		scores = make(map[componentKey]*ConfidenceResult, len(groups))
+		for i := range groups {
+			// Index into the slice (rather than using a copy
+			// via `for _, g := range groups`) so the entry we
+			// put in the map points at storage owned by this
+			// snapshot. Go 1.22+ already gives per-iteration
+			// variable scope so taking &conf would be safe;
+			// keeping the slice indexing makes the lifetime
+			// explicit anyway.
+			g := &groups[i]
+			conf := ComputeComponentConfidence(g.Signals, now, params)
+			scores[componentKey{
+				ecosystem: strings.ToLower(g.Ecosystem),
+				name:      strings.ToLower(g.Name),
+			}] = &conf
+		}
+	}
+	var productScores map[productKey]*ConfidenceResult
+	if len(productGroups) > 0 {
+		productScores = make(map[productKey]*ConfidenceResult, len(productGroups))
+		for i := range productGroups {
+			g := &productGroups[i]
+			conf := ComputeComponentConfidence(g.Signals, now, params)
+			productScores[productKey{
+				vendor:  strings.ToLower(g.Vendor),
+				product: strings.ToLower(g.Product),
+			}] = &conf
+		}
+	}
+	return componentRollupSnapshot{
+		Groups:        groups,
+		Scores:        scores,
+		ProductGroups: productGroups,
+		ProductScores: productScores,
+	}
+}
+
+// EnrichSignalsWithComponentConfidence stamps the per-component
+// (or per-product, when there is no component) identity /
+// presence scores + bands onto each signal in-place. It is safe
+// to call on a clone returned from Snapshot() (the API path) but
+// DO NOT call it on data that gets persisted -- the fields are
+// intentionally left zero on the in-memory state and on disk so
+// the engine output is the single source of truth and no stale
+// snapshot can drift.
+//
+// Signals that have neither a Component block nor a vendor +
+// product pair keep zero scores and bands; `omitempty` then
+// hides them on the wire so legacy consumers don't see noisy
+// nulls. The same `componentRollupSnapshot` the OTel +
+// gateway-events fanout uses is built here so the CLI
+// (`agent usage --detail`), the API (`/api/v1/ai-usage`), the
+// metrics histogram, and the per-signal payloads on the events
+// bus all report byte-identical numbers for one scan -- with
+// the explicit caveat that the OTel emitter intentionally only
+// publishes per-COMPONENT scores (not per-product) so we don't
+// quietly expand metric cardinality.
+func EnrichSignalsWithComponentConfidence(signals []AISignal, params ConfidenceParams) {
+	if len(signals) == 0 {
+		return
+	}
+	snap := buildComponentRollupSnapshot(signals, params)
+	// Skip enrichment only when BOTH score maps are empty --
+	// otherwise a workspace with only CLI / process products
+	// (no SDK manifests) would silently lose the new
+	// per-product scores, which is exactly what we just added
+	// this codepath for.
+	if snap.Scores == nil && snap.ProductScores == nil {
+		return
+	}
+	for i := range signals {
+		conf := snap.LookupSignal(signals[i])
+		if conf == nil {
+			continue
+		}
+		signals[i].IdentityScore = clampConfidenceScore(conf.IdentityScore)
+		signals[i].IdentityBand = conf.IdentityBand
+		signals[i].PresenceScore = clampConfidenceScore(conf.PresenceScore)
+		signals[i].PresenceBand = conf.PresenceBand
+	}
+}
+
+func clampConfidenceScore(value float64) float64 {
+	if value != value || value < 0 {
+		return 0
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
+}
+
+func buildComponentConfidenceAttrs(g componentSignalGroup, conf ConfidenceResult, policyVersion int) telemetry.AIComponentConfidenceAttrs {
+	return telemetry.AIComponentConfidenceAttrs{
+		Ecosystem:      g.Ecosystem,
+		Name:           g.Name,
+		Framework:      g.Framework,
+		IdentityScore:  conf.IdentityScore,
+		IdentityBand:   conf.IdentityBand,
+		PresenceScore:  conf.PresenceScore,
+		PresenceBand:   conf.PresenceBand,
+		InstallCount:   len(g.Signals),
+		WorkspaceCount: g.WorkspaceCount,
+		PolicyVersion:  policyVersion,
+		DetectorCount:  len(conf.Detectors),
+	}
+}
+
+// AISourceExternal is the value forcibly written into AIDiscoveryReport
+// summary.source / signal.source whenever IngestExternalReport accepts a
+// report. The internal sidecar scanner uses "sidecar" (see
+// signalFromEvidence and runScan); keeping the two values distinct
+// means downstream OTel queries can filter on a source the CLI cannot
+// forge.
+const AISourceExternal = "external"
+
+// IngestExternalReport validates and records sanitized reports from external
+// discovery clients. It does not merge raw evidence into local state.
+//
+// SECURITY (M-5): the CLI controls the entire report body, including
+// summary.source and per-signal source. The previous implementation
+// trusted both, so a malicious CLI could send {"summary":{"source":
+// "sidecar"}, "signals":[{"source":"sidecar", ...}]} and the gateway
+// would emit OTel + gateway events that looked indistinguishable from
+// signals the local sidecar scanner produced. We now force-attribute
+// every external report to AISourceExternal before any telemetry or
+// audit fanout runs, so the "sidecar" attribution stays unforgeable.
+//
+// The report is taken by pointer so the rewrite is visible to callers
+// (handleAIUsageDiscovery passes its decoded body directly here, and
+// any subsequent reuse of the same struct must observe the forced
+// attribution).
+func (s *ContinuousDiscoveryService) IngestExternalReport(ctx context.Context, report *AIDiscoveryReport) error {
+	if s == nil {
+		return errors.New("ai discovery disabled")
+	}
+	if report == nil {
+		return errors.New("missing report")
+	}
+	if err := ValidateSanitizedAIDiscoveryReport(*report); err != nil {
+		return err
+	}
+	report.Summary.Source = AISourceExternal
+	for i := range report.Signals {
+		report.Signals[i].Source = AISourceExternal
+		// Provenance country/publisher claims are catalog-controlled. An
+		// external discovery client may supply the model ID, but it cannot
+		// impersonate a higher-confidence publisher rule on outbound events.
+		// Recompute from the bounded ID with the same embedded resolver used by
+		// sidecar-native detections.
+		if report.Signals[i].Model != nil {
+			report.Signals[i].Model.Provenance = nil
+			enrichLocalModelProvenance(report.Signals[i].Model, modelProvenanceHints{})
+		}
+	}
+	s.fanoutReport(ctx, *report)
+	return nil
+}
+
+func ValidateSanitizedAIDiscoveryReport(report AIDiscoveryReport) error {
+	if strings.TrimSpace(report.Summary.ScanID) == "" {
+		return errors.New("scan_id is required")
+	}
+	// Cap raised from 256 → 4096 because the v2 detector emits one
+	// signal per matched component rather than one per signature, so
+	// reports from realistic monorepos legitimately carry hundreds to
+	// low thousands of rows. The cap still bounds adversarial input.
+	if len(report.Signals) > 4096 {
+		return errors.New("too many signals")
+	}
+	for _, sig := range report.Signals {
+		if !allowedAISignalCategories[sig.Category] {
+			return fmt.Errorf("unsupported category %q", sig.Category)
+		}
+		if sig.Category == SignalLocalModel && sig.Model == nil {
+			return errors.New("local_model signals require model metadata")
+		}
+		if sig.Category != SignalLocalModel && sig.Model != nil {
+			return errors.New("model metadata is only allowed on local_model signals")
+		}
+		for _, value := range sig.PathHashes {
+			if value != "" && !isSHA256Hash(value) {
+				return errors.New("path hashes must be sha256:<64 hex> or hmac-sha256:<64 hex>")
+			}
+		}
+		if sig.WorkspaceHash != "" && !isSHA256Hash(sig.WorkspaceHash) {
+			return errors.New("workspace_hash must be sha256:<64 hex> or hmac-sha256:<64 hex>")
+		}
+		for _, value := range sig.Basenames {
+			if strings.Contains(value, "/") || strings.Contains(value, "\\") {
+				return errors.New("raw paths are not allowed")
+			}
+		}
+		if sig.Model != nil {
+			model := sig.Model
+			if strings.TrimSpace(model.ID) == "" || len(model.ID) > 512 || containsUnicodeControl(model.ID) {
+				return errors.New("model id must be 1..512 printable characters")
+			}
+			if model.Status != "installed" && model.Status != "loaded" {
+				return fmt.Errorf("unsupported model status %q", model.Status)
+			}
+			for field, rule := range map[string]struct {
+				value string
+				max   int
+			}{
+				"format": {model.Format, 64}, "provider": {model.Provider, 96},
+				"recipe": {model.Recipe, 128}, "modality": {model.Modality, 64},
+				"device": {model.Device, 128}, "owner_application": {model.OwnerApplication, 96},
+			} {
+				if len(rule.value) > rule.max || containsUnicodeControl(rule.value) {
+					return fmt.Errorf("model %s must be at most %d printable characters", field, rule.max)
+				}
+			}
+			if model.SizeBytes < 0 {
+				return errors.New("model size_bytes must be non-negative")
+			}
+			if strings.ContainsAny(model.OwnerApplication, `/\\`) {
+				return errors.New("model owner_application must not contain path separators")
+			}
+			switch model.Relevance {
+			case "", "primary", "supporting", "embedded", "unknown":
+			default:
+				return fmt.Errorf("unsupported model relevance %q", model.Relevance)
+			}
+			if model.DiscoveryConfidence != nil {
+				confidence := *model.DiscoveryConfidence
+				if confidence != confidence || confidence < 0 || confidence > 1 {
+					return errors.New("model discovery_confidence must be between 0 and 1")
+				}
+			}
+			if err := validateLocalModelProvenance(model.Provenance); err != nil {
+				return err
+			}
+		}
+		// Phase-2 evidence bounds: keep the per-signal Evidence
+		// list finite and reject obviously hostile rows. We still
+		// allow Quality > 1 / < 0 to be normalized later by the
+		// engine, so the only hard failure is the count cap.
+		if len(sig.Evidence) > maxEvidencePerSignal {
+			return fmt.Errorf("signal %q has %d evidence rows (max %d)", sig.SignalID, len(sig.Evidence), maxEvidencePerSignal)
+		}
+		for _, ev := range sig.Evidence {
+			if ev.PathHash != "" && !isSHA256Hash(ev.PathHash) {
+				return errors.New("evidence path_hash must be sha256:<64 hex> or hmac-sha256:<64 hex>")
+			}
+			if ev.Basename != "" && (strings.Contains(ev.Basename, "/") || strings.Contains(ev.Basename, "\\")) {
+				return errors.New("evidence basename must not contain path separators")
+			}
+		}
+	}
+	return nil
+}
+
+func containsUnicodeControl(value string) bool {
+	return strings.IndexFunc(value, unicode.IsControl) >= 0
+}
+
+// SanitizeEvidenceForWire unconditionally clears RawPath from every
+// AISignal.Evidence row while retaining non-sensitive Quality and MatchKind.
+// Local raw-path persistence is a separate forensic-store concern and never
+// grants an API or destination export bypass. The function operates in-place
+// on the slice header but copies each AIEvidence value before mutating, so the
+// caller's underlying slice data is not modified.
+func SanitizeEvidenceForWire(signals []AISignal) {
+	for i := range signals {
+		if len(signals[i].Evidence) == 0 {
+			continue
+		}
+		out := make([]AIEvidence, len(signals[i].Evidence))
+		for j, ev := range signals[i].Evidence {
+			ev.RawPath = ""
+			out[j] = ev
+		}
+		signals[i].Evidence = out
+	}
+}
+
+// isSHA256Hash returns true for the two opaque-digest formats that
+// AI-discovery payloads are allowed to carry in PathHashes,
+// WorkspaceHash, and evidence.PathHash:
+//
+//	sha256:<64 lowercase hex>       — legacy unsalted form (hashPath
+//	                                   when SetPathHashKey is unset, e.g.
+//	                                   detached scans, tests).
+//	hmac-sha256:<64 lowercase hex>  — per-installation keyed form
+//	                                   activated by SetPathHashKey at
+//	                                   sidecar boot. See
+//	                                   inventory.hashPath and the
+//	                                   sidecar's deriveAIInventoryHashKey
+//	                                   for the derivation contract.
+//
+// Both formats are exactly 64 hex chars after the prefix because
+// HMAC-SHA256 has the same 32-byte output as plain SHA-256. Accepting
+// both keeps validateAIDiscoveryReport from rejecting payloads emitted
+// by a fully-configured gateway (remediation), while
+// still rejecting raw paths, truncated digests, and unrelated formats.
+func isSHA256Hash(value string) bool {
+	for _, prefix := range [...]string{"sha256:", "hmac-sha256:"} {
+		if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+64 {
+			continue
+		}
+		hex := value[len(prefix):]
+		ok := true
+		for _, ch := range hex {
+			if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') {
+				continue
+			}
+			ok = false
+			break
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// AIStateStore persists local discovery deltas under the DefenseClaw data dir.
+// The file carries no secrets, but is still mode 0600 because it can contain
+// local path hashes and, when explicitly enabled, raw local paths.
+type AIStateStore struct {
+	path string
+}
+
+func NewAIStateStore(path string) *AIStateStore { return &AIStateStore{path: path} }
+
+func (s *AIStateStore) Load() (aiStateFile, error) {
+	var out aiStateFile
+	if s == nil || s.path == "" {
+		return out, nil
+	}
+	raw, err := os.ReadFile(s.path)
+	if err != nil {
+		return out, nil
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return aiStateFile{}, err
+	}
+	// v1 → v2 migration: v1 had no per-stored EvidenceHash on disk
+	// (the field was `json:"-"` on AISignal so the JSON encoder dropped
+	// it). We accept v1 files transparently — entries land with empty
+	// EvidenceHash, and `classifyAndPersist` skips the hash comparison
+	// when the stored side is empty so the upgrade does not flood the
+	// operator with spurious "changed" rows.
+	//
+	// Future / unknown versions are surfaced as errors so a forward-
+	// version state file (e.g. written by a newer gateway and then
+	// read by an older one) doesn't silently look like an empty
+	// inventory and produce spurious "all new" change events.
+	if out.Version != 1 && out.Version != aiDiscoveryStateVersion {
+		return aiStateFile{}, fmt.Errorf("ai-discovery state file at %s has unsupported version %d (expected 1 or %d)", s.path, out.Version, aiDiscoveryStateVersion)
+	}
+	if out.Signals == nil {
+		out.Signals = map[string]aiStoredSignal{}
+	}
+	// Rehydrate the in-memory AISignal.{EvidenceHash,Evidence} from
+	// their stored mirrors so the rest of the code path can keep
+	// reading those struct fields (the rest of the service is unaware
+	// that they live on the stored wrapper).
+	for fp, stored := range out.Signals {
+		if stored.AISignal.EvidenceHash == "" && stored.StoredEvidenceHash != "" {
+			stored.AISignal.EvidenceHash = stored.StoredEvidenceHash
+		}
+		if len(stored.AISignal.Evidence) == 0 && len(stored.StoredEvidence) > 0 {
+			stored.AISignal.Evidence = stored.StoredEvidence
+		}
+		if stored.AISignal.ModelAPISourceHash == "" && stored.StoredModelAPISourceHash != "" {
+			stored.AISignal.ModelAPISourceHash = stored.StoredModelAPISourceHash
+		}
+		if stored.StoredModelProvenanceHubResolvedAt != nil && stored.StoredModelProvenanceHubResolvedAt.IsZero() {
+			// Older builds serialized time.Time's zero value despite omitempty.
+			// Normalize it to nil so the next save can omit the absent marker.
+			stored.StoredModelProvenanceHubResolvedAt = nil
+		}
+		if stored.AISignal.ModelProvenanceHubResolvedAt.IsZero() && stored.StoredModelProvenanceHubResolvedAt != nil {
+			stored.AISignal.ModelProvenanceHubResolvedAt = *stored.StoredModelProvenanceHubResolvedAt
+		}
+		if stored.AISignal.ModelProvenanceHubHash == "" && stored.StoredModelProvenanceHubHash != "" {
+			stored.AISignal.ModelProvenanceHubHash = stored.StoredModelProvenanceHubHash
+		}
+		out.Signals[fp] = stored
+	}
+	return out, nil
+}
+
+func (s *AIStateStore) Save(state aiStateFile) error {
+	if s == nil || s.path == "" {
+		return nil
+	}
+	state.Version = aiDiscoveryStateVersion
+	state.UpdatedAt = time.Now().UTC()
+	if state.Signals == nil {
+		state.Signals = map[string]aiStoredSignal{}
+	}
+	// Mirror the in-memory hash/evidence onto the stored wrapper so
+	// they actually persist (the AISignal fields themselves are
+	// `json:"-"`). This is the write half of the v2 migration above.
+	for fp, stored := range state.Signals {
+		if stored.StoredEvidenceHash == "" && stored.AISignal.EvidenceHash != "" {
+			stored.StoredEvidenceHash = stored.AISignal.EvidenceHash
+		}
+		if len(stored.StoredEvidence) == 0 && len(stored.AISignal.Evidence) > 0 {
+			stored.StoredEvidence = stored.AISignal.Evidence
+		}
+		if stored.StoredModelAPISourceHash == "" && stored.AISignal.ModelAPISourceHash != "" {
+			stored.StoredModelAPISourceHash = stored.AISignal.ModelAPISourceHash
+		}
+		if stored.StoredModelProvenanceHubResolvedAt != nil && stored.StoredModelProvenanceHubResolvedAt.IsZero() {
+			stored.StoredModelProvenanceHubResolvedAt = nil
+		}
+		if stored.StoredModelProvenanceHubResolvedAt == nil && !stored.AISignal.ModelProvenanceHubResolvedAt.IsZero() {
+			resolvedAt := stored.AISignal.ModelProvenanceHubResolvedAt
+			stored.StoredModelProvenanceHubResolvedAt = &resolvedAt
+		}
+		if stored.StoredModelProvenanceHubHash == "" && stored.AISignal.ModelProvenanceHubHash != "" {
+			stored.StoredModelProvenanceHubHash = stored.AISignal.ModelProvenanceHubHash
+		}
+		state.Signals[fp] = stored
+	}
+	payload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	return safefile.WritePrivate(s.path, payload)
+}
+
+// processNames is kept for backward compatibility with existing
+// callers and tests that only care about the process basename. The
+// new code path (detectProcesses) uses processSnapshot() instead.
+func processNames() ([]string, error) {
+	infos, err := processSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(infos))
+	for _, p := range infos {
+		out = append(out, p.Comm)
+	}
+	return out, nil
+}
+
+// processCommExactlyEquals reports whether `have` is byte-for-byte
+// equal (after path-stripping and case-folding) to `want`. The
+// confidence engine uses this to distinguish "exact" matches (which
+// get full Quality=1.0) from substring matches that succeed via the
+// fall-through in processNameMatches.
+func processCommExactlyEquals(have, want string) bool {
+	have = strings.ToLower(strings.TrimSpace(filepath.Base(have)))
+	want = strings.ToLower(strings.TrimSpace(filepath.Base(want)))
+	if have == "" || want == "" {
+		return false
+	}
+	return have == want
+}
+
+func processNameMatches(have, want string) bool {
+	have = strings.ToLower(strings.TrimSpace(filepath.Base(have)))
+	want = strings.ToLower(strings.TrimSpace(filepath.Base(want)))
+	if have == "" || want == "" {
+		return false
+	}
+	if have == want {
+		return true
+	}
+	// Short process names such as Amazon Q's `q` are far too noisy for
+	// substring matching (`quicklook`, `qemu`, etc.). Require exact matches.
+	if len(want) <= 3 {
+		return false
+	}
+	return strings.Contains(have, want)
+}
+
+func installedApplicationNames(home string) []string {
+	return platformInstalledApplicationNames(home)
+}
+
+func applicationNameMatches(have, want string) bool {
+	// Package identities carry an internal source marker and match only exact,
+	// reviewed catalog aliases. The reverse-DNS suffix convenience below is for
+	// ordinary desktop/display names; applying it here would let a package named
+	// "Fake.OpenAI.ChatGPT-Desktop" inherit ChatGPT's identity.
+	const packageIdentityPrefix = "package-id:"
+	rawHave := strings.ToLower(strings.TrimSpace(have))
+	rawWant := strings.ToLower(strings.TrimSpace(want))
+	if strings.HasPrefix(rawHave, packageIdentityPrefix) || strings.HasPrefix(rawWant, packageIdentityPrefix) {
+		return rawHave != "" && rawHave == rawWant
+	}
+	have = normalizeApplicationName(have)
+	want = normalizeApplicationName(want)
+	if have == "" || want == "" {
+		return false
+	}
+	// Exact names cover ordinary application bundles. A dot-delimited suffix
+	// additionally covers reverse-DNS Linux desktop IDs such as dev.zed.Zed
+	// without allowing adjacent products such as "Notion Calendar" to match
+	// the "Notion" signature.
+	return have == want || strings.HasSuffix(have, "."+want)
+}
+
+func normalizeApplicationName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	for {
+		previous := value
+		for _, suffix := range []string{".appref-ms", ".desktop", ".app", ".lnk", ".exe", ".url"} {
+			value = strings.TrimSuffix(value, suffix)
+		}
+		if value == previous {
+			break
+		}
+	}
+	return strings.TrimSpace(value)
+}
+
+func isSafeLoopbackEndpoint(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isProjectPackageManifest(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".csproj") ||
+		strings.HasSuffix(lower, ".fsproj") ||
+		strings.HasSuffix(lower, ".vbproj")
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func readBoundedText(path string, maxBytes int64) (string, bool) {
+	st, err := os.Stat(path)
+	if err != nil || st.IsDir() || st.Size() > maxBytes {
+		return "", false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+func readBoundedTail(path string, maxBytes int64) (string, bool) {
+	fh, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer fh.Close()
+	st, err := fh.Stat()
+	if err != nil || st.IsDir() {
+		return "", false
+	}
+	offset := int64(0)
+	if st.Size() > maxBytes {
+		offset = st.Size() - maxBytes
+	}
+	if _, err := fh.Seek(offset, io.SeekStart); err != nil {
+		return "", false
+	}
+	raw, err := io.ReadAll(io.LimitReader(fh, maxBytes))
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+// projectRootForManifest walks UP from a manifest file path to the
+// nearest enclosing project root, treating dependency-cache
+// directories as opaque. The intent is to give the operator
+// per-project counts ("ai (npm) installed in 5 projects") instead
+// of per-manifest counts ("685 package.json hits") -- the latter
+// is dominated by transitive `node_modules/<dep>/package.json`
+// records that all describe ONE installation.
+//
+// Heuristic, in order:
+//
+//  1. If any ancestor is a known dependency-cache segment
+//     (`node_modules`, `vendor`, `site-packages`, `.venv`,
+//     `venv`, `.cargo/registry`, `__pypackages__`, `bower_components`,
+//     `.pnpm-store`, `.yarn/cache`), return the ancestor IMMEDIATELY
+//     ABOVE that segment. That's the project that pulled the dep
+//     in transitively, regardless of how deep the cache nests.
+//
+//  2. Otherwise, return the manifest's immediate dir (status quo).
+//
+// We deliberately don't try to find a `.git` root -- monorepos and
+// embedded sub-projects make that ambiguous, and the cache-segment
+// heuristic above already captures the 99% case.
+func projectRootForManifest(path string) string {
+	// Single-segment cache directories that mark "we are now
+	// inside a transitive install tree owned by the parent
+	// project". Lowercased for case-insensitive match.
+	cacheSegments := map[string]bool{
+		"node_modules":     true,
+		"vendor":           true,
+		"site-packages":    true,
+		".venv":            true,
+		"venv":             true,
+		"__pypackages__":   true,
+		"bower_components": true,
+		".pnpm-store":      true,
+	}
+	dir := filepath.Dir(path)
+	parts := strings.Split(filepath.ToSlash(dir), "/")
+	// Walk SHALLOW → DEEP and stop at the FIRST cache segment.
+	// The project root is everything ABOVE that segment. This
+	// direction is critical: it makes nested caches like
+	// `proj/node_modules/foo/node_modules/bar/...` return
+	// `proj` (the OUTERMOST owner), and Python site-packages
+	// trees like `proj/.venv/lib/python3.12/site-packages/...`
+	// return `proj` (the project that owns the venv) rather
+	// than `.venv` itself.
+	for i := 1; i < len(parts); i++ {
+		seg := strings.ToLower(parts[i])
+		// Two-segment caches first so a project with a literal
+		// `cache` subdir (legitimate for some build tools)
+		// isn't mistaken for `.yarn/cache`. We anchor on the
+		// PRECEDING segment so this only fires for the well-
+		// known combo.
+		if seg == "registry" && i > 0 && strings.ToLower(parts[i-1]) == ".cargo" {
+			// Project root is the dir CONTAINING `.cargo` --
+			// for `~/.cargo/registry/...` that's the user's
+			// home, the natural attribution for global crates.
+			return filepath.FromSlash(strings.Join(parts[:i-1], "/"))
+		}
+		if seg == "cache" && i > 0 && strings.ToLower(parts[i-1]) == ".yarn" {
+			return filepath.FromSlash(strings.Join(parts[:i-1], "/"))
+		}
+		if cacheSegments[seg] {
+			return filepath.FromSlash(strings.Join(parts[:i], "/"))
+		}
+	}
+	return dir
+}
+
+// shouldSkipDiscoveryDir is the universal "do not descend" rule used
+// by the package_manifest detector's filepath.WalkDir.
+//
+// We deliberately removed `node_modules`, `venv`, `.venv`, and
+// `vendor` from the skip-list so the detector can find *installed*
+// versions (not just declared ones) in:
+//   - Python virtualenvs: `…/site-packages/<pkg>/METADATA` style trees
+//     contain the canonical installed version, which `pip freeze`
+//     reflects as `pkg==X.Y.Z`.
+//   - Node projects: `node_modules/<pkg>/package.json` is the resolved
+//     install record; the lockfile alone is brittle (workspaces, peer
+//     deps).
+//   - Go vendor directories: `vendor/modules.txt` is the canonical
+//     resolved-modules list.
+//
+// We still skip caches, build outputs, and `.git` history. The walker
+// is bounded by `opts.MaxFilesPerScan`, so even on large monorepos it
+// can't run away — at the cap, the walker short-circuits gracefully.
+//
+// `__pycache__` and `library` (macOS) stay skipped because they never
+// contain manifest data we care about.
+func shouldSkipDiscoveryDir(name string) bool {
+	switch strings.ToLower(name) {
+	case ".git", ".cache", "cache", "dist", "build", "target", "__pycache__", "library":
+		return true
+	default:
+		return false
+	}
+}
+
+// pathHashKey is the per-installation HMAC key that turns the
+// otherwise-reversible path SHA-256 fingerprint into an
+// installation-scoped opaque digest. ("Redacted AI
+// discovery events expose reversible path fingerprints"): without a
+// key, a recipient of a redacted gateway event can dictionary-attack
+// well-known paths (~/.aws/credentials, repo roots, package manifest
+// paths) to recover the local layout. The key is set by
+// SetPathHashKey at sidecar boot, drawn from the gateway secret so it
+// is stable for the install but opaque to outside recipients. When
+// the key is unset (legacy callers, tests) we fall back to the plain
+// SHA-256 form so existing tooling keeps parsing the digest.
+var pathHashKey []byte
+var pathHashKeyMu sync.RWMutex
+
+// SetPathHashKey installs the per-installation HMAC key used for
+// hashPath / hashValue digests. Pass nil to revert to the legacy
+// unsalted SHA-256 form (tests).
+func SetPathHashKey(key []byte) {
+	pathHashKeyMu.Lock()
+	defer pathHashKeyMu.Unlock()
+	if len(key) == 0 {
+		pathHashKey = nil
+		return
+	}
+	pathHashKey = append([]byte(nil), key...)
+}
+
+func currentPathHashKey() []byte {
+	pathHashKeyMu.RLock()
+	defer pathHashKeyMu.RUnlock()
+	if len(pathHashKey) == 0 {
+		return nil
+	}
+	return append([]byte(nil), pathHashKey...)
+}
+
+func hashPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		path = abs
+	}
+	if key := currentPathHashKey(); len(key) > 0 {
+		return "hmac-sha256:" + keyedHashHex(key, path)
+	}
+	return "sha256:" + hashHex(path)
+}
+
+func keyedHashHex(key []byte, value string) string {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func hashValue(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "sha256:" + hashHex(value)
+}
+
+func hashHex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func hashEvidence(evidence []AIEvidence) string {
+	raw, _ := json.Marshal(evidence)
+	return hashValue(string(raw))
+}
+
+func stableSignalID(fp string) string {
+	sum := sha256.Sum256([]byte(fp))
+	return "ai-" + hex.EncodeToString(sum[:])[:16]
+}
+
+// scanIDCounter is a process-local monotonic counter used as a
+// uniqueness fallback when crypto/rand fails. Even if two scans
+// collide on time.Now().UnixNano() (rare; doable on virtualized
+// clocks) and rand.Read returns an error, the counter guarantees
+// every newScanID() call produces a different ID inside a single
+// process. atomic so concurrent callers don't trample each other.
+var scanIDCounter atomic.Uint64
+
+func newScanID() string {
+	var b [8]byte
+	pid := os.Getpid()
+	count := scanIDCounter.Add(1)
+	if _, err := rand.Read(b[:]); err != nil {
+		// rand.Read failure is exceptional; mix the PID and a
+		// monotonic counter into the fallback so collisions
+		// across two processes (or two scans inside one) remain
+		// impossible. Logging the underlying error helps operators
+		// catch entropy starvation.
+		fmt.Fprintf(os.Stderr, "[ai-discovery] rand.Read failed; using deterministic fallback scan ID: %v\n", err)
+		return fmt.Sprintf("scan-%d-%d-%d", time.Now().UnixNano(), pid, count)
+	}
+	return fmt.Sprintf("scan-%d-%s", time.Now().UnixNano(), hex.EncodeToString(b[:]))
+}
+
+func rawPathsForSignal(sig AISignal, keep bool) []string {
+	if !keep {
+		return nil
+	}
+	var paths []string
+	for _, ev := range sig.Evidence {
+		if ev.RawPath != "" {
+			paths = appendUnique(paths, ev.RawPath)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func appendUnique(values []string, value string) []string {
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func sortAISignals(signals []AISignal) {
+	sort.Slice(signals, func(i, j int) bool {
+		return signals[i].Category+signals[i].Vendor+signals[i].Product+signals[i].Fingerprint <
+			signals[j].Category+signals[j].Vendor+signals[j].Product+signals[j].Fingerprint
+	})
+}
+
+func cloneAIDiscoveryReport(in AIDiscoveryReport) AIDiscoveryReport {
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return in
+	}
+	var out AIDiscoveryReport
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return in
+	}
+	return out
+}

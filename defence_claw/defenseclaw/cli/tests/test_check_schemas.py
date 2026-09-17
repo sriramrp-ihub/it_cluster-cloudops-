@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Regression tests for ``scripts/check_schemas.py``.
+
+Pins two contracts that downstream consumers (Splunk APM, OTLP collector
+validation, audit drill-down) silently depend on:
+
+1. The recursive walk of ``schemas/`` covers ``schemas/otel/*.json``.
+   A previous version of the script only globbed the top-level
+   directory, so OTel schemas drifted unchecked for months.
+
+2. ``schemas/otel/resource.schema.json``'s ``defenseclaw.claw.mode``
+   enum stays aligned with every built-in connector name emitted by
+   ``Connector.Name()`` in ``internal/gateway/connector``.
+   Adding a connector and forgetting the schema means dashboards
+   silently start dropping records — and the fresh-install empty
+   placeholder ("") masks the failure on bench tests.
+
+3. CLI schema mirrors are discovered from real ``//go:embed`` directives,
+   remain byte-identical, and reject unexplained duplicate JSON files.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts" / "check_schemas.py"
+SCHEMA_DIR = ROOT / "schemas"
+RESOURCE_SCHEMA = SCHEMA_DIR / "otel" / "resource.schema.json"
+GALILEO_PROFILE_SCHEMA = SCHEMA_DIR / "otel" / "galileo-export-profile.schema.json"
+UNICODE13_GENERATOR = ROOT / "scripts" / "generate_unicode13_repertoire.py"
+
+
+class TestCheckSchemasResourceEnum(unittest.TestCase):
+    def test_resource_schema_has_canonical_claw_mode_enum(self) -> None:
+        """The released schema must list every connector emit() can produce."""
+        doc = json.loads(RESOURCE_SCHEMA.read_text(encoding="utf-8"))
+        enum = set(doc["properties"]["defenseclaw.claw.mode"].get("enum", []))
+        # Connector names from internal/gateway/connector plus the empty placeholder
+        # for fresh installs that haven't picked a connector yet.
+        self.assertEqual(
+            enum,
+            {
+                "openclaw",
+                "zeptoclaw",
+                "claudecode",
+                "codex",
+                "hermes",
+                "cursor",
+                "windsurf",
+                "geminicli",
+                "copilot",
+                "openhands",
+        "antigravity",
+        "opencode",
+        "amp",
+        "omnigent",
+                # Sentinel set by telemetry/resource.go when more than one
+                # connector is active (multi-connector install). Not a
+                # connector name — see buildResource / WU4.
+                "multi",
+                "",
+            },
+            "drift in defenseclaw.claw.mode enum — update Connector.Name() "
+            "and the schema together; downstream APM dashboards pivot on this",
+        )
+
+    def test_legacy_modes_dropped(self) -> None:
+        """Legacy placeholders that were never emitted must stay dropped.
+
+        ``nemoclaw`` shipped in the schema before a connector by that name
+        existed; allowing it back masks typos in operator config files and
+        fails closed at the downstream consumer (silent drop of the resource
+        record). OpenCode is now a real built-in connector.
+        """
+        doc = json.loads(RESOURCE_SCHEMA.read_text(encoding="utf-8"))
+        enum = set(doc["properties"]["defenseclaw.claw.mode"].get("enum", []))
+        self.assertNotIn("nemoclaw", enum)
+        self.assertIn("opencode", enum)
+
+
+class TestUnicode13RepertoireDrift(unittest.TestCase):
+    def test_offline_generator_check_passes_and_detects_tampering(self) -> None:
+        clean = subprocess.run(
+            [sys.executable, str(UNICODE13_GENERATOR), "--check"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp)
+            owned_paths = (
+                Path("schemas/telemetry/v8/redaction/unicode-age-13.0.json"),
+                Path("internal/observability/redaction/unicode13.go"),
+                Path("cli/defenseclaw/observability/unicode13.py"),
+            )
+            for relative in owned_paths:
+                destination = repository / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((ROOT / relative).read_bytes())
+            manifest = repository / owned_paths[0]
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            document["scalar_count"] += 1
+            manifest.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+            tampered = subprocess.run(
+                [
+                    sys.executable,
+                    str(UNICODE13_GENERATOR),
+                    "--check",
+                    "--repository",
+                    str(repository),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(tampered.returncode, 0)
+            self.assertIn("generated file is stale", tampered.stderr + tampered.stdout)
+
+
+class TestCheckSchemasDriftDetection(unittest.TestCase):
+    """Run check_schemas.py against a tampered schema tree and assert it fails."""
+
+    def _run_against(self, schema_dir: Path) -> subprocess.CompletedProcess[str]:
+        # Re-execute the script with a swapped SCHEMA_DIR by injecting a
+        # tiny shim that monkey-patches the path before main() runs.
+        # This isolates the test from the real schemas/ tree.
+        shim = (
+            "import importlib.util, sys, pathlib\n"
+            f"spec = importlib.util.spec_from_file_location('check_schemas', r'{SCRIPT}')\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            f"mod.SCHEMA_DIR = pathlib.Path(r'{schema_dir}')\n"
+            "sys.exit(mod.main())\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", shim],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_dropping_a_connector_mode_is_caught(self) -> None:
+        # Mirror schemas/ into a tempdir, drop "claudecode" from the
+        # resource schema's claw.mode enum, and assert the script
+        # exits non-zero with a drift-shaped error message.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            # rsync-equivalent copy preserving structure
+            for src in SCHEMA_DIR.rglob("*.json"):
+                rel = src.relative_to(SCHEMA_DIR)
+                dst = tmp_path / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+            tampered = tmp_path / "otel" / "resource.schema.json"
+            doc = json.loads(tampered.read_text(encoding="utf-8"))
+            mode = doc["properties"]["defenseclaw.claw.mode"]
+            mode["enum"] = [m for m in mode["enum"] if m != "claudecode"]
+            tampered.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+            res = self._run_against(tmp_path)
+            self.assertNotEqual(
+                res.returncode,
+                0,
+                f"check_schemas should have flagged the dropped connector\nstdout={res.stdout}\nstderr={res.stderr}",
+            )
+            self.assertIn("defenseclaw.claw.mode", res.stderr)
+            self.assertIn("claudecode", res.stderr)
+
+    def test_adding_a_bogus_connector_mode_is_caught(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for src in SCHEMA_DIR.rglob("*.json"):
+                rel = src.relative_to(SCHEMA_DIR)
+                dst = tmp_path / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+            tampered = tmp_path / "otel" / "resource.schema.json"
+            doc = json.loads(tampered.read_text(encoding="utf-8"))
+            doc["properties"]["defenseclaw.claw.mode"]["enum"].append("nemoclaw")
+            tampered.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+            res = self._run_against(tmp_path)
+            self.assertNotEqual(
+                res.returncode,
+                0,
+                f"check_schemas should have flagged the legacy connector name\n"
+                f"stdout={res.stdout}\nstderr={res.stderr}",
+            )
+            self.assertIn("nemoclaw", res.stderr)
+
+
+class TestCheckSchemasCoversOtelTree(unittest.TestCase):
+    def test_missing_directly_owned_public_schema_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            schema_dir = Path(tmp)
+            for source in SCHEMA_DIR.rglob("*.json"):
+                target = schema_dir / source.relative_to(SCHEMA_DIR)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+            (schema_dir / "scan-result.json").unlink()
+
+            shim = (
+                "import importlib.util, pathlib, sys\n"
+                f"spec = importlib.util.spec_from_file_location('check_schemas', r'{SCRIPT}')\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                f"mod.SCHEMA_DIR = pathlib.Path(r'{schema_dir}')\n"
+                "sys.exit(0 if mod.check_public_schema_inventory() else 1)\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", shim],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("scan-result.json", result.stderr)
+
+    def test_otel_subdir_is_walked(self) -> None:
+        # Sanity: corrupt schemas/otel/metrics.schema.json and ensure
+        # the script catches it (proves rglob covers the subtree).
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for src in SCHEMA_DIR.rglob("*.json"):
+                rel = src.relative_to(SCHEMA_DIR)
+                dst = tmp_path / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+            corrupt = tmp_path / "otel" / "metrics.schema.json"
+            corrupt.write_text("{not json", encoding="utf-8")
+
+            shim = (
+                "import importlib.util, sys, pathlib\n"
+                f"spec = importlib.util.spec_from_file_location('check_schemas', r'{SCRIPT}')\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                f"mod.SCHEMA_DIR = pathlib.Path(r'{tmp_path}')\n"
+                "sys.exit(mod.main())\n"
+            )
+            res = subprocess.run(
+                [sys.executable, "-c", shim],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn(os.fspath(Path("otel") / "metrics.schema.json"), res.stderr)
+
+
+class TestCliEmbedSchemaMirrors(unittest.TestCase):
+    def test_unreferenced_duplicate_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            schema_dir = root / "schemas"
+            cli_dir = root / "internal" / "cli"
+            embed_dir = cli_dir / "embed"
+            schema_dir.mkdir(parents=True)
+            embed_dir.mkdir(parents=True)
+            schema = '{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n'
+            (schema_dir / "scan-result.json").write_text(schema, encoding="utf-8")
+            (embed_dir / "scan-result.json").write_text(schema, encoding="utf-8")
+            (embed_dir / "orphan.json").write_text(schema, encoding="utf-8")
+            (cli_dir / "scan.go").write_text(
+                "//go:embed embed/scan-result.json\n", encoding="utf-8"
+            )
+
+            shim = (
+                "import importlib.util, pathlib, sys\n"
+                f"spec = importlib.util.spec_from_file_location('check_schemas', r'{SCRIPT}')\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                f"mod.SCHEMA_DIR = pathlib.Path(r'{schema_dir}')\n"
+                f"mod.CLI_GO_DIR = pathlib.Path(r'{cli_dir}')\n"
+                f"mod.CLI_EMBED_SCHEMA_DIR = pathlib.Path(r'{embed_dir}')\n"
+                "sys.exit(0 if mod.check_cli_embed_mirrors() else 1)\n"
+            )
+            res = subprocess.run(
+                [sys.executable, "-c", shim],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("unreferenced CLI embed schema copies", res.stderr)
+            self.assertIn("orphan.json", res.stderr)
+
+
+class TestGalileoExportProfileSchema(unittest.TestCase):
+    def test_profile_signals_match_galileo_preset(self) -> None:
+        from defenseclaw.observability.presets import PRESETS
+
+        doc = json.loads(GALILEO_PROFILE_SCHEMA.read_text(encoding="utf-8"))
+        preset = PRESETS["galileo"]
+        schema_signals = tuple(doc["properties"]["signals"]["const"])
+        self.assertEqual(schema_signals, preset.default_signals)
+        self.assertEqual(
+            [
+                (item["name"], tuple(item["required_attributes"]))
+                for item in doc["properties"]["operations"]["const"]
+            ],
+            list(preset.span_filter_operations),
+        )
+
+    def test_profile_operations_match_runtime_contracts(self) -> None:
+        profile = json.loads(GALILEO_PROFILE_SCHEMA.read_text(encoding="utf-8"))
+        operations = profile["properties"]["operations"]["const"]
+        schemas = {
+            "chat": "runtime-llm-span.schema.json",
+            "invoke_agent": "runtime-agent-span.schema.json",
+            "execute_tool": "runtime-tool-span.schema.json",
+        }
+        for operation in operations:
+            contract = json.loads(
+                (SCHEMA_DIR / "otel" / schemas[operation["name"]]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                operation["required_attributes"],
+                contract["x-required-attribute-keys"],
+            )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

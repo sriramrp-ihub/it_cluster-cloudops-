@@ -1,0 +1,637 @@
+{
+  "exact_rule_axes": [
+    {
+      "id": "C2-INTERACT-SH",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-METADATA-AWS",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-METADATA-AZURE",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-METADATA-DECIMAL",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-METADATA-GCP",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-METADATA-HEX",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-METADATA-OCTAL",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-NGROK",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-OAST",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-PIPEDREAM",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-REQUESTBIN",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "C2-WEBHOOK-SITE",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "CMD-CURL-UPLOAD",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "CMD-ENV-DUMP",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "CMD-PIPE-CURL",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "CMD-PIPE-WGET",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "CMD-WGET-POST",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "CRED-AWS-FILE",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "CRED-AWS-KEY",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "DNS-TUNNEL",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "ENT-BULK-SSN",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "INJ-DAN-MODE",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "INJ-DELIMITER-HIJACK",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "INJ-DISREGARD",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "INJ-IGNORE-ALL",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "INJ-IGNORE-PREVIOUS",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "INJ-JAILBREAK",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "INJ-OVERRIDE",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "JUDGE-EXFIL-CHANNEL",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "JUDGE-TOOL-INJ-DESTRUCT",
+      "axes": []
+    },
+    {
+      "id": "JUDGE-TOOL-INJ-EXFIL",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "OBFUSC-UNICODE-ZWSP",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "PATH-ETC-PASSWD",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PATH-ETC-SHADOW",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PATH-GIT-CREDS",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PATH-NETRC",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PATH-PROC-ENVIRON",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PATH-SSH-KEY",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PII-PASSPORT",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PII-PASSWORD",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "PII-SSN",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SEC-CONNSTR",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SEC-DISCORD-WEBHOOK",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SEC-GITHUB",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SEC-GOOGLE",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SEC-PRIVKEY",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SEC-SENDGRID",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SEC-SLACK-TOKEN",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SEC-SLACK-WEBHOOK",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SRC-ENV-READ",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "SRC-FETCH",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SRC-HTTP-SERVER",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SRC-NET-SERVER",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SRC-WS",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SSRF-AWS-META",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SSRF-AZURE-META",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SSRF-GCP-META",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SSRF-INTERNAL-HOST",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "SSRF-PRIVATE-IP",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "TRUST-AUTHORITY-CLAIM",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "TRUST-NEW-INSTRUCTION",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "TRUST-SAFETY-OVERRIDE",
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "id": "chain.guardrails_off_then_egress",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "chain.permission_denied_then_runtime_bypass",
+      "axes": []
+    },
+    {
+      "id": "chain.privilege_discovery_then_elevation",
+      "axes": []
+    },
+    {
+      "id": "chain.secret_manager_read_then_egress",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "chain.secret_read_then_egress",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "chain.workload_identity_then_lateral_execution",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "exec.agent_runtime_bypass_flags",
+      "axes": []
+    },
+    {
+      "id": "exec.reverse_tunnel",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "exfil.secret_read_and_egress_oneliner",
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "id": "impact.cryptomining_launch",
+      "axes": []
+    },
+    {
+      "id": "impact.fork_bomb",
+      "axes": []
+    },
+    {
+      "id": "impact.mass_process_termination",
+      "axes": []
+    },
+    {
+      "id": "integrity.git_hooks_bypass",
+      "axes": []
+    },
+    {
+      "id": "integrity.history_tamper",
+      "axes": []
+    },
+    {
+      "id": "lateral.workload_exec",
+      "axes": []
+    },
+    {
+      "id": "persistence.git_hook_write",
+      "axes": []
+    },
+    {
+      "id": "persistence.privileged_account_change",
+      "axes": []
+    },
+    {
+      "id": "persistence.shell_profile_write",
+      "axes": []
+    },
+    {
+      "id": "persistence.ssh_authorized_keys_command",
+      "axes": []
+    },
+    {
+      "id": "privilege.container_host_escape",
+      "axes": []
+    },
+    {
+      "id": "privilege.container_runtime_socket_access",
+      "axes": []
+    },
+    {
+      "id": "privilege.host_namespace_entry",
+      "axes": []
+    },
+    {
+      "id": "recon.network_sweep",
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "id": "secrets.browser_session_store_read",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "secrets.cloud_credential_read",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "secrets.cloud_secret_manager_read",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "secrets.workload_identity_token_read",
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "id": "source.git_config_exec",
+      "axes": []
+    },
+    {
+      "id": "source.git_remote_tamper",
+      "axes": []
+    },
+    {
+      "id": "tamper.detector_state_write",
+      "axes": []
+    },
+    {
+      "id": "tamper.guardrails_off",
+      "axes": []
+    }
+  ],
+  "prefix_axes": [
+    {
+      "prefixes": [
+        "SEC-",
+        "PATH-",
+        "ENT-",
+        "CRED-",
+        "PII-",
+        "CS-PII-",
+        "JSON-SEC-",
+        "COG-",
+        "JUDGE-PII-",
+        "JUDGE-EXFIL-"
+      ],
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "prefixes": [
+        "C2-",
+        "DNS-TUNNEL"
+      ],
+      "axes": [
+        "egress_external"
+      ]
+    },
+    {
+      "prefixes": [
+        "INJ-",
+        "TRUST-",
+        "JAIL-",
+        "JUDGE-INJ-",
+        "JUDGE-TOOL-INJ-"
+      ],
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "prefixes": [
+        "SSRF-"
+      ],
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "prefixes": [
+        "META-REMOTE",
+        "META-EXEC"
+      ],
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "prefixes": [
+        "META-ENV-EXFIL",
+        "META-EXFIL"
+      ],
+      "axes": [
+        "sensitive_access",
+        "egress_external"
+      ]
+    },
+    {
+      "prefixes": [
+        "GW-ENV-WRITE",
+        "GW-ENV-READ"
+      ],
+      "axes": [
+        "sensitive_access"
+      ]
+    },
+    {
+      "prefixes": [
+        "GW-"
+      ],
+      "axes": [
+        "ingress_untrusted"
+      ]
+    },
+    {
+      "prefixes": [
+        "CMD-DESTRUCTIVE",
+        "SHELL-DESTRUCTIVE"
+      ],
+      "axes": null
+    }
+  ],
+  "prefix_capabilities": [
+    {
+      "prefixes": [
+        "CMD-DESTRUCTIVE",
+        "SHELL-DESTRUCTIVE"
+      ],
+      "capability": "exec_shell"
+    }
+  ]
+}

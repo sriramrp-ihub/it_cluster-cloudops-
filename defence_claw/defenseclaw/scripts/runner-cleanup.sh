@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+# Host-wide cleanup for the self-hosted E2E runner.
+#
+# Idempotent. Logs each section so we can correlate disk-fill regressions to
+# specific consumers when CI fails the FREE_GB headroom check below.
+#
+# Why a script instead of inlining in e2e.yml: the disk-fill bug surfaced as
+# "the self-hosted runner lost communication with the server" (looks like an
+# OOM but is actually exhausted root fs). The runner died mid-job before its
+# inline cleanup could run, so the next run inherited the same full disk.
+# Calling this script BEFORE the heavy E2E steps (and again unconditionally
+# in post-run cleanup) means a single run's worth of leaks can never wedge
+# the host across runs.
+#
+# Set RUNNER_CLEANUP_VERBOSE=1 to trace every command. Otherwise we just emit
+# section headers and leave individual rm/prune output on stdout.
+set -u
+[ "${RUNNER_CLEANUP_VERBOSE:-0}" = "1" ] && set -x
+DC_STATE_HOME="${DEFENSECLAW_HOME:-$HOME/.defenseclaw}"
+DC_STATE_HOME_IS_OVERRIDE=0
+[ -n "${DEFENSECLAW_HOME+x}" ] && DC_STATE_HOME_IS_OVERRIDE=1
+OC_STATE_HOME="$HOME/.openclaw"
+
+log() { printf '[runner-cleanup] %s\n' "$*"; }
+
+validate_defenseclaw_state_home() {
+  local canonical cleanup_path resolved
+  case "$DC_STATE_HOME" in
+    /*) ;;
+    *)
+      printf '[runner-cleanup] ERROR: DEFENSECLAW_HOME must be absolute: %s\n' "$DC_STATE_HOME" >&2
+      return 2
+      ;;
+  esac
+  if [ -L "$DC_STATE_HOME" ]; then
+    printf '[runner-cleanup] ERROR: DEFENSECLAW_HOME must not be a symlink: %s\n' "$DC_STATE_HOME" >&2
+    return 2
+  fi
+  canonical="$(python3 - "$DC_STATE_HOME" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+)" || return 2
+  resolved="$(python3 - "$DC_STATE_HOME" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)" || return 2
+  if [ "$resolved" != "$canonical" ]; then
+    printf '[runner-cleanup] ERROR: DEFENSECLAW_HOME must not contain a symlink: %s\n' "$DC_STATE_HOME" >&2
+    return 2
+  fi
+  if [ "$resolved" = "/" ]; then
+    printf '[runner-cleanup] ERROR: DEFENSECLAW_HOME must not resolve to /\n' >&2
+    return 2
+  fi
+  if [ "$DC_STATE_HOME_IS_OVERRIDE" -eq 1 ] && [ "$(basename "$DC_STATE_HOME")" != ".defenseclaw" ]; then
+    printf '[runner-cleanup] ERROR: explicit DEFENSECLAW_HOME must name a .defenseclaw state directory: %s\n' "$DC_STATE_HOME" >&2
+    return 2
+  fi
+
+  # This script recursively repairs the selected DefenseClaw state and prunes
+  # only its quarantine subtree. Refuse a link at every directory boundary the
+  # prune can traverse so a crash artifact cannot redirect cleanup outside the
+  # marker-authenticated E2E slot.
+  for cleanup_path in \
+    "$DC_STATE_HOME/quarantine" \
+    "$DC_STATE_HOME/quarantine/skills" \
+    "$DC_STATE_HOME/quarantine/plugins"; do
+    if [ -L "$cleanup_path" ]; then
+      printf '[runner-cleanup] ERROR: DefenseClaw cleanup path must not be a symlink: %s\n' "$cleanup_path" >&2
+      return 2
+    fi
+  done
+}
+
+validate_defenseclaw_state_home || exit $?
+
+repair_state_path() {
+  local state_path="$1" runner_uid runner_gid
+  [ -e "$state_path" ] || return 0
+  runner_uid="$(id -u)"
+  runner_gid="$(id -g)"
+  if sudo -n python3 - "$state_path" "$runner_uid" "$runner_gid" <<'PY'
+import os
+import stat
+import sys
+
+root, uid_text, gid_text = sys.argv[1:]
+uid = int(uid_text)
+gid = int(gid_text)
+directory_flags = (
+    os.O_RDONLY
+    | os.O_DIRECTORY
+    | os.O_NOFOLLOW
+    | os.O_CLOEXEC
+)
+
+
+def repair_directory(descriptor):
+    os.fchown(descriptor, uid, gid)
+    directory_mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+    directory_mode &= ~(stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+    os.fchmod(descriptor, directory_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    for name in os.listdir(descriptor):
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            # Ownership of a link is irrelevant to unlinking it; leave it
+            # untouched and never cross it into an external target.
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(name, directory_flags, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise OSError("state directory changed during repair")
+                repair_directory(child)
+            finally:
+                os.close(child)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            # Sockets, devices, and FIFOs do not need recursive permission
+            # repair. Avoid every pathname-based privileged mutation.
+            continue
+        if metadata.st_nlink != 1:
+            raise OSError("state repair refuses multiply-linked files")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        child = os.open(name, flags, dir_fd=descriptor)
+        try:
+            opened = os.fstat(child)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise OSError("state entry changed during repair")
+            if opened.st_nlink != 1:
+                raise OSError("state repair refuses multiply-linked files")
+            os.fchown(child, uid, gid)
+            repaired = os.fstat(child)
+            mode = stat.S_IMODE(repaired.st_mode)
+            mode &= ~(stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            mode |= stat.S_IRUSR | stat.S_IWUSR
+            if repaired.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                mode |= stat.S_IXUSR
+            os.fchmod(child, mode)
+        finally:
+            os.close(child)
+
+
+absolute = os.path.abspath(root)
+descriptor = os.open(os.path.sep, directory_flags)
+try:
+    for component in absolute.split(os.path.sep)[1:]:
+        if not component:
+            continue
+        child = os.open(component, directory_flags, dir_fd=descriptor)
+        os.close(descriptor)
+        descriptor = child
+    repair_directory(descriptor)
+finally:
+    os.close(descriptor)
+PY
+  then
+    return 0
+  fi
+  return 1
+}
+
+repair_persistent_state_permissions() {
+  local runner_uid runner_gid state_dir repaired resolved_state_dir
+  runner_uid="$(id -u)"
+  runner_gid="$(id -g)"
+  for state_dir in "$DC_STATE_HOME" "$OC_STATE_HOME"; do
+    [ -e "$state_dir" ] || continue
+    repaired=0
+
+    # Sandbox setup can leave ~/.openclaw as a symlink to a root-owned target.
+    # DEFENSECLAW_HOME has already been rejected when it is a symlink; only
+    # the persistent OpenClaw state is intentionally followed here.
+    # Repair the resolved target first; chown -R on the symlink path itself may
+    # only affect the link and leave openclaw.json unreadable.
+    if [ -L "$state_dir" ]; then
+      resolved_state_dir="$(realpath "$state_dir" 2>/dev/null || true)"
+      if [ -n "$resolved_state_dir" ] && [ "$resolved_state_dir" != "$state_dir" ]; then
+        if repair_state_path "$resolved_state_dir"; then
+          repaired=1
+        else
+          log "WARNING: unable to repair permissions on $resolved_state_dir"
+        fi
+      fi
+    fi
+
+    if repair_state_path "$state_dir"; then
+      repaired=1
+    fi
+    if [ "$repaired" -ne 1 ]; then
+      log "WARNING: unable to repair permissions on $state_dir"
+    fi
+  done
+}
+
+prune_stale_openclaw_e2e_artifacts() {
+  local dir
+  for dir in \
+    "$OC_STATE_HOME/workspace/skills" \
+    "$OC_STATE_HOME/skills" \
+    "$OC_STATE_HOME/extensions"; do
+    [ -d "$dir" ] || continue
+    find "$dir" -mindepth 1 -maxdepth 1 -name 'e2e-*' -exec rm -rf {} + 2>/dev/null || true
+  done
+  for dir in \
+    "$DC_STATE_HOME/quarantine/skills" \
+    "$DC_STATE_HOME/quarantine/plugins"; do
+    [ -d "$dir" ] || continue
+    find "$dir" -mindepth 1 -maxdepth 2 -name 'e2e-*' -exec rm -rf {} + 2>/dev/null || true
+  done
+}
+
+prune_stale_openclaw_channel_plugin_projects() {
+  local project_root project removed
+  removed=0
+  for project_root in /data/openclaw/npm/projects "$OC_STATE_HOME/npm/projects"; do
+    [ -d "$project_root" ] || continue
+    while IFS= read -r -d '' project; do
+      if rm -rf -- "$project" 2>/dev/null; then
+        removed=$((removed + 1))
+      elif sudo -n rm -rf -- "$project" 2>/dev/null; then
+        removed=$((removed + 1))
+      else
+        log "WARNING: unable to remove stale OpenClaw channel plugin project $project"
+      fi
+    done < <(find "$project_root" -mindepth 1 -maxdepth 1 -type d \
+      \( -name 'openclaw-discord-*' \
+         -o -name 'openclaw-slack-*' \
+         -o -name 'openclaw-telegram-*' \
+         -o -name 'openclaw-whatsapp-*' \) -print0 2>/dev/null)
+  done
+  if [ "$removed" -gt 0 ]; then
+    log "Removed stale OpenClaw channel plugin project(s) ($removed)"
+  fi
+}
+
+normalize_openclaw_ci_config() {
+  local oc_home="$OC_STATE_HOME"
+  [ -d "$oc_home" ] || return 0
+  python3 - "$oc_home" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+oc_home = Path(sys.argv[1])
+cfg_paths = []
+seen = set()
+for pattern in ("openclaw.json", "openclaw.json.*"):
+    for path in sorted(oc_home.glob(pattern)):
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        cfg_paths.append(path)
+
+if not cfg_paths:
+    raise SystemExit(0)
+
+stale_channel_plugin_ids = {"discord", "slack", "telegram", "whatsapp"}
+
+
+def is_defenseclaw_load_path(value):
+    if isinstance(value, str):
+        return Path(value.rstrip("/")).name == "defenseclaw"
+    if isinstance(value, dict):
+        return any(is_defenseclaw_load_path(item) for item in value.values())
+    if isinstance(value, list):
+        return any(is_defenseclaw_load_path(item) for item in value)
+    return False
+
+
+def is_stale_channel_load_path(value):
+    if isinstance(value, str):
+        lowered = value.lower()
+        return any(
+            f"openclaw-{name}-" in lowered or f"@openclaw/{name}" in lowered
+            for name in stale_channel_plugin_ids
+        )
+    if isinstance(value, dict):
+        return any(is_stale_channel_load_path(item) for item in value.values())
+    if isinstance(value, list):
+        return any(is_stale_channel_load_path(item) for item in value)
+    return False
+
+
+def should_remove_plugin_name(name):
+    value = str(name)
+    return value == "defenseclaw" or value in stale_channel_plugin_ids
+
+
+def normalize_config(cfg_path):
+    try:
+        with cfg_path.open() as f:
+            cfg = json.load(f)
+    except PermissionError as exc:
+        print(f"[runner-cleanup] WARNING: OpenClaw config unreadable during normalization: {exc}")
+        return "skipped"
+    except json.JSONDecodeError as exc:
+        print(f"[runner-cleanup] WARNING: OpenClaw config invalid during normalization: {exc}")
+        return "skipped"
+
+    if not isinstance(cfg, dict):
+        return "skipped"
+
+    changed = False
+    plugins = cfg.get("plugins")
+    if isinstance(plugins, dict):
+        for section in ("entries", "installs", "allow", "enabled"):
+            bucket = plugins.get(section)
+            if isinstance(bucket, dict):
+                next_bucket = {name: meta for name, meta in bucket.items() if not should_remove_plugin_name(name)}
+                if next_bucket != bucket:
+                    plugins[section] = next_bucket
+                    changed = True
+            elif isinstance(bucket, list):
+                next_bucket = [item for item in bucket if not should_remove_plugin_name(item)]
+                if next_bucket != bucket:
+                    plugins[section] = next_bucket
+                    changed = True
+
+        load = plugins.get("load")
+        if isinstance(load, dict):
+            paths = load.get("paths")
+            if isinstance(paths, list):
+                next_paths = [
+                    path for path in paths
+                    if not is_defenseclaw_load_path(path)
+                    and not is_stale_channel_load_path(path)
+                ]
+                if next_paths != paths:
+                    load["paths"] = next_paths
+                    changed = True
+
+        if plugins.get("allow") != ["defenseclaw"]:
+            plugins["allow"] = ["defenseclaw"]
+            changed = True
+
+    gateway = cfg.get("gateway")
+    if not isinstance(gateway, dict):
+        gateway = {}
+        cfg["gateway"] = gateway
+        changed = True
+    if not gateway.get("mode"):
+        gateway["mode"] = "local"
+        changed = True
+
+    channels = cfg.get("channels")
+    if isinstance(channels, dict):
+        for channel in channels.values():
+            if not isinstance(channel, dict):
+                continue
+            if "nativeStreaming" in channel:
+                channel.pop("nativeStreaming", None)
+                changed = True
+            if "streaming" in channel and not isinstance(channel.get("streaming"), dict):
+                channel.pop("streaming", None)
+                changed = True
+
+    if changed:
+        with cfg_path.open("w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        return "changed"
+    return "clean"
+
+
+changed = clean = skipped = 0
+for cfg_path in cfg_paths:
+    result = normalize_config(cfg_path)
+    if result == "changed":
+        changed += 1
+    elif result == "clean":
+        clean += 1
+    else:
+        skipped += 1
+
+if changed:
+    print(f"[runner-cleanup] OpenClaw config normalized for CI ({changed} file(s))")
+elif clean:
+    print("[runner-cleanup] OpenClaw config already clean")
+elif skipped:
+    print("[runner-cleanup] OpenClaw config normalization skipped")
+PY
+}
+
+if [ "${RUNNER_CLEANUP_REPAIR_PERMISSIONS_ONLY:-0}" = "1" ]; then
+  log "Repairing persistent product state permissions only"
+  repair_persistent_state_permissions
+  exit 0
+fi
+
+if [ "${RUNNER_CLEANUP_PERMISSIONS_ONLY:-0}" = "1" ]; then
+  log "Repairing persistent product state permissions only"
+  repair_persistent_state_permissions
+  prune_stale_openclaw_e2e_artifacts
+  prune_stale_openclaw_channel_plugin_projects
+  exit 0
+fi
+
+if [ "${RUNNER_CLEANUP_STATE_ONLY:-0}" = "1" ]; then
+  log "Repairing persistent product state permissions and config only"
+  repair_persistent_state_permissions
+  prune_stale_openclaw_e2e_artifacts
+  prune_stale_openclaw_channel_plugin_projects
+  normalize_openclaw_ci_config
+  exit 0
+fi
+
+log "Disk before cleanup: $(df -h / | tail -1)"
+
+# 1. Stop stranded sidecar processes from earlier crashed runs. The runner
+# dying mid-job leaves these around (see PID 2462199 / 2461276 incident).
+defenseclaw-gateway stop 2>/dev/null || true
+openclaw gateway stop 2>/dev/null || true
+pkill -TERM -f 'openclaw-gateway' 2>/dev/null || true
+pkill -TERM -f 'defenseclaw-gateway' 2>/dev/null || true
+pkill -TERM -f 'splunk_hec_mock.py' 2>/dev/null || true
+sleep 1
+pkill -KILL -f 'openclaw-gateway' 2>/dev/null || true
+pkill -KILL -f 'defenseclaw-gateway' 2>/dev/null || true
+
+# 2. Aggressive docker reclaim. Splunk's image is ~4 GB and a dangling-only
+# prune would never reclaim it across runs.
+docker container prune -f 2>/dev/null || true
+docker volume prune -f 2>/dev/null || true
+docker image prune -a -f 2>/dev/null || true
+docker builder prune -a -f 2>/dev/null || true
+
+# 2b. Persistent product state can be left owned by root after sandboxed or
+# service-backed E2E paths. Repair it before workflow cleanup parses or prunes
+# these directories on the next run.
+repair_persistent_state_permissions
+prune_stale_openclaw_e2e_artifacts
+prune_stale_openclaw_channel_plugin_projects
+normalize_openclaw_ci_config
+
+# 3. Runner-level caches. _work/_actions and _tool accumulate from every job
+# that ever ran on this host; without TTL pruning they grow unbounded.
+RUNNER_ROOT="$(dirname "$(dirname "${RUNNER_WORKSPACE:-/home/ubuntu/actions-runner/_work/defenseclaw}")")"
+find "$RUNNER_ROOT/_work/_actions" -mindepth 2 -maxdepth 3 \
+     -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+find "$RUNNER_ROOT/_work/_tool" -mindepth 2 -maxdepth 3 \
+     -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+find "$RUNNER_ROOT/_diag" -type f -mtime +1 -delete 2>/dev/null || true
+
+# 3b. Old runner binaries from in-place upgrades (./bin is symlinked to
+# ./bin.<active-version>; everything else is dead weight). On the bedrock
+# runner this saved ~1.4 GB.
+RUNNER_HOME="$(dirname "$RUNNER_ROOT")"
+if [ -L "$RUNNER_HOME/bin" ]; then
+  ACTIVE_BIN="$(basename "$(readlink "$RUNNER_HOME/bin")")"
+  ACTIVE_EXT="${ACTIVE_BIN/bin/externals}"
+  for d in "$RUNNER_HOME"/bin.* "$RUNNER_HOME"/externals.*; do
+    [ -d "$d" ] || continue
+    base="$(basename "$d")"
+    if [ "$base" != "$ACTIVE_BIN" ] && [ "$base" != "$ACTIVE_EXT" ]; then
+      rm -rf "$d" 2>/dev/null || true
+    fi
+  done
+fi
+
+# 4. Language / package caches filled by `make install`. /tmp/go-build* is
+# the single biggest disk leak we've seen: a single failed E2E job leaves
+# ~700 MB behind, and `go clean -cache` does NOT touch them (it only flushes
+# ~/.cache/go-build).
+go clean -cache 2>/dev/null || true
+rm -rf "$HOME/.cache/go-build" 2>/dev/null || true
+rm -rf "$HOME/.cache/uv"/* "$HOME/.cache/pip"/* 2>/dev/null || true
+# `npm cache clean --force` is a no-op on hosts where npm isn't installed
+# globally; the explicit rm covers nvm-managed installs too.
+npm cache clean --force 2>/dev/null || true
+rm -rf "$HOME/.npm/_cacache" 2>/dev/null || true
+
+# 5. /tmp leaks from prior runs. Every entry here has been observed in a
+# disk-fill incident on the self-hosted runner.
+rm -rf /tmp/go-build* /tmp/go-link-* /tmp/go-* 2>/dev/null || true
+rm -rf /tmp/buildah* 2>/dev/null || true
+rm -rf /tmp/dclaw-test-* 2>/dev/null || true
+rm -rf /tmp/openclaw 2>/dev/null || true
+rm -rf /tmp/defenseclaw-logs-* 2>/dev/null || true
+rm -rf /tmp/splunk-mock-*.log /tmp/splunk-mock.stdout 2>/dev/null || true
+rm -f /tmp/opa 2>/dev/null || true
+
+# 6. Journals grow unbounded on long-running runners.
+journalctl --user --vacuum-time=1h 2>/dev/null || true
+sudo -n journalctl --vacuum-size=200M 2>/dev/null || true
+
+log "Disk after cleanup: $(df -h / | tail -1)"

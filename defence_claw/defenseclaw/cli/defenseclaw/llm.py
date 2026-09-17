@@ -1,0 +1,666 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""defenseclaw-llm — LiteLLM-backed subprocess bridge.
+
+Called by the TypeScript plugin scanner (``@defenseclaw/plugin-scanner``)
+and any other out-of-process component that needs to talk to an LLM
+without pulling in the full DefenseClaw Python dependency tree on its
+own. Uses LiteLLM's :func:`litellm.completion` so every provider
+LiteLLM supports — OpenAI, Anthropic, Google, Azure, Bedrock, Groq,
+Mistral, DeepSeek, Fireworks, Ollama, vLLM, LM Studio, OpenRouter,
+Together.ai, etc. — works through the same bridge with no SDK-specific
+branching here.
+
+Routing precedence (high → low) for each field:
+
+1. Explicit JSON request field (``model``, ``api_key``, ``api_base``,
+   ``provider``, ``temperature``, ``max_tokens``).
+2. The unified :class:`defenseclaw.config.LLMConfig` resolved at
+   ``scanners.plugin`` — top-level ``llm:`` merged with
+   ``scanners.plugin.llm:`` overrides. This is where
+   ``DEFENSECLAW_LLM_KEY`` / ``DEFENSECLAW_LLM_MODEL`` land.
+3. Provider-specific env vars (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``,
+   …) that LiteLLM reads on its own as a last resort.
+
+Guardrail bypass:
+    By design, the plugin scanner does NOT route through Bifrost.
+    Running DefenseClaw's own guardrails against third-party plugin
+    source code would double-bill operators and add latency for no
+    security benefit — the scanner IS the guardrail layer. If you want
+    guardrails on this path, stand Bifrost up separately and point
+    ``api_base`` at it.
+
+Usage::
+
+    echo '{"model":"anthropic/claude-sonnet-4-20250514","messages":[...]}' \\
+        | python -m defenseclaw.llm
+
+Input (stdin JSON) — every field is optional except ``messages``::
+
+    {
+        "model": "anthropic/claude-sonnet-4-20250514",
+        "messages": [{"role": "system", "content": "..."},
+                     {"role": "user",   "content": "..."}],
+        "max_tokens": 8192,
+        "temperature": 0.0,
+        "api_key": "...",
+        "api_base": "...",
+        "provider": "anthropic",
+        "timeout": 60,
+        "max_retries": 2
+    }
+
+Output (stdout JSON)::
+
+    {
+        "content": "...",
+        "model":   "anthropic/claude-sonnet-4-20250514",
+        "usage":   {"prompt_tokens": N,
+                    "completion_tokens": N,
+                    "total_tokens": N},
+        "error":   null
+    }
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from typing import Any
+
+from defenseclaw.gateway_error_codes import ERR_LLM_BRIDGE_ERROR
+
+# Opt-in debug flag. Default off so the plugin scanner stays quiet on
+# stderr (the TS plugin pipes stderr through to the Cursor/OpenClaw
+# log panel, and a noisy bridge pollutes that view). When the operator
+# is debugging "why is my LLM analyzer silent?" they can set
+# ``DEFENSECLAW_LLM_DEBUG=1`` and get one ``[llm-bridge]`` line per
+# fallback so they can tell which stage is failing — import vs config
+# load vs resolve vs env injection. We intentionally avoid ``logging``
+# here because this module is executed as a short-lived subprocess
+# without any log configuration, and configuring a root logger per
+# invocation is worse than a plain stderr line.
+_DEBUG = os.environ.get("DEFENSECLAW_LLM_DEBUG", "").strip() not in ("", "0", "false", "False")
+
+
+def _debug(msg: str) -> None:
+    if _DEBUG:
+        sys.stderr.write(f"[llm-bridge] {msg}\n")
+
+
+def _emit_llm_bridge_observation(
+    *,
+    model: str,
+    provider: str,
+    status: str,
+    duration_ms: float,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    response_model: str = "",
+    response_id: str = "",
+    finish_reasons: list[str] | None = None,
+) -> None:
+    """Best-effort handoff to the process-owned generated v8 runtime.
+
+    The bridge remains usable by a stand-alone plugin scanner, where no
+    DefenseClaw configuration or gateway exists. With an active v8 install,
+    Python never owns an SDK provider: it submits source facts and the gateway
+    creates the canonical metric and model span.
+    """
+
+    try:
+        from defenseclaw import config as config_module
+        from defenseclaw.logger import Logger
+
+        config_module.require_v8_config()
+        logger = Logger.from_config(config_module.load())
+        try:
+            logger.log_llm_bridge(
+                model=model,
+                provider=provider,
+                status=status,
+                duration_ms=duration_ms,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                response_model=response_model,
+                response_id=response_id,
+                finish_reasons=finish_reasons,
+            )
+        finally:
+            logger.close()
+    except Exception as exc:
+        _debug(f"canonical v8 observability handoff unavailable: {exc!r}")
+
+
+def _log_bridge_error_json(status: str, message: str) -> None:
+    rec = {
+        "defenseclaw": "llm-bridge",
+        "error_code": ERR_LLM_BRIDGE_ERROR,
+        "status": status,
+        "message": message[:2000],
+    }
+    sys.stderr.write(json.dumps(rec) + "\n")
+
+
+def _classify_llm_exception(exc: BaseException) -> str:
+    name = type(exc).__name__
+    mod = type(exc).__module__
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if mod.startswith("httpx") or mod.startswith("http"):
+        pass
+    try:
+        import requests  # noqa: PLC0415 — optional, same as litellm
+
+        if isinstance(exc, requests.Timeout | requests.ConnectTimeout | requests.ReadTimeout):
+            return "timeout"
+        if isinstance(exc, requests.ConnectionError):
+            return "network_error"
+    except Exception:
+        pass
+    try:
+        import litellm  # noqa: PLC0415
+
+        if isinstance(exc, getattr(litellm, "RateLimitError", ())):
+            return "rate_limited"
+        if isinstance(exc, getattr(litellm, "AuthenticationError", ())):
+            return "auth_failed"
+        if isinstance(exc, getattr(litellm, "Timeout", ())):
+            return "timeout"
+    except Exception:
+        pass
+    low = f"{name} {exc}".lower()
+    if "429" in low or "rate limit" in low:
+        return "rate_limited"
+    if "401" in low or "403" in low or "authentication" in low:
+        return "auth_failed"
+    if "timeout" in low:
+        return "timeout"
+    if "connection" in low or "connect" in low:
+        return "network_error"
+    return "internal"
+
+
+# LiteLLM provider → install hint when its lazy cloud SDK import fails.
+#
+# Bedrock (``boto3``) is bundled in the base install — see
+# ``[project].dependencies`` in pyproject.toml. The entry is kept here
+# as a defensive net for a damaged managed runtime or incomplete source
+# environment; recovery guidance must preserve the installation boundary.
+#
+# Vertex AI keeps the ``[vertex]`` extras gate because the SDK pulls
+# ~286 MB of transitive deps and most operators never touch Vertex.
+#
+# Each entry: provider prefix → (recovery hint, missing module pattern)
+_PROVIDER_INSTALL_HINT: dict[str, tuple[str, str]] = {
+    "bedrock": (
+        "Repair the managed installation; source checkouts: uv sync.",
+        "boto3",
+    ),
+    "vertex_ai": (
+        "Source checkouts: uv sync --extra vertex. Do not modify a packaged runtime.",
+        "google.cloud.aiplatform",
+    ),
+}
+
+
+def _missing_cloud_sdk(exc: BaseException, provider: str) -> str | None:
+    """Return an install-hint message if the exception is a missing cloud
+    SDK we know how to repair, otherwise ``None``.
+
+    Looks for the ``No module named 'X'`` shape that LiteLLM surfaces when
+    its lazy ``import boto3`` / ``import google.cloud.aiplatform`` fails.
+    The message is short enough to display in a wizard or doctor row and
+    points to the appropriate managed-runtime or source-checkout recovery.
+    """
+    text = str(exc)
+    if "No module named" not in text:
+        return None
+    prov = (provider or "").strip().lower()
+    hint_for_prov = _PROVIDER_INSTALL_HINT.get(prov)
+    if hint_for_prov is not None:
+        recovery_hint, _module = hint_for_prov
+        return f"{prov} support requires an extra dependency. {recovery_hint}"
+    # Provider unknown but module pattern matched — surface a generic hint.
+    for recovery_hint, module_name in _PROVIDER_INSTALL_HINT.values():
+        if f"'{module_name.split('.')[0]}'" in text:
+            return f"missing cloud SDK ({module_name}). {recovery_hint}"
+    return None
+
+
+def _load_plugin_llm_config() -> dict[str, Any]:
+    """Best-effort load of the plugin-scoped unified LLM config.
+
+    We isolate the import/load inside a try/except because this module
+    is designed to run even when DefenseClaw isn't fully installed on
+    the host (e.g. a user running the plugin scanner stand-alone from
+    the OpenClaw plugin). Missing config → empty dict, callers treat
+    it as "no defaults available" and fall back to env vars.
+
+    Each stage swallows its own exceptions and logs to stderr only
+    when ``DEFENSECLAW_LLM_DEBUG=1`` — see module-level ``_debug``.
+    Silently ignoring errors here was the M6 concern: before the debug
+    hook, a config typo left the scanner running with *no* resolved
+    defaults and the only symptom was "LLM analyzer shows no findings",
+    which is indistinguishable from a clean scan.
+
+    Returned keys map 1:1 to the LiteLLM ``completion`` kwargs so the
+    caller can spread them straight in.
+    """
+    try:
+        # ``defenseclaw.config`` exposes ``load()`` as a module-level
+        # function, not ``Config.load()``. Using the module entry point
+        # also keeps the import surface minimal for plugin scanner
+        # subprocesses that don't need the whole ``Config`` class.
+        from defenseclaw.config import load as _load_config
+        from defenseclaw.config import require_v8_config as _require_v8_config
+        from defenseclaw.scanner._llm_env import (
+            inject_llm_env,
+            litellm_completion_kwargs,
+        )
+    except Exception as exc:
+        _debug(f"import failed; falling back to env-only routing: {exc!r}")
+        return {}
+
+    try:
+        _require_v8_config()
+        cfg = _load_config()
+    except Exception as exc:
+        _debug(f"config.load() failed; check ~/.defenseclaw/config.yaml: {exc!r}")
+        return {}
+
+    try:
+        resolved = cfg.resolve_llm("scanners.plugin")
+    except Exception as exc:
+        _debug(f"cfg.resolve_llm('scanners.plugin') failed: {exc!r}")
+        return {}
+
+    _debug(
+        "resolved plugin LLM: "
+        f"provider={resolved.provider!r} "
+        f"model={resolved.model!r} "
+        f"api_key_env={resolved.api_key_env!r} "
+        f"has_key={bool(resolved.resolved_api_key())} "
+        f"base_url={resolved.base_url!r}"
+    )
+
+    # Inject the resolved key into provider env vars so LiteLLM picks
+    # it up even on code paths that bypass ``api_key=`` (e.g. Bedrock's
+    # AWS credential chain, Vertex AI's application-default creds).
+    try:
+        touched = inject_llm_env(resolved)
+        if touched:
+            _debug(f"injected env vars: {touched}")
+    except Exception as exc:
+        _debug(f"inject_llm_env failed (non-fatal): {exc!r}")
+
+    try:
+        return litellm_completion_kwargs(resolved)
+    except Exception as exc:
+        _debug(f"litellm_completion_kwargs failed: {exc!r}")
+        return {}
+
+
+def _request_redirects_routing(request: dict, defaults: dict) -> bool:
+    """Return True when the request routes to a different endpoint than the
+    resolved default.
+
+    "Routing" is the combination of ``api_base`` (explicit endpoint URL)
+    and the ``provider`` / ``model`` pair (which selects the provider's
+    default endpoint). The model comparison mirrors :func:`call_llm`'s
+    ``provider/model`` stitching so a request that re-states the default
+    routing in a different shape (``provider`` + bare ``model``) is not
+    treated as a redirect.
+    """
+    req_api_base = request.get("api_base")
+    if req_api_base and req_api_base != defaults.get("api_base"):
+        return True
+
+    default_model = defaults.get("model") or ""
+    req_model = (request.get("model") or "").strip()
+    req_provider = (request.get("provider") or "").strip()
+    if req_model:
+        effective = req_model
+        if req_provider and "/" not in req_model:
+            effective = f"{req_provider}/{req_model}"
+        if effective != default_model:
+            return True
+    elif req_provider:
+        default_provider = default_model.split("/", 1)[0] if "/" in default_model else ""
+        if req_provider != default_provider:
+            return True
+    return False
+
+
+def _merge_defaults(request: dict, defaults: dict) -> dict:
+    """Layer defaults under explicit request fields.
+
+    Anything the caller set wins; anything they left empty comes from
+    the resolved DefenseClaw config. Kept dead simple because LiteLLM's
+    ``completion`` is forgiving about missing optional kwargs.
+    """
+    merged: dict = dict(defaults)
+    # Map request field names → LiteLLM kwarg names. Most are 1:1
+    # except ``api_base`` which LiteLLM also accepts as ``api_base``
+    # (alias for base_url).
+    aliases = {
+        "model": "model",
+        "api_key": "api_key",
+        "api_base": "api_base",
+        "timeout": "timeout",
+        "max_retries": "num_retries",
+    }
+    for req_name, litellm_name in aliases.items():
+        value = request.get(req_name)
+        if value:
+            merged[litellm_name] = value
+
+    # F-0061: do not reuse the operator's resolved default api_key with a
+    # caller-chosen endpoint. When the request redirects routing
+    # (api_base / provider / model) away from the resolved default but does
+    # not supply its own api_key, drop the default key so the trusted
+    # credential is never sent to an endpoint the caller selected. Normal
+    # routing (unchanged) and caller-supplied keys are preserved.
+    if (
+        defaults.get("api_key")
+        and not request.get("api_key")
+        and _request_redirects_routing(request, defaults)
+    ):
+        merged.pop("api_key", None)
+        _debug(
+            "dropped resolved default api_key: request redirects routing to a "
+            "caller-chosen endpoint without supplying its own key"
+        )
+    return merged
+
+
+def call_llm(request: dict) -> dict:
+    """Dispatch a single LLM completion via LiteLLM.
+
+    Returns the canonical bridge response shape regardless of which
+    provider actually served the request. Any exception — import,
+    network, rate-limit, schema — is surfaced as ``error`` rather than
+    raised so the caller (typically a TS subprocess) gets a clean JSON
+    error document instead of a crash stack.
+    """
+    messages = request.get("messages", [])
+    if not messages:
+        return {
+            "content": "",
+            "model": request.get("model", ""),
+            "usage": {},
+            "error": "messages is required and must be a non-empty list",
+            "error_code": None,
+        }
+
+    try:
+        import litellm
+    except ImportError:
+        return {
+            "content": "",
+            "model": request.get("model", ""),
+        "usage": {},
+        "error": (
+                "litellm not installed. Repair the managed DefenseClaw "
+                "installation; source checkouts: uv sync "
+                "(LiteLLM is bundled with DefenseClaw ≥ 0.5)"
+            ),
+            "error_code": None,
+        }
+
+    defaults = _load_plugin_llm_config()
+    kwargs = _merge_defaults(request, defaults)
+
+    # ``provider`` in the request is a hint for LiteLLM's routing when
+    # the model is ambiguous (e.g. ``gpt-4o`` could be OpenAI or Azure).
+    # LiteLLM expects this stitched into the model string as
+    # ``provider/model``, which matches our config convention — only
+    # prepend when the caller hasn't already.
+    model = kwargs.get("model") or request.get("model") or ""
+    provider_hint = request.get("provider", "").strip()
+    if model and provider_hint and "/" not in model:
+        model = f"{provider_hint}/{model}"
+    kwargs["model"] = model
+
+    if not kwargs.get("model"):
+        return {
+            "content": "",
+            "model": "",
+            "usage": {},
+            "error": (
+                "model is required — pass ``model`` in the request or set "
+                "``llm.model`` / ``DEFENSECLAW_LLM_MODEL`` in the DefenseClaw "
+                "config"
+            ),
+            "error_code": None,
+        }
+
+    # Per-request knobs that LiteLLM expects verbatim.
+    kwargs["messages"] = messages
+    kwargs["max_tokens"] = request.get("max_tokens", 8192)
+    kwargs["temperature"] = request.get("temperature", 0.0)
+
+    t0 = time.perf_counter()
+    try:
+        response = litellm.completion(**kwargs)
+    except Exception as exc:
+        ms = (time.perf_counter() - t0) * 1000.0
+        st = _classify_llm_exception(exc)
+        _emit_llm_bridge_observation(
+            model=model, provider=provider_hint, status=st, duration_ms=ms
+        )
+        _log_bridge_error_json(st, f"{type(exc).__name__}: {exc}")
+        return {
+            "content": "",
+            "model": model,
+            "usage": {},
+            "error": f"{type(exc).__name__}: {exc}",
+            "error_code": ERR_LLM_BRIDGE_ERROR,
+        }
+
+    # LiteLLM normalizes responses to the OpenAI ChatCompletion shape
+    # regardless of provider, so a single extraction path works for
+    # every supported backend.
+    content = ""
+    try:
+        choices = response.choices or []
+        if choices:
+            msg = choices[0].message
+            content = getattr(msg, "content", "") or ""
+    except Exception as exc:
+        ms_bad = (time.perf_counter() - t0) * 1000.0
+        _emit_llm_bridge_observation(
+            model=model, provider=provider_hint, status="internal", duration_ms=ms_bad
+        )
+        _log_bridge_error_json("internal", f"malformed LiteLLM response: {exc}")
+        return {
+            "content": "",
+            "model": model,
+            "usage": {},
+            "error": f"malformed LiteLLM response: {exc}",
+            "error_code": ERR_LLM_BRIDGE_ERROR,
+        }
+
+    usage: dict = {}
+    response_usage = getattr(response, "usage", None)
+    if response_usage is not None:
+        prompt_tokens = getattr(response_usage, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(response_usage, "completion_tokens", 0) or 0
+        total_tokens = getattr(response_usage, "total_tokens", 0) or (
+            prompt_tokens + completion_tokens
+        )
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    response_model = getattr(response, "model", "") or model
+    finish_reasons = [
+        str(getattr(choice, "finish_reason", ""))
+        for choice in (getattr(response, "choices", None) or [])
+        if getattr(choice, "finish_reason", "")
+    ]
+    _emit_llm_bridge_observation(
+        model=model,
+        provider=provider_hint,
+        status="success",
+        duration_ms=(time.perf_counter() - t0) * 1000.0,
+        input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+        output_tokens=int(usage.get("completion_tokens", 0) or 0),
+        response_model=response_model,
+        response_id=str(getattr(response, "id", "") or ""),
+        finish_reasons=finish_reasons,
+    )
+
+    return {
+        "content": content,
+        "model": response_model,
+        "usage": usage,
+        "error": None,
+        "error_code": None,
+    }
+
+
+# Backward-compatible alias — older call sites (and the OpenClaw plugin
+# bridge) imported ``call_litellm`` before this module was renamed
+# ``call_llm``. Keep the name live so upgrading DefenseClaw doesn't
+# break a pinned plugin version.
+call_litellm = call_llm
+
+
+def ping(llm_config: Any, *, timeout: int = 5) -> tuple[bool, str]:
+    """One-shot reachability probe for a resolved :class:`LLMConfig`.
+
+    Sends ``messages=[{role:"user", content:"ping"}]`` with
+    ``max_tokens=1`` to the configured provider via LiteLLM. Designed
+    for the post-save wizard step and ``defenseclaw doctor``: short
+    timeout, no retries, never raises.
+
+    Returns ``(ok, message)``:
+
+    * ``(True,  "...")`` — provider answered with a non-empty payload.
+    * ``(False, "...")`` — auth failure, network failure, configuration
+      gap, or unexpected error. ``message`` is safe to render verbatim
+      (no secrets, no stack trace).
+
+    The function reads ``provider``, ``model``, ``base_url``,
+    ``resolved_api_key()``, and the provider-typed sub-blocks when
+    present. Local providers (ollama/vllm/lm_studio) with no API key
+    are accepted; an unset model id returns ``(False, ...)`` because
+    LiteLLM cannot route a blank model.
+    """
+    try:
+        import litellm  # noqa: PLC0415
+    except ImportError:
+        return (
+            False,
+            "litellm not installed — repair the managed DefenseClaw "
+            "installation; source checkouts: uv sync",
+        )
+
+    model = (getattr(llm_config, "model", "") or "").strip()
+    if not model:
+        return (False, "no model configured (set llm.model or pass --model)")
+    provider = (getattr(llm_config, "provider", "") or "").strip().lower()
+    if provider and "/" not in model:
+        model = f"{provider}/{model}"
+    api_key = ""
+    if hasattr(llm_config, "resolved_api_key"):
+        try:
+            api_key = llm_config.resolved_api_key() or ""
+        except Exception:
+            api_key = ""
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "timeout": max(1, int(timeout or 5)),
+        "num_retries": 0,
+    }
+    base_url = getattr(llm_config, "base_url", "") or ""
+    if base_url:
+        kwargs["api_base"] = base_url
+    if api_key:
+        kwargs["api_key"] = api_key
+
+    try:
+        resp = litellm.completion(**kwargs)
+    except Exception as exc:
+        # LiteLLM lazy-imports cloud SDKs (boto3 for Bedrock SigV4 +
+        # bearer routing, google-cloud-aiplatform for Vertex). When the
+        # operator picks one of those providers without installing the
+        # matching extra, the failure surfaces as a generic
+        # ``APIConnectionError: No module named 'boto3'`` which buries
+        # the actual fix. Detect that shape and replace the message
+        # with a one-line install hint.
+        missing = _missing_cloud_sdk(exc, provider)
+        if missing is not None:
+            return (False, missing)
+        st = _classify_llm_exception(exc)
+        return (False, f"{st}: {type(exc).__name__}: {exc}".strip().splitlines()[0][:240])
+
+    try:
+        choices = getattr(resp, "choices", None) or []
+        if not choices:
+            return (False, "provider returned empty choices")
+    except Exception as exc:
+        return (False, f"malformed response: {exc}")
+    return (True, f"ok ({model})")
+
+
+def main() -> None:
+    """Entry point for ``python -m defenseclaw.llm``.
+
+    Reads one JSON request from stdin, writes one JSON response to
+    stdout. Non-zero exit codes are deliberately avoided — errors are
+    reported in the response body so the caller can distinguish
+    transport failures (subprocess died) from model failures (rate
+    limit, auth, bad model id).
+    """
+    raw = sys.stdin.read().strip()
+    if not raw:
+        json.dump(
+            {"content": "", "model": "", "usage": {}, "error": "empty input"},
+            sys.stdout,
+        )
+        return
+
+    try:
+        request = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        json.dump(
+            {
+                "content": "",
+                "model": "",
+                "usage": {},
+                "error": f"invalid JSON: {exc}",
+            },
+            sys.stdout,
+        )
+        return
+
+    result = call_llm(request)
+    json.dump(result, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

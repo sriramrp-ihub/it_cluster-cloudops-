@@ -1,0 +1,254 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/defenseclaw/defenseclaw/internal/managed"
+)
+
+type Environment string
+
+const (
+	EnvDGXSpark Environment = "dgx-spark"
+	EnvMacOS    Environment = "macos"
+	EnvLinux    Environment = "linux"
+	EnvWindows  Environment = "windows"
+)
+
+type DeploymentMode string
+
+const (
+	DeploymentModeManagedEnterprise DeploymentMode = "managed_enterprise"
+	DeploymentModeUnmanagedBYOD     DeploymentMode = "unmanaged_byod"
+	DeploymentModeCICD              DeploymentMode = "ci_cd"
+	DeploymentModeSandboxed         DeploymentMode = "sandboxed"
+	DeploymentModeServer            DeploymentMode = "server"
+	DeploymentModeSaaS              DeploymentMode = "saas"
+)
+
+var validDeploymentModes = map[string]struct{}{
+	string(DeploymentModeManagedEnterprise): {},
+	string(DeploymentModeUnmanagedBYOD):     {},
+	string(DeploymentModeCICD):              {},
+	string(DeploymentModeSandboxed):         {},
+	string(DeploymentModeServer):            {},
+	string(DeploymentModeSaaS):              {},
+}
+
+const (
+	DefaultDataDirName = ".defenseclaw"
+	DefaultAuditDBName = "audit.db"
+	// DefaultJudgeBodiesDBName is the separate SQLite file that
+	// holds retained LLM judge bodies. We split it out from
+	// audit.db so the high-volume body INSERTs do not share a
+	// write lock with audit_events / activity_events; see the
+	// JudgeBodyStore design notes in
+	// internal/audit/judge_body_store.go.
+	DefaultJudgeBodiesDBName = "judge_bodies.db"
+	DefaultConfigName        = "config.yaml"
+	DefaultGatewayAPIPort    = 18970
+)
+
+func DefaultDataPath() string {
+	if v := os.Getenv("DEFENSECLAW_HOME"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, DefaultDataDirName)
+}
+
+func ConfigPath() string {
+	if v := os.Getenv(managed.ConfigPathEnv); v != "" {
+		return v
+	}
+	return filepath.Join(DefaultDataPath(), DefaultConfigName)
+}
+
+func DetectEnvironment() Environment {
+	switch runtime.GOOS {
+	case "darwin":
+		return EnvMacOS
+	case "windows":
+		return EnvWindows
+	}
+
+	if _, err := os.Stat("/etc/dgx-release"); err == nil {
+		return EnvDGXSpark
+	}
+
+	out, err := exec.Command("nvidia-smi", "-L").Output()
+	if err == nil && strings.Contains(string(out), "DGX") {
+		return EnvDGXSpark
+	}
+
+	return EnvLinux
+}
+
+// DefaultSkillWatchPaths returns skill directories for the default claw mode.
+// Prefer Config.SkillDirsForConnector when a config is available;
+// this fallback always uses the OpenClaw layout because we don't
+// know the active framework here.
+func DefaultSkillWatchPaths() []string {
+	return SkillDirsForOpenClaw("")
+}
+
+func DefaultConfig() *Config {
+	dataDir := DefaultDataPath()
+	clawMode := ClawOpenClaw
+	return &Config{
+		DataDir:       dataDir,
+		AuditDB:       filepath.Join(dataDir, DefaultAuditDBName),
+		JudgeBodiesDB: filepath.Join(dataDir, DefaultJudgeBodiesDBName),
+		QuarantineDir: filepath.Join(dataDir, "quarantine"),
+		PluginDir:     "",
+		PolicyDir:     filepath.Join(dataDir, "policies"),
+		Environment:   string(DetectEnvironment()),
+		AssetPolicy:   DefaultAssetPolicy(),
+		Claw: ClawConfig{
+			Mode:       clawMode,
+			HomeDir:    "~/.openclaw",
+			ConfigFile: "~/.openclaw/openclaw.json",
+		},
+		InspectLLM: InspectLLMConfig{
+			Timeout:    30,
+			MaxRetries: 3,
+		},
+		CiscoAIDefense: CiscoAIDefenseConfig{
+			Endpoint:  "https://us.api.inspect.aidefense.security.cisco.com",
+			APIKeyEnv: "CISCO_AI_DEFENSE_API_KEY",
+			TimeoutMs: 3000,
+		},
+		Scanners: ScannersConfig{
+			SkillScanner: SkillScannerConfig{
+				Binary:  "skill-scanner",
+				Policy:  "permissive",
+				Lenient: true,
+			},
+			MCPScanner: MCPScannerConfig{
+				Binary:    "mcp-scanner",
+				Analyzers: "auto",
+			},
+			PluginScanner: "defenseclaw",
+			CodeGuard:     filepath.Join(dataDir, "codeguard-rules"),
+		},
+		OpenShell: OpenShellConfig{
+			Binary:    "openshell",
+			PolicyDir: "/etc/openshell/policies",
+			Version:   DefaultOpenShellVersion,
+		},
+		Watch: WatchConfig{
+			DebounceMs:          500,
+			AutoBlock:           true,
+			AllowListBypassScan: true,
+			RescanEnabled:       true,
+			RescanIntervalMin:   60,
+			RescanContentGated:  true,
+		},
+		AIDiscovery: AIDiscoveryConfig{
+			Enabled:                   true,
+			Mode:                      "enhanced",
+			ScanIntervalMin:           5,
+			ProcessIntervalSec:        60,
+			ScanRoots:                 []string{"~"},
+			SignaturePacks:            []string{},
+			AllowWorkspaceSignatures:  false,
+			DisabledSignatureIDs:      []string{},
+			IncludeShellHistory:       true,
+			IncludePackageManifests:   true,
+			IncludeEnvVarNames:        true,
+			IncludeNetworkDomains:     true,
+			MaxFilesPerScan:           1000,
+			MaxFileBytes:              512 * 1024,
+			EmitOTel:                  true,
+			StoreRawLocalPaths:        false,
+			ConfidencePolicyPath:      filepath.Join(dataDir, "confidence.yaml"),
+			RequireTrustedBinaryPaths: false,
+			TrustedBinaryPrefixes:     []string{},
+		},
+		ApplicationProtection: DefaultApplicationProtectionConfig(),
+		Firewall: FirewallConfig{
+			ConfigFile: filepath.Join(dataDir, "firewall.yaml"),
+			RulesFile:  filepath.Join(dataDir, "firewall.pf.conf"),
+			AnchorName: "com.defenseclaw",
+		},
+		Guardrail: GuardrailConfig{
+			Mode:                        "observe",
+			ScannerMode:                 "both",
+			Host:                        "",
+			Port:                        4000,
+			HookSelfHeal:                true,
+			HookSelfHealDebounceMs:      500,
+			DetectionStrategy:           "regex_judge",
+			DetectionStrategyCompletion: "regex_only",
+			Judge: JudgeConfig{
+				Injection:     true,
+				PII:           true,
+				PIIPrompt:     true,
+				PIICompletion: true,
+				ToolInjection: true,
+				Exfil:         true,
+				Timeout:       30.0,
+			},
+			HILT: HILTConfig{
+				Enabled:     false,
+				MinSeverity: "HIGH",
+			},
+		},
+		// AuditSinks is empty by default — operators opt in to forwarding
+		// by adding entries (splunk_hec / otlp_logs / http_jsonl). The
+		// local SQLite store always receives every event.
+		AuditSinks: nil,
+		Gateway: GatewayConfig{
+			Host:            "127.0.0.1",
+			Port:            18789,
+			DeviceKeyFile:   filepath.Join(dataDir, "device.key"),
+			AutoApprove:     false,
+			ReconnectMs:     800,
+			MaxReconnectMs:  15000,
+			ApprovalTimeout: 30,
+			APIPort:         DefaultGatewayAPIPort,
+			ConfigReload: GatewayConfigReloadConfig{
+				Mode: "hot",
+			},
+			Watcher: GatewayWatcherConfig{
+				Enabled: true,
+				Skill: GatewayWatcherSkillConfig{
+					Enabled:    true,
+					TakeAction: true,
+					Dirs:       []string{},
+				},
+				Plugin: GatewayWatcherPluginConfig{
+					Enabled:    true,
+					TakeAction: true,
+					Dirs:       []string{},
+				},
+			},
+		},
+		SkillActions:  DefaultSkillActions(),
+		MCPActions:    DefaultMCPActions(),
+		PluginActions: DefaultPluginActions(),
+	}
+}

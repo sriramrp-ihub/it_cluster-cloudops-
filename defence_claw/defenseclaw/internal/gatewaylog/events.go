@@ -1,0 +1,1043 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+// Package gatewaylog defines the pre-v8 structured event schema retained for
+// compatibility decoding and isolated tests. Production v8 routing uses the
+// generated observability family registry instead of this writer stack.
+//
+// The schema is intentionally small, discriminated, and forward-stable:
+// adding a field is non-breaking, renaming a field is breaking. Every
+// event carries enough context for incident reconstruction without the
+// gateway process running, which is the single hard requirement from
+// operators auditing guardrail decisions after the fact.
+package gatewaylog
+
+import (
+	"sync/atomic"
+	"time"
+
+	"github.com/defenseclaw/defenseclaw/internal/version"
+)
+
+type AgentWatchContext struct {
+	TenantID        string
+	WorkspaceID     string
+	Environment     string
+	DeploymentMode  string
+	DiscoverySource string
+}
+
+var agentWatchContext atomic.Value
+
+func SetAgentWatchContext(ctx AgentWatchContext) {
+	agentWatchContext.Store(ctx)
+}
+
+func CurrentAgentWatchContext() AgentWatchContext {
+	v, _ := agentWatchContext.Load().(AgentWatchContext)
+	return v
+}
+
+func StampAgentWatchContext(e *Event) {
+	if e == nil {
+		return
+	}
+	ctx := CurrentAgentWatchContext()
+	if e.TenantID == "" {
+		e.TenantID = ctx.TenantID
+	}
+	if e.WorkspaceID == "" {
+		e.WorkspaceID = ctx.WorkspaceID
+	}
+	if e.Environment == "" {
+		e.Environment = ctx.Environment
+	}
+	if e.DeploymentMode == "" {
+		e.DeploymentMode = ctx.DeploymentMode
+	}
+	if e.DiscoverySource == "" {
+		e.DiscoverySource = ctx.DiscoverySource
+	}
+}
+
+// EventType enumerates the five first-class categories of gateway
+// observability events. Sinks and filters key off this value.
+type EventType string
+
+const (
+	// EventVerdict is the terminal decision of a single guardrail
+	// pipeline stage (regex, judge, cisco-ai-defense, opa, final).
+	// Emitted once per scanner per request in regex_judge mode, and
+	// once overall for the composed final verdict.
+	EventVerdict EventType = "verdict"
+
+	// EventJudge captures a single LLM-judge invocation — input size,
+	// latency, parsed verdict, and (when guardrail.retain_judge_bodies
+	// is on) the raw model response. Separated from EventVerdict so
+	// Verdict payloads stay small in the hot path.
+	EventJudge EventType = "judge"
+
+	// EventLifecycle covers gateway start/stop, config reloads, sink
+	// health transitions, and the handful of other non-verdict
+	// state changes operators care about.
+	EventLifecycle EventType = "lifecycle"
+
+	// EventError is a structured error log. We split errors out of
+	// the generic message stream so alerting/pagers can key off a
+	// single event_type without grepping free-form strings.
+	EventError EventType = "error"
+
+	// EventDiagnostic is a developer-facing trace (init, reentrancy
+	// guard fires, provider dial retries). Always ships to stderr
+	// but only to sinks when the operator opts in.
+	EventDiagnostic EventType = "diagnostic"
+
+	// EventManagedAIDFailOpen is the bounded managed-enterprise availability
+	// producer. Only the exact unwired/unavailable fail-open branches use it;
+	// benign no-content skips remain opt-in diagnostics.
+	EventManagedAIDFailOpen EventType = "managed_aid_fail_open"
+
+	// EventScan [v7] is a per-scan completion summary emitted by
+	// skill / mcp / plugin / aibom / codeguard scanners. Carries
+	// scanner identity, target, duration, finding counts by
+	// severity, and the parent scan_id. One per scan invocation.
+	EventScan EventType = "scan"
+
+	// EventScanFinding [v7] is a per-finding event fanned out
+	// alongside EventScan so SIEM consumers can alert on a single
+	// critical finding without having to join against the scan
+	// summary. Emitted once per Finding; a scan that produces N
+	// findings therefore produces 1 EventScan + N EventScanFinding.
+	EventScanFinding EventType = "scan_finding"
+
+	// EventActivity [v7] records operator-facing mutations:
+	// config updates, policy reloads, block/allow list changes,
+	// skill approval, sink reconfiguration. Carries a full
+	// before/after snapshot plus a compact structured diff so
+	// compliance auditors can reconstruct every change without
+	// scraping CLI output.
+	EventActivity EventType = "activity"
+
+	// EventDestinationTest records only the content-free attempt and terminal
+	// outcome of an explicit operator connectivity test. It is a distinct
+	// producer so ordinary audit actions cannot claim the probe-only schema.
+	EventDestinationTest EventType = "destination_test"
+
+	// EventEgress [v7.1] records every outbound request observed
+	// by the guardrail proxy's passthrough path, classified by the
+	// Layer 1 shape detector. The three branches — known / shape /
+	// passthrough — map to provider-allowlist hits, unknown hosts
+	// whose body looks like an LLM call, and unknown hosts with no
+	// LLM shape respectively. Emitted regardless of allow/block so
+	// operators can confirm coverage of the silent-bypass surface.
+	EventEgress EventType = "egress"
+
+	// EventLLMPrompt records a user/model prompt submitted through
+	// a monitored agent surface. Canonical destination routes apply their
+	// selected redaction profile before export.
+	EventLLMPrompt EventType = "llm_prompt"
+
+	// EventLLMResponse records model output and links it back to the
+	// prompt event it replies to when the source surface exposes
+	// enough turn/session data to build that correlation.
+	EventLLMResponse EventType = "llm_response"
+
+	// EventToolInvocation records an agent tool call or result. A
+	// call and its result share ToolCallID/ToolID so SIEM consumers
+	// can join input and output without scraping free-form details.
+	EventToolInvocation EventType = "tool_invocation"
+
+	// EventHookDecision records the connector-facing outcome of one hook
+	// evaluation. It is distinct from EventVerdict: Verdict describes what a
+	// guardrail stage concluded, while HookDecision records what DefenseClaw
+	// actually returned to the agent after enforcement-mode and connector
+	// capability mapping. This lets operators distinguish an enforced block
+	// from an observe-mode would-block and then follow the next lifecycle,
+	// model, or tool event in the same agent execution.
+	EventHookDecision EventType = "hook_decision"
+
+	// EventAIDiscovery records sanitized continuous AI usage discovery
+	// deltas. It is metadata-only: no raw paths, commands, prompt text,
+	// file contents, or secret values.
+	EventAIDiscovery EventType = "ai_discovery"
+)
+
+// Severity is the shared severity vocabulary — keep in lockstep with
+// audit.Event severities and OPA policy inputs so downstream filters
+// don't need a translation table.
+//
+// SeverityWarn ("WARN") is intentionally listed even though it doesn't
+// fit the LOW/MEDIUM/HIGH/CRITICAL ordering: codex/OTLP ingest paths
+// use it for "this thing was malformed, dashboards should notice but
+// it isn't a security event". Downstream consumers MUST map unknown
+// severities to MEDIUM so a future schema-only severity doesn't drop
+// off the on-call radar.
+type Severity string
+
+const (
+	SeverityInfo     Severity = "INFO"
+	SeverityLow      Severity = "LOW"
+	SeverityWarn     Severity = "WARN"
+	SeverityMedium   Severity = "MEDIUM"
+	SeverityHigh     Severity = "HIGH"
+	SeverityCritical Severity = "CRITICAL"
+)
+
+// JudgeFailureClass is the closed, internal reason vocabulary for a judge
+// invocation whose terminal action is "error". Keep this classification
+// separate from ErrorSummary: the class is safe for bounded metric labels,
+// while the summary remains centrally redacted free-form diagnostic text.
+type JudgeFailureClass string
+
+const (
+	JudgeFailureProvider      JudgeFailureClass = "provider"
+	JudgeFailureEmptyResponse JudgeFailureClass = "empty_response"
+	JudgeFailureOutputParse   JudgeFailureClass = "output_parse"
+)
+
+// Valid reports whether the value is one of the terminal judge-error classes.
+// The empty value is deliberately invalid here: successful allow/block results
+// carry no failure class, while action=error must always name one.
+func (class JudgeFailureClass) Valid() bool {
+	switch class {
+	case JudgeFailureProvider, JudgeFailureEmptyResponse, JudgeFailureOutputParse:
+		return true
+	default:
+		return false
+	}
+}
+
+// Stage identifies which stage of the guardrail pipeline produced a
+// Verdict. "final" is the composed result returned to the caller.
+type Stage string
+
+const (
+	StageRegex    Stage = "regex"
+	StageJudge    Stage = "judge"
+	StageCiscoAID Stage = "cisco_ai_defense"
+	StageOPA      Stage = "opa"
+	StageFinal    Stage = "final"
+	// StageSessionMessage marks the observational WebSocket
+	// session.message scan path. The prompt has already been sent
+	// to the LLM by the time this stage fires, so verdicts here
+	// produce audit but not block or confirm.
+	StageSessionMessage Stage = "session_message"
+	// StageMultiTurn marks verdicts emitted by the cross-turn
+	// injection tracker when repeated injection patterns are
+	// detected across user turns in the same session.
+	StageMultiTurn Stage = "multi_turn"
+	// StageBlockList marks verdicts emitted when a tool call is
+	// rejected by the static block list (skills/MCP/tool names
+	// enumerated by the operator), prior to any content scan.
+	StageBlockList Stage = "block_list"
+	// StageApproval marks verdicts emitted by the exec-approval
+	// pipeline when a dangerous command is denied before running.
+	StageApproval Stage = "approval"
+)
+
+// Direction is request-layer (user -> model) vs completion-layer
+// (model -> user). Guardrails run on both.
+type Direction string
+
+const (
+	DirectionPrompt     Direction = "prompt"
+	DirectionCompletion Direction = "completion"
+	// DirectionToolCall marks guardrail inspections of tool-call
+	// arguments (skill/MCP tool invocations). Distinct from prompt/
+	// completion so dashboards can split out MCP-tool risk from
+	// user-facing chat risk.
+	DirectionToolCall Direction = "tool_call"
+)
+
+// Event is the single envelope type every gateway observability
+// emission serializes to. Unused fields are omitted to keep JSONL
+// lines compact; indexers then key on event_type to interpret the
+// type-specific payload in the `verdict`, `judge`, `lifecycle`,
+// `error`, `scan`, `scan_finding`, and `activity` sub-objects.
+//
+// v7 additions:
+//   - Provenance (schema_version + content_hash + generation +
+//     binary_version) is stamped on EVERY event via StampProvenance
+//     at the writer choke point. Downstream consumers use it to
+//     distinguish between two events emitted by the same sidecar
+//     across a config reload, and to reject events they can't parse.
+//   - Agent identity is three-tiered: AgentID (logical, stable
+//     across restarts), AgentInstanceID (per agent session),
+//     SidecarInstanceID (per sidecar process, stable UUID minted
+//     at boot). All three coexist; aggregates key off different
+//     tiers for different questions.
+//   - EventScan/EventScanFinding/EventActivity expand the payload
+//     union with full scanner and operator-mutation coverage.
+//
+// Nullability:
+//   - Envelope fields marked `omitempty` are OPTIONAL per event type.
+//     Never assume a given event carries ToolName/PolicyID/etc.
+//     Consult docs/event-contracts.md for the field-presence matrix.
+type Event struct {
+	// Envelope fields — always populated.
+	Timestamp time.Time `json:"ts"`
+	EventType EventType `json:"event_type"`
+	Severity  Severity  `json:"severity"`
+
+	// Provenance quartet (v7). Populated at the writer choke point
+	// via StampProvenance; callers should leave these zero and let
+	// the writer fill them so every event on a single wire reflects
+	// a consistent snapshot of config state. SchemaVersion is always
+	// emitted (current contract: 7) so consumers can branch on the
+	// envelope version without probing optional fields. Generation
+	// is likewise always emitted — a zero value is semantically
+	// meaningful ("no bumps observed yet"), not missing data.
+	SchemaVersion int    `json:"schema_version"`
+	ContentHash   string `json:"content_hash,omitempty"`
+	Generation    uint64 `json:"generation"`
+	BinaryVersion string `json:"binary_version,omitempty"`
+
+	// Correlation
+	RunID     string `json:"run_id,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	TurnID    string `json:"turn_id,omitempty"`
+	// TraceID mirrors the OTel span's trace id for cross-sink
+	// correlation. Optional — unset events are still valid.
+	TraceID   string    `json:"trace_id,omitempty"`
+	Provider  string    `json:"provider,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	Direction Direction `json:"direction,omitempty"`
+
+	// Agent/tool/policy correlation fields. All are optional
+	// because not every event type populates every field:
+	// guardrail verdicts carry Model+Provider but no ToolName,
+	// tool_call events carry ToolName+ToolID but no Model, etc.
+	// Downstream consumers must tolerate missing fields gracefully.
+	//
+	// Three-tier agent identity (v7):
+	//
+	//   - AgentID: logical agent name/ID. Stable across restarts,
+	//     across sidecar processes, and across agent instances.
+	//     Use this to group "all events for agent X" in dashboards.
+	//   - AgentInstanceID: a single agent execution / session.
+	//     Stable per conversation; changes when the agent is
+	//     re-invoked. Use this to group turns within one
+	//     conversation.
+	//   - SidecarInstanceID: the sidecar process. Stable for the
+	//     sidecar's lifetime; changes on every restart. Primarily
+	//     useful for operators debugging which sidecar emitted a
+	//     specific event.
+	AgentID              string   `json:"agent_id,omitempty"`
+	AgentName            string   `json:"agent_name,omitempty"`
+	AgentType            string   `json:"agent_type,omitempty"`
+	RootAgentID          string   `json:"root_agent_id,omitempty"`
+	ParentAgentID        string   `json:"parent_agent_id,omitempty"`
+	RootSessionID        string   `json:"root_session_id,omitempty"`
+	ParentSessionID      string   `json:"parent_session_id,omitempty"`
+	AgentLifecycleID     string   `json:"agent_lifecycle_id,omitempty"`
+	AgentExecutionID     string   `json:"agent_execution_id,omitempty"`
+	AgentLifecycleEvent  string   `json:"agent_lifecycle_event,omitempty"`
+	AgentLifecycleState  string   `json:"agent_lifecycle_state,omitempty"`
+	AgentPhase           string   `json:"agent_phase,omitempty"`
+	AgentPreviousPhase   string   `json:"agent_previous_phase,omitempty"`
+	AgentPhaseCode       *int     `json:"agent_phase_code,omitempty"`
+	AgentSequence        int64    `json:"agent_sequence,omitempty"`
+	AgentOperationID     string   `json:"agent_operation_id,omitempty"`
+	AgentDepth           *int     `json:"agent_depth,omitempty"`
+	AgentReportedCostUSD *float64 `json:"agent_reported_cost_usd,omitempty"`
+	AgentReportedCost    *bool    `json:"agent_reported_cost_present,omitempty"`
+	SessionSource        string   `json:"session_source,omitempty"`
+	SessionResumed       *bool    `json:"session_resumed,omitempty"`
+	AgentInstanceID      string   `json:"agent_instance_id,omitempty"`
+	SidecarInstanceID    string   `json:"sidecar_instance_id,omitempty"`
+	UserID               string   `json:"user_id,omitempty"`
+	UserName             string   `json:"user_name,omitempty"`
+	PolicyID             string   `json:"policy_id,omitempty"`
+	DestinationApp       string   `json:"destination_app,omitempty"`
+	ToolName             string   `json:"tool_name,omitempty"`
+	ToolID               string   `json:"tool_id,omitempty"`
+
+	// Connector is the hook/proxy connector that produced this event
+	// (codex, claudecode, antigravity, openclaw, …). Optional —
+	// empty on single-connector installs and on events with no
+	// connector scope. Lets canonical observability consumers filter/group by
+	// connector with the same
+	// identity the audit rows and OTel telemetry carry, instead of
+	// inferring it from the model/agent fields.
+	Connector string `json:"connector,omitempty"`
+
+	// Multi-tenant / fleet-scoping fields.
+	//
+	// These are stamped from config at the writer / OTel choke points
+	// when set. All five are `omitempty`, so deployments that do not
+	// provide common Agent Watch context keep the historical compact
+	// event shape.
+	//
+	//   - TenantID: logical tenancy boundary for hosted / SaaS
+	//     deployments. One DefenseClaw sidecar can front agents owned
+	//     by multiple tenants; this field makes per-tenant billing,
+	//     auth scoping, and SIEM routing deterministic.
+	//   - WorkspaceID: sub-tenant scope (Slack-style workspace,
+	//     organization, or team). Allows the TUI / Grafana to filter
+	//     down from a tenant to a single working group.
+	//   - Environment: deployment environment string
+	//     (dev | staging | prod | sandbox). Dashboards key off it
+	//     so SLO alerts for "prod" don't fire on dev noise.
+	//   - DeploymentMode: mode the sidecar is running in
+	//     (standalone | managed | edge | ci). Helps operators
+	//     distinguish between agent events emitted from developer
+	//     laptops vs production fleets vs ephemeral CI runs.
+	//   - DiscoverySource: how the sidecar learned about the
+	//     monitored agent/tool (registry | manual | scan | import).
+	//     Feeds asset-management systems without a separate discovery
+	//     table.
+	TenantID        string `json:"tenant_id,omitempty"`
+	WorkspaceID     string `json:"workspace_id,omitempty"`
+	Environment     string `json:"environment,omitempty"`
+	DeploymentMode  string `json:"deployment_mode,omitempty"`
+	DiscoverySource string `json:"discovery_source,omitempty"`
+
+	// PayloadHMAC [v7.1 / plan B6] is the hex-encoded HMAC-SHA256 of
+	// the canonical JSON of whichever type-specific payload is set on
+	// this event, computed under the per-boot HMAC key derived via
+	// HKDF-SHA256 from the device.key seed (info=
+	// "defenseclaw-telemetry-v1"). Downstream auditors verify
+	// integrity by recomputing the HMAC over the canonicalized
+	// payload; tampering or in-flight rewriting yields a mismatch
+	// without exposing the device key.
+	//
+	// Stamped at the writer choke point alongside StampProvenance.
+	// Empty when:
+	//   - SetTelemetryHMACSeed has not been called (boot ordering /
+	//     unit tests). Production sidecars always invoke it; tests
+	//     that don't care about HMAC keep the field empty.
+	//   - No payload pointer is set on the event (envelope-only
+	//     events have nothing to authenticate).
+	PayloadHMAC string `json:"payload_hmac,omitempty"`
+
+	// RedactionEnabled carries the cloud-controlled per-inspection
+	// redaction directive (Cisco AI Defense is_redaction_enabled) from
+	// the inspection that produced this event down to the async /
+	// mirror sinks that don't share the originating request context
+	// (e.g. the audit-mirror path). Tri-state: nil = no directive
+	// (honor local config), true = force redact, false = store raw.
+	// In-process control metadata only — never serialized on the wire
+	// (json:"-"); the redaction decision it drives has already been
+	// applied to the payload strings by the time any sink sees them.
+	RedactionEnabled *bool `json:"-"`
+
+	// Type-specific payloads — exactly one is populated.
+	Verdict      *VerdictPayload      `json:"verdict,omitempty"`
+	Judge        *JudgePayload        `json:"judge,omitempty"`
+	Lifecycle    *LifecyclePayload    `json:"lifecycle,omitempty"`
+	Error        *ErrorPayload        `json:"error,omitempty"`
+	Diagnostic   *DiagnosticPayload   `json:"diagnostic,omitempty"`
+	Scan         *ScanPayload         `json:"scan,omitempty"`
+	ScanFinding  *ScanFindingPayload  `json:"scan_finding,omitempty"`
+	Activity     *ActivityPayload     `json:"activity,omitempty"`
+	Egress       *EgressPayload       `json:"egress,omitempty"`
+	LLMPrompt    *LLMPromptPayload    `json:"llm_prompt,omitempty"`
+	LLMResponse  *LLMResponsePayload  `json:"llm_response,omitempty"`
+	Tool         *ToolPayload         `json:"tool_invocation,omitempty"`
+	HookDecision *HookDecisionPayload `json:"hook_decision,omitempty"`
+	AIDiscovery  *AIDiscoveryPayload  `json:"ai_discovery,omitempty"`
+
+	ConnectorInventory *ConnectorInventoryPayload `json:"connector_inventory,omitempty"`
+	MCPInventory       *MCPInventoryPayload       `json:"mcp_inventory,omitempty"`
+	AgentInventory     *AgentInventoryPayload     `json:"agent_inventory,omitempty"`
+}
+
+// StampPayloadHMAC fills the PayloadHMAC field with HMAC-SHA256 over
+// whichever type-specific payload is non-nil. Safe to call when no
+// payload is set (no-op) or when the HMAC key is not yet installed
+// (no-op). Idempotent — calling twice produces the same digest because
+// the canonicalization is deterministic.
+//
+// Plan B6 / S0.10: stamped at the writer choke point so every event
+// on the wire is HMAC-stamped under a single boot-stable key.
+func (e *Event) StampPayloadHMAC() {
+	switch {
+	case e.Verdict != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Verdict)
+	case e.Judge != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Judge)
+	case e.Lifecycle != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Lifecycle)
+	case e.Error != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Error)
+	case e.Diagnostic != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Diagnostic)
+	case e.Scan != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Scan)
+	case e.ScanFinding != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.ScanFinding)
+	case e.Activity != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Activity)
+	case e.Egress != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Egress)
+	case e.LLMPrompt != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.LLMPrompt)
+	case e.LLMResponse != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.LLMResponse)
+	case e.Tool != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.Tool)
+	case e.HookDecision != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.HookDecision)
+	case e.AIDiscovery != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.AIDiscovery)
+	case e.ConnectorInventory != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.ConnectorInventory)
+	case e.MCPInventory != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.MCPInventory)
+	case e.AgentInventory != nil:
+		e.PayloadHMAC = ComputePayloadHMAC(e.AgentInventory)
+	}
+}
+
+// StampProvenance fills the four v7 provenance fields from the
+// current process-wide snapshot. Safe to call more than once; later
+// calls override earlier values so the writer can stamp at the
+// final serialization hop without worrying about upstream staleness.
+// Intended to be invoked at the writer choke point, never at the
+// emission call site, so a single wire run shows consistent
+// schema/content/generation across all events.
+func (e *Event) StampProvenance() {
+	p := version.Current()
+	e.SchemaVersion = p.SchemaVersion
+	e.ContentHash = p.ContentHash
+	e.Generation = p.Generation
+	e.BinaryVersion = p.BinaryVersion
+}
+
+// sidecarInstanceID is the per-process stable identifier stamped on
+// every event whose caller did not set one. The sidecar boot path
+// populates it alongside audit.SetProcessAgentInstanceID; leaving it
+// unset is only expected in unit tests where the identifier is
+// irrelevant.
+var sidecarInstanceID atomic.Value
+
+// SetSidecarInstanceID installs the per-process sidecar UUID that
+// the writer will stamp on events lacking an explicit value. Pairs
+// with audit.SetProcessAgentInstanceID — kept in a separate package
+// to avoid a gateway → audit cycle at the writer level.
+func SetSidecarInstanceID(id string) {
+	sidecarInstanceID.Store(id)
+}
+
+// SidecarInstanceID returns the installed per-process sidecar UUID
+// or the empty string when boot hasn't set one yet.
+func SidecarInstanceID() string {
+	v, _ := sidecarInstanceID.Load().(string)
+	return v
+}
+
+// VerdictPayload describes a single pipeline stage decision.
+// Structured findings live on JudgePayload (or on the pipeline-level
+// audit record). This envelope carries only the decision and a
+// redacted, operator-facing reason — enough to drive the TUI and
+// SIEM without re-deriving shape for every sink.
+type VerdictPayload struct {
+	Stage      Stage    `json:"stage"`
+	Action     string   `json:"action"`               // allow | warn | alert | confirm | block
+	Reason     string   `json:"reason,omitempty"`     // short, redacted
+	Categories []string `json:"categories,omitempty"` // e.g. [pii.email, injection.system_prompt]
+	LatencyMs  int64    `json:"latency_ms,omitempty"`
+	// EvaluationID joins this verdict to its per-finding rows in
+	// scan_findings and to the EventScanFinding fan-out emitted by
+	// the same runtime turn (hook, inspect, proxy, mid-stream,
+	// tool-call). Empty for verdicts that did not produce structured
+	// findings.
+	EvaluationID string `json:"evaluation_id,omitempty"`
+	// RuleIDs lists the (up to 8) detection rule identifiers that
+	// drove this verdict. Operators get a quick SIEM-pivot key
+	// without joining against scan_findings rows.
+	RuleIDs []string `json:"rule_ids,omitempty"`
+}
+
+// HookDecisionPayload is the agent-facing decision after the hook runtime
+// applies connector capability and enforcement-mode mapping. Action is what
+// the connector received; RawAction is the guardrail's original result. The
+// two differ for observe-mode would-blocks and non-enforceable hook surfaces.
+// EvaluationID and RuleIDs link this decision to the matching verdict and
+// per-rule scan-finding events without embedding content in the dashboard
+// correlation path.
+type HookDecisionPayload struct {
+	Connector    string   `json:"connector"`
+	Event        string   `json:"event"`
+	Result       string   `json:"result"`
+	Action       string   `json:"action"`
+	RawAction    string   `json:"raw_action"`
+	Severity     Severity `json:"severity"`
+	Mode         string   `json:"mode"`
+	WouldBlock   bool     `json:"would_block"`
+	Enforced     bool     `json:"enforced"`
+	StepIdx      int      `json:"step_idx,omitempty"`
+	LatencyMs    int64    `json:"latency_ms,omitempty"`
+	Reason       string   `json:"reason,omitempty"`
+	EvaluationID string   `json:"evaluation_id,omitempty"`
+	RuleIDs      []string `json:"rule_ids,omitempty"`
+}
+
+// Finding matches the shape guardrail scanners emit. Keep the field
+// set minimal — additional context belongs in the stage-specific
+// JudgePayload or VerdictPayload, not here.
+//
+// v7 additions: RuleID + LineNumber. Scanner-origin findings
+// (skill/plugin/mcp/aibom/codeguard) always populate RuleID so
+// downstream SIEM can group by detection rule without brittle
+// substring matches on Rule. LineNumber is the 1-based source line
+// or 0 when not meaningful (e.g. file-level findings).
+type Finding struct {
+	Category   string   `json:"category"`
+	Severity   Severity `json:"severity"`
+	Rule       string   `json:"rule,omitempty"`
+	RuleID     string   `json:"rule_id,omitempty"`
+	LineNumber int      `json:"line_number,omitempty"`
+	Evidence   string   `json:"evidence,omitempty"` // always redacted to a safe preview
+	Confidence float64  `json:"confidence,omitempty"`
+	Source     string   `json:"source,omitempty"` // regex | judge | cisco_aid | skill | mcp | plugin | aibom | codeguard
+}
+
+// JudgePayload records a single LLM-judge call. RawResponse is only
+// populated when guardrail.retain_judge_bodies is true — operators
+// opt in because raw bodies can echo user PII.
+type JudgePayload struct {
+	Kind         string            `json:"kind"` // injection | pii | tool_injection
+	Model        string            `json:"model"`
+	InputBytes   int               `json:"input_bytes"`
+	LatencyMs    int64             `json:"latency_ms"`
+	Action       string            `json:"action,omitempty"`
+	Severity     Severity          `json:"severity,omitempty"`
+	Findings     []Finding         `json:"findings,omitempty"`
+	RawResponse  string            `json:"raw_response,omitempty"`
+	FailureClass JudgeFailureClass `json:"failure_class,omitempty"`
+	ErrorSummary string            `json:"error_summary,omitempty"`
+	// ParseError is populated only when FailureClass is output_parse. Provider
+	// and empty-response failures use ErrorSummary without pretending that a
+	// parser observed malformed model output.
+	ParseError string `json:"parse_error,omitempty"`
+	// InputHash is the SHA-256 of the inspected judge *input*
+	// (the prompt/request bytes the judge was asked to evaluate),
+	// hex-encoded with the "sha256:" prefix when populated.
+	// ("Judge input_hash is computed from the
+	// response body") closure: the persistor previously hashed
+	// RawResponse and stored the resulting digest as InputHash,
+	// breaking dedup/pivot semantics. Callers that have the
+	// inspected bytes available should populate this; the audit
+	// store leaves InputHash empty when this is not provided
+	// rather than hashing the response body.
+	InputHash string `json:"input_hash,omitempty"`
+}
+
+// LifecyclePayload covers sidecar start/stop and config-reload
+// transitions. Details is free-form and always redacted.
+type LifecyclePayload struct {
+	Subsystem  string            `json:"subsystem"`  // gateway | watcher | sinks | telemetry | api
+	Transition string            `json:"transition"` // start | stop | ready | degraded | restored | alert | completed
+	Details    map[string]string `json:"details,omitempty"`
+}
+
+// ErrorPayload is the structured shape of every recoverable error we
+// want an operator to be able to filter on. Non-recoverable errors
+// exit the process and land in stderr before the sidecar dies.
+type ErrorPayload struct {
+	Subsystem string `json:"subsystem"`
+	Code      string `json:"code,omitempty"` // stable short identifier
+	Message   string `json:"message"`
+	Cause     string `json:"cause,omitempty"`
+	// RuleID attributes this error to a specific detection rule
+	// when the broken event carried one (schema-gate violations
+	// on EventScanFinding, verdict-failure errors that reference
+	// a rule). Empty for errors that are not rule-attributable
+	// (boot failures, transport errors, audit DB faults).
+	RuleID string `json:"rule_id,omitempty"`
+	// EvaluationID joins this error to the upstream evaluation
+	// (scan_summary / hook / inspect / proxy guardrail) that
+	// produced the broken event. Empty when no upstream
+	// evaluation exists (e.g. schema gate firing on a config /
+	// admin emission, or a writer-level transport error).
+	EvaluationID string `json:"evaluation_id,omitempty"`
+}
+
+// DiagnosticPayload carries developer traces that don't fit the other
+// categories. Message is human-readable; Fields is an open bag.
+type DiagnosticPayload struct {
+	Component string                 `json:"component"`
+	Message   string                 `json:"message"`
+	Fields    map[string]interface{} `json:"fields,omitempty"`
+}
+
+// ScanPayload [v7] summarises a single scanner invocation.
+// Findings live on sibling EventScanFinding events for SIEM
+// per-row alerting; this payload carries the roll-up counts.
+//
+// ScanID correlates a ScanPayload to its children; every
+// ScanFindingPayload tied to the same scan shares a ScanID.
+type ScanPayload struct {
+	ScanID      string         `json:"scan_id"`
+	Scanner     string         `json:"scanner"` // see scanner enum in scan-event.json schema
+	Target      string         `json:"target"`  // file path | skill name | server URL | tool name | message surface
+	TargetType  string         `json:"target_type,omitempty"`
+	Verdict     string         `json:"verdict,omitempty"` // clean | warn | block
+	DurationMs  int64          `json:"duration_ms,omitempty"`
+	SeverityMax Severity       `json:"severity_max,omitempty"`
+	Counts      map[string]int `json:"counts,omitempty"` // severity -> count
+	TotalCount  int            `json:"total_count,omitempty"`
+	ExitCode    int            `json:"exit_code,omitempty"`
+	Error       string         `json:"error,omitempty"` // scanner execution error
+	// EvaluationID joins this scan summary to the verdict / hook /
+	// inspect audit row that triggered it. Empty for classic
+	// scanner-invocation paths that have no upstream evaluation.
+	EvaluationID string `json:"evaluation_id,omitempty"`
+}
+
+// ScanFindingPayload [v7] records a single finding produced by a
+// scanner. Downstream SIEM can alert on severity/rule_id without
+// joining to the parent ScanPayload.
+type ScanFindingPayload struct {
+	ScanID      string   `json:"scan_id"`
+	Scanner     string   `json:"scanner"`
+	Target      string   `json:"target"`
+	FindingID   string   `json:"finding_id,omitempty"`
+	RuleID      string   `json:"rule_id,omitempty"`
+	Category    string   `json:"category,omitempty"`
+	Title       string   `json:"title,omitempty"`
+	Description string   `json:"description,omitempty"` // redacted
+	Severity    Severity `json:"severity,omitempty"`
+	Location    string   `json:"location,omitempty"` // redacted path + line
+	LineNumber  int      `json:"line_number,omitempty"`
+	Remediation string   `json:"remediation,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	// Confidence is the detector's self-reported certainty in [0,1].
+	// Populated by regex/judge/AID detectors; omitted for binary
+	// scanners that don't compute a score.
+	Confidence float64 `json:"confidence,omitempty"`
+	// EvaluationID matches ScanPayload.EvaluationID — joins this
+	// finding to the verdict / hook / inspect row that produced it.
+	EvaluationID string `json:"evaluation_id,omitempty"`
+}
+
+// ActivityPayload [v7] records an operator-facing mutation
+// (config save, policy reload, block/allow list update, skill
+// approval). Before/After are compact JSON snapshots of the changed
+// resource; Diff is a structured key-level diff so dashboards
+// don't have to diff blobs themselves.
+//
+// Actor is the principal who made the change (CLI user, automated
+// watcher, HTTP API client). Reason is operator-supplied free text.
+// TargetType + TargetID identify what changed (policy/skill/mcp/
+// config/action/sink).
+type ActivityPayload struct {
+	Actor       string         `json:"actor"`
+	Action      string         `json:"action"` // mirrors audit.Action
+	TargetType  string         `json:"target_type"`
+	TargetID    string         `json:"target_id"`
+	Reason      string         `json:"reason,omitempty"`
+	Before      map[string]any `json:"before,omitempty"` // nil on create
+	After       map[string]any `json:"after,omitempty"`  // nil on delete
+	Diff        []DiffEntry    `json:"diff,omitempty"`
+	VersionFrom string         `json:"version_from,omitempty"`
+	VersionTo   string         `json:"version_to,omitempty"`
+}
+
+// DiffEntry is a single added / removed / changed key within an
+// ActivityPayload. For array fields Path uses "field[index]"
+// notation; for nested maps a dotted path is used.
+type DiffEntry struct {
+	Path   string `json:"path"`
+	Op     string `json:"op"` // add | remove | replace
+	Before any    `json:"before,omitempty"`
+	After  any    `json:"after,omitempty"`
+}
+
+// EgressPayload [v7.1] records a classified outbound request observed
+// by the guardrail proxy. Layer 1 (shape detection) and Layer 3
+// (observability) both populate this payload — Layer 1 on the Go
+// side from handlePassthrough, Layer 3 from the TS fetch-interceptor
+// reporting its own branch decision back through the /v1/events/egress
+// endpoint.
+//
+// Field semantics:
+//   - TargetHost: destination hostname (not the full URL — we never
+//     log the query string to avoid leaking API keys).
+//   - ResolvedIP: concrete remote peer observed by Go's HTTP transport.
+//     Set only for private-upstream events; TS callers cannot attest it.
+//   - TargetPath: URL pathname only, trimmed to 256 chars. Useful
+//     for distinguishing /chat/completions vs /messages.
+//   - BodyShape: BodyShapeNone | messages | prompt | input | contents.
+//     Empty for non-body requests (GETs reported from the TS side).
+//   - LooksLikeLLM: true when the request hit a known provider OR
+//     the shape classifier matched.
+//   - Branch: known | shape | passthrough | private-upstream. The latter
+//     records use of an operator-approved private destination.
+//   - Decision: allow | block. Paired with Branch because a "shape"
+//     branch can produce either depending on allow_unknown_llm_domains.
+//   - Reason: stable short identifier matching the Go emitter's
+//     call-site reason strings (e.g. "unknown-host-no-shape",
+//     "private-ip", "allow-unknown-disabled", "known-provider").
+//   - Source: "go" | "ts" — which layer observed the request. Both
+//     are expected in a correctly instrumented fleet; mismatches are
+//     a red flag that one layer has a stale allowlist.
+type EgressPayload struct {
+	TargetHost   string `json:"target_host,omitempty"`
+	ResolvedIP   string `json:"resolved_ip,omitempty"`
+	TargetPath   string `json:"target_path,omitempty"`
+	BodyShape    string `json:"body_shape,omitempty"`
+	LooksLikeLLM bool   `json:"looks_like_llm,omitempty"`
+	Branch       string `json:"branch"`
+	Decision     string `json:"decision"`
+	Reason       string `json:"reason,omitempty"`
+	Source       string `json:"source"`
+}
+
+// LLMPromptPayload records source facts submitted to a monitored model.
+// Canonical observability v8 routing applies the selected redaction profile
+// independently for each destination before projection or export.
+type LLMPromptPayload struct {
+	PromptID       string `json:"prompt_id"`
+	TurnID         string `json:"turn_id,omitempty"`
+	Role           string `json:"role,omitempty"`
+	Prompt         string `json:"prompt,omitempty"`
+	RawRequestBody string `json:"raw_request_body,omitempty"`
+	Source         string `json:"source,omitempty"`
+}
+
+// LLMResponsePayload records model output and its prompt correlation. Response
+// and RawResponseBody follow the same redaction contract as LLMPromptPayload.
+type LLMResponsePayload struct {
+	ResponseID      string   `json:"response_id"`
+	ReplyToPromptID string   `json:"reply_to_prompt_id,omitempty"`
+	TurnID          string   `json:"turn_id,omitempty"`
+	Response        string   `json:"response,omitempty"`
+	RawResponseBody string   `json:"raw_response_body,omitempty"`
+	FinishReasons   []string `json:"finish_reasons,omitempty"`
+	Source          string   `json:"source,omitempty"`
+}
+
+// ToolPayload records one phase of a model-selected or agent-executed tool
+// invocation. ToolInput and ToolOutput are content-bearing and flow through
+// canonical destination redaction before export.
+type ToolPayload struct {
+	ToolCallID      string `json:"tool_call_id,omitempty"`
+	Phase           string `json:"phase"` // call | result
+	TurnID          string `json:"turn_id,omitempty"`
+	Tool            string `json:"tool"`
+	ToolInput       string `json:"tool_input,omitempty"`
+	ToolOutput      string `json:"tool_output,omitempty"`
+	ExitCode        *int   `json:"exit_code,omitempty"`
+	ReplyToPromptID string `json:"reply_to_prompt_id,omitempty"`
+	Source          string `json:"source,omitempty"`
+}
+
+// AIDiscoveryPayload preserves the historical gateway-event envelope schema.
+// Runtime v8 emits AI discovery through generated canonical records instead.
+//
+// Privacy contract:
+//   - The "minimal" set of fields (ScanID through LastSeen) is always
+//     populated -- they carry no raw paths or unhashed values, only
+//     sha256:* digests and category/vendor/product strings drawn from
+//     the operator-curated catalog.
+//   - The "extended" set remains decodable for pre-v8 stored envelopes. New
+//     producers do not construct this payload, and raw paths are never exposed
+//     through canonical API or destination projections.
+//   - Every extended field is `omitempty` so receivers cannot tell
+//     from the wire whether the operator opted out or never had a
+//     value for that signal.
+type AIDiscoveryPayload struct {
+	ScanID        string   `json:"scan_id"`
+	SignalID      string   `json:"signal_id"`
+	Category      string   `json:"category"`
+	Vendor        string   `json:"vendor,omitempty"`
+	Product       string   `json:"product,omitempty"`
+	Confidence    float64  `json:"confidence,omitempty"`
+	State         string   `json:"state"` // new | changed | gone
+	EvidenceTypes []string `json:"evidence_types,omitempty"`
+	PathHashes    []string `json:"path_hashes,omitempty"`
+	Basenames     []string `json:"basenames,omitempty"`
+	WorkspaceHash string   `json:"workspace_hash,omitempty"`
+	LastSeen      string   `json:"last_seen,omitempty"`
+
+	// Extended fields below are historical decode compatibility only.
+	Detector        string                `json:"detector,omitempty"`
+	Component       *AIDiscoveryComponent `json:"component,omitempty"`
+	Model           *AIDiscoveryModel     `json:"model,omitempty"`
+	Runtime         *AIDiscoveryRuntime   `json:"runtime,omitempty"`
+	LastActiveAt    string                `json:"last_active_at,omitempty"`
+	IdentityScore   float64               `json:"identity_score,omitempty"`
+	IdentityBand    string                `json:"identity_band,omitempty"`
+	PresenceScore   float64               `json:"presence_score,omitempty"`
+	PresenceBand    string                `json:"presence_band,omitempty"`
+	IdentityFactors []AIDiscoveryFactor   `json:"identity_factors,omitempty"`
+	PresenceFactors []AIDiscoveryFactor   `json:"presence_factors,omitempty"`
+	Detectors       []string              `json:"detectors,omitempty"`
+	Evidence        []AIDiscoveryEvidence `json:"evidence,omitempty"`
+	// RawPaths is retained only to decode historical envelopes.
+	RawPaths []string `json:"raw_paths,omitempty"`
+}
+
+// AIDiscoveryComponent mirrors inventory.AIComponent.
+type AIDiscoveryComponent struct {
+	Ecosystem string `json:"ecosystem,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Version   string `json:"version,omitempty"`
+	Framework string `json:"framework,omitempty"`
+}
+
+// AIDiscoveryModel mirrors inventory.LocalModelInfo. It is part of the
+// privacy-gated extended payload because model IDs can contain user-chosen or
+// private repository names. Local `/api/v1/ai-usage` responses still carry the
+// model block regardless of outbound sink redaction.
+type AIDiscoveryModel struct {
+	ID                  string                      `json:"id"`
+	Status              string                      `json:"status"`
+	Format              string                      `json:"format,omitempty"`
+	Provider            string                      `json:"provider,omitempty"`
+	Recipe              string                      `json:"recipe,omitempty"`
+	Modality            string                      `json:"modality,omitempty"`
+	Device              string                      `json:"device,omitempty"`
+	SizeBytes           int64                       `json:"size_bytes,omitempty"`
+	Pinned              bool                        `json:"pinned,omitempty"`
+	OwnerApplication    string                      `json:"owner_application,omitempty"`
+	Relevance           string                      `json:"relevance,omitempty"`
+	DiscoveryConfidence *float64                    `json:"discovery_confidence,omitempty"`
+	Provenance          *AIDiscoveryModelProvenance `json:"provenance,omitempty"`
+}
+
+// AIDiscoveryModelProvenance mirrors inventory.LocalModelProvenance for
+// historical extended envelopes. Runtime v8 emits a bounded provenance subset
+// through canonical ai_component logs instead of serializing this legacy model
+// block.
+type AIDiscoveryModelProvenance struct {
+	Publisher    string   `json:"publisher,omitempty"`
+	CountryCode  string   `json:"country_code,omitempty"`
+	RootModel    string   `json:"root_model,omitempty"`
+	BaseModels   []string `json:"base_models,omitempty"`
+	Quantized    *bool    `json:"quantized,omitempty"`
+	Quantization string   `json:"quantization,omitempty"`
+	Distilled    *bool    `json:"distilled,omitempty"`
+	Derivation   string   `json:"derivation,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	Confidence   string   `json:"confidence,omitempty"`
+}
+
+// AIDiscoveryRuntime mirrors inventory.ProcessRuntime.
+type AIDiscoveryRuntime struct {
+	PID       int    `json:"pid,omitempty"`
+	PPID      int    `json:"ppid,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
+	UptimeSec int64  `json:"uptime_sec,omitempty"`
+	User      string `json:"user,omitempty"`
+	Comm      string `json:"comm,omitempty"`
+}
+
+// AIDiscoveryFactor mirrors inventory.ConfidenceFactor for the wire.
+// LogitDelta is the additive contribution this evidence made to the
+// per-axis log-odds; receivers can convert via P*(1-P) to get a
+// percentage-point shift.
+type AIDiscoveryFactor struct {
+	Detector    string  `json:"detector"`
+	EvidenceID  string  `json:"evidence_id,omitempty"`
+	MatchKind   string  `json:"match_kind,omitempty"`
+	Quality     float64 `json:"quality"`
+	Specificity float64 `json:"specificity"`
+	LR          float64 `json:"lr"`
+	LogitDelta  float64 `json:"logit_delta"`
+}
+
+// AIDiscoveryEvidence mirrors historical inventory evidence on the envelope.
+// Runtime v8 never populates RawPath on API or destination projections.
+type AIDiscoveryEvidence struct {
+	Type          string  `json:"type"`
+	Basename      string  `json:"basename,omitempty"`
+	PathHash      string  `json:"path_hash,omitempty"`
+	ValueHash     string  `json:"value_hash,omitempty"`
+	WorkspaceHash string  `json:"workspace_hash,omitempty"`
+	RawPath       string  `json:"raw_path,omitempty"`
+	Quality       float64 `json:"quality,omitempty"`
+	MatchKind     string  `json:"match_kind,omitempty"`
+}
+
+// ConnectorInventoryPayload is the endpoint's roster of configured
+// DefenseClaw connectors, shipped to AI Defense as a discovery event
+// (event_type=connector_inventory). Metadata-only — connector names,
+// human descriptions, source (built-in vs plugin), and the inspection /
+// subprocess posture. No user content. DeviceID / Hostname anchor the
+// inventory to a specific endpoint; they duplicate the resource-level
+// defenseclaw.device.id / host.name attributes so consumers that key on
+// the log body (not the resource) still get the anchor.
+type ConnectorInventoryPayload struct {
+	DeviceID   string                   `json:"device_id,omitempty"`
+	Hostname   string                   `json:"hostname,omitempty"`
+	Count      int                      `json:"count"`
+	Connectors []ConnectorInventoryItem `json:"connectors"`
+}
+
+// ConnectorInventoryItem is one connector row in a ConnectorInventoryPayload.
+type ConnectorInventoryItem struct {
+	Name               string `json:"name"`
+	Description        string `json:"description,omitempty"`
+	Source             string `json:"source,omitempty"` // built-in | plugin
+	ToolInspectionMode string `json:"tool_inspection_mode,omitempty"`
+	SubprocessPolicy   string `json:"subprocess_policy,omitempty"`
+}
+
+// MCPInventoryPayload lists the MCP servers configured for the endpoint's
+// active connector(s), shipped as a discovery event
+// (event_type=mcp_inventory). Deliberately redaction-safe: only the
+// server name, transport, command BASENAME, and URL HOST are carried —
+// full command paths, args, env, headers, and OAuth blocks are omitted
+// because they can embed local paths or secrets.
+type MCPInventoryPayload struct {
+	DeviceID string             `json:"device_id,omitempty"`
+	Hostname string             `json:"hostname,omitempty"`
+	Count    int                `json:"count"`
+	Servers  []MCPInventoryItem `json:"servers"`
+}
+
+// MCPInventoryItem is one MCP-server row in an MCPInventoryPayload.
+type MCPInventoryItem struct {
+	Name         string `json:"name"`
+	Transport    string `json:"transport,omitempty"`
+	Command      string `json:"command,omitempty"`  // basename only, never args/path
+	URLHost      string `json:"url_host,omitempty"` // host only, never path/query
+	AuthProvider string `json:"auth_provider_type,omitempty"`
+	Disabled     bool   `json:"disabled,omitempty"`
+}
+
+// AgentInventoryPayload is the endpoint's installed coding-agent roster,
+// emitted at agent-discovery ingest time (event_type=agent_inventory)
+// from the already-validated agentDiscoveryReport. The report is
+// sanitized before it reaches this payload: basenames + sha256 path
+// hashes only, never raw filesystem paths.
+type AgentInventoryPayload struct {
+	DeviceID  string               `json:"device_id,omitempty"`
+	Hostname  string               `json:"hostname,omitempty"`
+	Source    string               `json:"source,omitempty"`
+	ScannedAt string               `json:"scanned_at,omitempty"`
+	Count     int                  `json:"count"`
+	Installed int                  `json:"installed"`
+	Agents    []AgentInventoryItem `json:"agents"`
+}
+
+// AgentInventoryItem is one coding-agent row in an AgentInventoryPayload.
+type AgentInventoryItem struct {
+	Name               string `json:"name"`
+	Installed          bool   `json:"installed"`
+	HasConfig          bool   `json:"has_config"`
+	ConfigBasename     string `json:"config_basename,omitempty"`
+	ConfigPathHash     string `json:"config_path_hash,omitempty"`
+	HasBinary          bool   `json:"has_binary"`
+	BinaryBasename     string `json:"binary_basename,omitempty"`
+	BinaryPathHash     string `json:"binary_path_hash,omitempty"`
+	Version            string `json:"version,omitempty"`
+	VersionProbeStatus string `json:"version_probe_status,omitempty"`
+}

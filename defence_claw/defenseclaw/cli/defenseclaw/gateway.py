@@ -1,0 +1,594 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Gateway-related helpers shared by every Click command.
+
+This module hosts two cohesive but independent responsibilities:
+
+* :class:`OrchestratorClient` — the HTTP client the Python CLI uses to
+  talk to the running sidecar at ``http://{host}:{api_port}``.  Mirrors
+  the endpoints exposed in ``internal/gateway/api.go``.
+* :func:`resolve_gateway_binary` — the single source of truth for where
+  the Python CLI looks for the ``defenseclaw-gateway`` executable on
+  disk.  See the helper's own docstring for the resolution order and
+  the UX bug that prompted it.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import socket
+import sys
+from collections.abc import Mapping
+from functools import lru_cache
+from typing import Any
+from urllib.parse import quote
+
+import requests
+
+PLUGIN_MUTATION_TIMEOUT = 90
+
+
+def gateway_api_client_host(cfg: Any) -> str:
+    """Return a connectable host for the configured sidecar API bind."""
+    gateway = getattr(cfg, "gateway", None)
+    bind = str(getattr(gateway, "api_bind", "") or "").strip()
+    if not bind:
+        openshell = getattr(cfg, "openshell", None)
+        guardrail = getattr(cfg, "guardrail", None)
+        standalone = bool(
+            openshell is not None and callable(getattr(openshell, "is_standalone", None)) and openshell.is_standalone()
+        )
+        guardrail_host = str(getattr(guardrail, "host", "") or "").strip()
+        if standalone and guardrail_host and guardrail_host != "localhost":
+            bind = guardrail_host
+    if bind in {"::", "[::]"}:
+        # An unspecified IPv6 bind is reachable on the IPv6 loopback, which is
+        # the exact target. But a host can have IPv6 disabled at the kernel or
+        # image level while still running this gateway (hardened base images
+        # and some container runtimes do), and on those hosts a ``::`` listener
+        # is reached through the IPv4 loopback. Only claim ``::1`` when this
+        # process can actually open an IPv6 socket; otherwise fall back to the
+        # historical 127.0.0.1 rather than emitting an unconnectable host.
+        return "::1" if _ipv6_loopback_available() else "127.0.0.1"
+    if bind in {"", "0.0.0.0", "*"}:
+        return "127.0.0.1"
+    return bind
+
+
+@lru_cache(maxsize=1)
+def _ipv6_loopback_available() -> bool:
+    """Return whether this process can bind the IPv6 loopback.
+
+    Cached: the answer is a property of the running kernel and cannot change
+    within one CLI invocation. Binding port 0 is a purely local operation --
+    it sends no traffic and needs no privileges.
+    """
+    if not getattr(socket, "has_ipv6", False):
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+def _url_host(host: str) -> str:
+    """Bracket a bare IPv6 literal for use in an HTTP authority."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _refuse_gateway_redirect(response: requests.Response, **_kwargs: Any) -> requests.Response:
+    """Reject every management-channel redirect before callers parse a body."""
+    if 300 <= response.status_code < 400:
+        raise requests.HTTPError(
+            f"gateway response redirect refused ({response.status_code})",
+            response=response,
+        )
+    return response
+
+
+class OrchestratorClient:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 18970,
+        timeout: int = 5,
+        token: str = "",
+        plugin_timeout: int | None = None,
+    ) -> None:
+        self.base_url = f"http://{_url_host(host)}:{port}"
+        self.timeout = timeout
+        self.plugin_timeout = max(timeout, plugin_timeout or PLUGIN_MUTATION_TIMEOUT)
+        self._session = requests.Session()
+        # This client talks to the operator-selected managed gateway, often on
+        # loopback or a local standalone bridge address. Environment proxy
+        # discovery can forward both gateway bearer headers to HTTP_PROXY and
+        # let the proxy impersonate gateway responses. Keep the management
+        # channel direct on every platform.
+        self._session.trust_env = False
+        # Requests dispatches response hooks before it follows redirects or
+        # returns the response to a method. Coupled with allow_redirects=False
+        # on every call below, this gives every present and future management
+        # endpoint one consistent fail-closed redirect policy.
+        self._session.hooks["response"].append(_refuse_gateway_redirect)
+        self._session.headers["X-DefenseClaw-Client"] = "python-cli"
+        if token:
+            self._session.headers["Authorization"] = f"Bearer {token}"
+            self._session.headers["X-DC-Auth"] = f"Bearer {token}"
+
+    def health(self) -> dict[str, Any]:
+        resp = self._session.get(
+            f"{self.base_url}/health",
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def status(self) -> dict[str, Any]:
+        # No per-method redirect check: the session-level ``_refuse_gateway_redirect``
+        # hook already raises before any method sees a 3xx response, so a local
+        # copy here would be unreachable and would imply — wrongly — that
+        # redirect safety is something each new endpoint must remember to add.
+        resp = self._session.get(
+            f"{self.base_url}/status",
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def provider_registry(self) -> dict[str, Any]:
+        resp = self._session.get(
+            f"{self.base_url}/v1/config/providers",
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("providers"), list):
+            raise ValueError("sidecar returned a malformed provider registry")
+        return data
+
+    def reload_provider_registry(self) -> dict[str, Any]:
+        resp = self._session.post(
+            f"{self.base_url}/v1/config/providers/reload",
+            json={},
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            raise ValueError("sidecar returned a malformed provider reload response")
+        return data
+
+    def emit_cli_observability(self, payload: Mapping[str, Any]) -> None:
+        """Hand one raw Python-CLI fact to the canonical v8 runtime.
+
+        Destination selection, redaction, SQLite persistence, and fanout all
+        happen in the gateway. A non-204 response means admission was not
+        confirmed and is intentionally surfaced to the caller.
+        """
+        resp = self._session.post(
+            f"{self.base_url}/api/v1/observability/cli",
+            json=dict(payload),
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        if resp.status_code != 204:
+            raise requests.HTTPError("canonical observability admission was not acknowledged")
+
+    def set_alert_disposition(
+        self,
+        *,
+        operation_id: str,
+        audit_db_identity: str,
+        disposition: str,
+        selector: Mapping[str, Any],
+        preview: bool,
+        selection_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """Preview or apply protected alert-review state through the CAS API."""
+
+        payload: dict[str, Any] = {
+            "operation_id": operation_id,
+            "audit_db_identity": audit_db_identity,
+            "disposition": disposition,
+            "selector": dict(selector),
+            "preview": preview,
+        }
+        if selection_digest:
+            payload["selection_digest"] = selection_digest
+        resp = self._session.post(
+            f"{self.base_url}/api/v1/alerts/disposition",
+            json=payload,
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        if resp.status_code not in {200, 409, 503}:
+            resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("gateway returned a malformed alert disposition response")
+        data["_http_status"] = resp.status_code
+        return data
+
+    def close(self) -> None:
+        self._session.close()
+
+    def disable_skill(self, skill_key: str) -> dict[str, Any]:
+        resp = self._session.post(
+            f"{self.base_url}/skill/disable",
+            json={"skillKey": skill_key},
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def enable_skill(self, skill_key: str) -> dict[str, Any]:
+        resp = self._session.post(
+            f"{self.base_url}/skill/enable",
+            json={"skillKey": skill_key},
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def patch_config(self, path: str, value: Any) -> dict[str, Any]:
+        resp = self._session.post(
+            f"{self.base_url}/config/patch",
+            json={"path": path, "value": value},
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_skills(self) -> dict[str, Any]:
+        resp = self._session.get(
+            f"{self.base_url}/skills",
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_tools_catalog(self) -> dict[str, Any]:
+        resp = self._session.get(
+            f"{self.base_url}/tools/catalog",
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def disable_plugin(self, plugin_name: str) -> dict[str, Any]:
+        resp = self._session.post(
+            f"{self.base_url}/plugin/disable",
+            json={"pluginName": plugin_name},
+            timeout=self.plugin_timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def enable_plugin(self, plugin_name: str) -> dict[str, Any]:
+        resp = self._session.post(
+            f"{self.base_url}/plugin/enable",
+            json={"pluginName": plugin_name},
+            timeout=self.plugin_timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def scan_skill(self, target: str, name: str = "") -> dict[str, Any]:
+        """Request a skill scan on the remote sidecar host.
+
+        The sidecar runs the skill-scanner locally against the target path
+        on that machine and returns the ScanResult JSON.
+        """
+        resp = self._session.post(
+            f"{self.base_url}/v1/skill/scan",
+            json={"target": target, "name": name},
+            timeout=120,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def emit_agent_discovery(self, report: dict[str, Any]) -> dict[str, Any]:
+        """Emit a sanitized agent-discovery report through the sidecar.
+
+        The caller owns sanitizing local filesystem paths before invoking this
+        method. The sidecar endpoint is token-authenticated and fans the report
+        into gateway lifecycle telemetry plus OTel metrics/logs.
+        """
+        resp = self._session.post(
+            f"{self.base_url}/api/v1/agents/discovery",
+            json=report,
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def ai_usage(self) -> dict[str, Any]:
+        resp = self._session.get(
+            f"{self.base_url}/api/v1/ai-usage",
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def scan_ai_usage(self) -> dict[str, Any]:
+        resp = self._session.post(
+            f"{self.base_url}/api/v1/ai-usage/scan",
+            json={},
+            timeout=120,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def ai_usage_components(self) -> dict[str, Any]:
+        """Fetch the deduped components rollup (one row per
+        (ecosystem, name, version)).
+
+        The sidecar exposes this view at ``GET /api/v1/ai-usage/components``;
+        it folds across every detector + workspace so the CLI can render
+        a true "what SDKs and versions are on this fleet" table without
+        re-implementing the join.
+        """
+        resp = self._session.get(
+            f"{self.base_url}/api/v1/ai-usage/components",
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def ai_usage_component_locations(self, ecosystem: str, name: str) -> dict[str, Any]:
+        """Fetch the locations detail for one component (the rows
+        from ``ai_signals`` for the latest scan).
+
+        Powered by ``GET /api/v1/ai-usage/components/{ecosystem}/{name}/locations``;
+        when ``ai_discovery.store_raw_local_paths`` is set on the sidecar,
+        each row may include a ``raw_path`` field, otherwise
+        only basenames + path hashes are returned.
+
+        ``ecosystem`` and ``name`` are URL-encoded with ``safe=""``
+        so any character (including ``/``, ``?``, ``#``, ``%``,
+        whitespace) round-trips intact through the path. The gateway
+        parses the path via ``r.URL.EscapedPath()`` and
+        ``url.PathUnescape``s each segment, so a percent-encoded
+        slash inside a scoped npm name like ``@anthropic-ai/sdk``
+        survives the split and the lookup hits the right row.
+        """
+        url = f"{self.base_url}/api/v1/ai-usage/components/{quote(ecosystem, safe='')}/{quote(name, safe='')}/locations"
+        resp = self._session.get(
+            url,
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def ai_usage_component_history(self, ecosystem: str, name: str) -> dict[str, Any]:
+        """Fetch up to 50 confidence snapshots for one component
+        (most-recent-first) so ``agent components history`` can render
+        the trend without recomputing scores.
+
+        ``ecosystem`` and ``name`` are URL-encoded with ``safe=""``
+        for the same reason as ``ai_usage_component_locations``.
+        """
+        url = f"{self.base_url}/api/v1/ai-usage/components/{quote(ecosystem, safe='')}/{quote(name, safe='')}/history"
+        resp = self._session.get(
+            url,
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def ai_usage_confidence_policy(self, *, source: str = "merged") -> dict[str, Any]:
+        """Fetch the active confidence policy.
+
+        ``source`` is forwarded as a query parameter. ``merged``
+        returns whatever the engine currently uses (default + any
+        operator override deep-merged on top); ``default`` returns
+        the embedded baseline so an operator can diff against their
+        override.
+        """
+        resp = self._session.get(
+            f"{self.base_url}/api/v1/ai-usage/confidence/policy",
+            params={"source": source},
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def ai_usage_validate_confidence_policy(self, yaml_text: str) -> dict[str, Any]:
+        """Dry-run a candidate policy YAML against the sidecar's
+        loader + validator without writing anything to disk.
+
+        The wire format is a JSON envelope ``{"yaml": "<raw YAML>"}``
+        (not a raw YAML body) because the sidecar's CSRF gate rejects
+        every non-OTLP POST that doesn't advertise
+        ``application/json``. See the matching server comment in
+        ``handleAIUsageConfidencePolicyValidate`` for context.
+
+        Always returns 200 OK; the response carries a ``valid``
+        boolean and (on failure) an ``error`` message so the CLI can
+        exit non-zero with the same diagnostic the loader would
+        print.
+        """
+        resp = self._session.post(
+            f"{self.base_url}/api/v1/ai-usage/confidence/policy/validate",
+            json={"yaml": yaml_text},
+            timeout=self.timeout,
+            allow_redirects=False,
+        )
+        if resp.status_code == 413:
+            return {"valid": False, "error": "policy file exceeds size limit"}
+        resp.raise_for_status()
+        return resp.json()
+
+    def is_running(self) -> bool:
+        try:
+            self.health()
+            return True
+        except (requests.RequestException, ValueError):
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Binary resolver
+# ---------------------------------------------------------------------------
+#
+# Every caller that needs to shell out to the Go sidecar used to write
+# ``shutil.which("defenseclaw-gateway")`` inline and treat a ``None``
+# result as "not installed".  That silently misbehaves right after
+# ``make all``: the binary is installed at ``~/.local/bin/defenseclaw-
+# gateway`` (the ``INSTALL_DIR`` in the ``Makefile``) but the user's
+# current shell hasn't picked up the ``PATH`` entry that ``scripts/
+# add-to-path.sh`` just appended to their rc file.  Opening a new shell
+# (or ``source``ing the rc file) fixes it, but we should not make users
+# debug that to run ``defenseclaw tui``.  The helper below centralises
+# the lookup and adds a fallback to the canonical install path so the
+# CLI stays usable in the very same shell that ran ``make all``.
+
+
+GATEWAY_BIN_NAME = "defenseclaw-gateway"
+
+_CANONICAL_INSTALL_DIR = os.path.join(os.path.expanduser("~"), ".local", "bin")
+
+
+def canonical_install_path() -> str:
+    """Return the canonical install path written by ``make gateway-install``.
+
+    Exposed so error messages and the upgrade command can reference the
+    exact same path instead of each hard-coding the string.
+    """
+    return os.path.join(_CANONICAL_INSTALL_DIR, GATEWAY_BIN_NAME)
+
+
+def resolve_gateway_binary() -> str | None:
+    """Return the first resolvable path to the gateway binary, or ``None``.
+
+    Resolution order:
+
+    1. The verified sibling from a native Windows installation.  The native
+       launcher supplies ``DEFENSECLAW_INSTALL_ROOT`` only after validating
+       install state; this helper additionally requires ``sys.executable`` to
+       be that root's embedded Python runtime.  This path deliberately wins
+       over the working directory, overrides, and ``PATH`` so an unrelated
+       ``defenseclaw-gateway.exe`` cannot shadow the installed service.
+    2. ``DEFENSECLAW_GATEWAY_BIN`` — explicit env override used by
+       tests, packagers, and vendored distributions that drop the
+       binary somewhere non-standard.  Returned verbatim (even when the
+       file is missing) so the real ``exec`` error surfaces to the
+       caller rather than a generic "not found" from here.
+    3. ``shutil.which(GATEWAY_BIN_NAME)`` — honours ``PATH``.  The
+       happy path for installed releases and for users whose shell has
+       already sourced the updated rc file.
+    4. :func:`canonical_install_path` — the ``~/.local/bin`` fallback
+       that keeps ``defenseclaw tui`` working in the same shell that
+       just ran ``make all``.
+
+    ``None`` only if every option above fails to resolve to a runnable
+    file on disk.  Callers own the user-facing error message.
+    """
+    packaged_root = packaged_windows_install_root()
+    if packaged_root:
+        # A corroborated package must fail closed when its sibling is missing;
+        # never fall through to a working-directory/PATH shadow.
+        return packaged_windows_gateway_path()
+
+    override = os.environ.get("DEFENSECLAW_GATEWAY_BIN", "").strip()
+    if override:
+        return override
+
+    via_path = shutil.which(GATEWAY_BIN_NAME)
+    if via_path:
+        return via_path
+
+    canonical = canonical_install_path()
+    if _is_runnable_file(canonical):
+        return canonical
+
+    return None
+
+
+def packaged_windows_gateway_path() -> str | None:
+    """Return the gateway sibling for a corroborated native Windows runtime.
+
+    ``DEFENSECLAW_INSTALL_ROOT`` is not trusted by itself: developer shells and
+    child processes may set arbitrary environment values.  A packaged CLI is
+    recognized only when the current interpreter is the embedded Python at the
+    same root and the sibling gateway is runnable.  Native setup can then use
+    this absolute path for every lifecycle operation without Windows' current-
+    directory executable search taking precedence over ``PATH``.
+    """
+
+    root = packaged_windows_install_root()
+    if not root:
+        return None
+
+    candidate = os.path.join(root, "bin", "defenseclaw-gateway.exe")
+    if _is_runnable_file(candidate):
+        return os.path.abspath(candidate)
+    return None
+
+
+def packaged_windows_install_root() -> str | None:
+    """Return a native install root corroborated by the running interpreter."""
+
+    if os.name != "nt":
+        return None
+
+    install_root = os.environ.get("DEFENSECLAW_INSTALL_ROOT", "").strip()
+    if not install_root or "\x00" in install_root or not os.path.isabs(install_root):
+        return None
+
+    root = os.path.abspath(install_root)
+    expected_python = os.path.join(root, "runtime", "python", "python.exe")
+    try:
+        actual_python = os.path.normcase(os.path.realpath(sys.executable))
+        packaged_python = os.path.normcase(os.path.realpath(expected_python))
+    except OSError:
+        return None
+    if actual_python != packaged_python:
+        return None
+    return root
+
+
+def _is_runnable_file(path: str) -> bool:
+    try:
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+    except OSError:
+        return False

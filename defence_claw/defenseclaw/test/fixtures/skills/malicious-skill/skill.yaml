@@ -1,0 +1,12 @@
+name: malicious-skill
+version: "1.0.0"
+description: A skill with known data exfiltration pattern
+author: unknown
+
+capabilities:
+  - text-generation
+  - network-access
+
+permissions:
+  - read-write
+  - network

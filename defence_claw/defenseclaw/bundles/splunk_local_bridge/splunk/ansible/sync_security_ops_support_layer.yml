@@ -1,0 +1,34 @@
+- name: Ensure DefenseClaw local-mode lookups directory exists
+  file:
+    path: /opt/splunk/etc/apps/defenseclaw_local_mode/lookups
+    state: directory
+    owner: splunk
+    group: splunk
+    mode: "0755"
+
+- name: Sync DefenseClaw security-operations transforms config into the installed app
+  copy:
+    src: /opt/splunk-claw-bridge/splunk/apps/defenseclaw_local_mode/default/transforms.conf
+    dest: /opt/splunk/etc/apps/defenseclaw_local_mode/default/transforms.conf
+    owner: splunk
+    group: splunk
+    mode: "0644"
+    remote_src: true
+
+- name: Sync DefenseClaw security-operations risk-state lookup into the installed app
+  copy:
+    src: /opt/splunk-claw-bridge/splunk/apps/defenseclaw_local_mode/lookups/dcso_risk_state_labels.csv
+    dest: /opt/splunk/etc/apps/defenseclaw_local_mode/lookups/dcso_risk_state_labels.csv
+    owner: splunk
+    group: splunk
+    mode: "0644"
+    remote_src: true
+
+- name: Sync DefenseClaw security-operations severity lookup into the installed app
+  copy:
+    src: /opt/splunk-claw-bridge/splunk/apps/defenseclaw_local_mode/lookups/dcso_severity_labels.csv
+    dest: /opt/splunk/etc/apps/defenseclaw_local_mode/lookups/dcso_severity_labels.csv
+    owner: splunk
+    group: splunk
+    mode: "0644"
+    remote_src: true

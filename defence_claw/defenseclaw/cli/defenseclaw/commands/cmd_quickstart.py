@@ -1,0 +1,295 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""defenseclaw quickstart — zero-prompt first-run setup.
+
+Designed for ``make all`` and ``install.sh --quickstart``. Picks safe
+defaults (observe profile, local scanner, no judge) and runs every step
+of the install flow without asking the user a single question. Power
+users who want something different should use ``defenseclaw init`` or
+``defenseclaw setup guardrail`` instead.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+import click
+
+
+@click.command("quickstart")
+@click.option(
+    "--mode",
+    type=click.Choice(["observe", "action"], case_sensitive=False),
+    default=None,
+    show_default="observe",
+    help="Protection profile. observe logs findings; action blocks.",
+)
+@click.option(
+    "--scanner",
+    "scanner_mode",
+    type=click.Choice(["local", "remote", "both"], case_sensitive=False),
+    default="local",
+    show_default=True,
+    help="Scanner backend. 'local' is the zero-key default; 'remote'/'both' require CISCO_AI_DEFENSE_API_KEY.",
+)
+@click.option(
+    "--with-judge/--no-judge",
+    "with_judge",
+    default=False,
+    help="Enable the LLM Judge adjudicator (reuses the unified DEFENSECLAW_LLM_KEY).",
+)
+@click.option(
+    "--fail-mode",
+    type=click.Choice(["open", "closed"], case_sensitive=False),
+    default=None,
+    help=(
+        "Hook fail-mode for delivery, authentication, and invalid gateway responses. "
+        "'open' (default) allows + logs; 'closed' blocks where the hook supports it. "
+        "DEFENSECLAW_STRICT_AVAILABILITY=1 additionally forces transport and "
+        "missing-token failures closed. "
+        "Quickstart is non-interactive — pick 'closed' here to opt the agent into a "
+        "stricter posture without later running `defenseclaw guardrail fail-mode`."
+    ),
+)
+@click.option(
+    "--human-approval/--no-human-approval",
+    "human_approval",
+    default=None,
+    help=(
+        "HITL: require operator approval before risky tool actions (action mode "
+        "only — observe mode logs without blocking, regardless of this flag). "
+        "Quickstart is non-interactive: omit the flag to keep whatever the "
+        "current config has."
+    ),
+)
+@click.option(
+    "--hilt-min-severity",
+    type=click.Choice(["HIGH", "MEDIUM", "LOW", "CRITICAL"], case_sensitive=False),
+    default=None,
+    help=(
+        "Lowest finding severity that triggers a HITL approval prompt. Only "
+        "meaningful when --human-approval is on. CRITICAL findings always "
+        "block."
+    ),
+)
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    help="Never prompt. Same as --yes; kept for install-script compat.",
+)
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Assume yes for confirmations.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Re-run all steps even if the environment is already initialized.",
+)
+@click.option(
+    "--connector",
+    "--agent",
+    "agent_name",
+    type=click.Choice(
+        [
+            "openclaw",
+            "zeptoclaw",
+            "claudecode",
+            "codex",
+            "hermes",
+            "cursor",
+            "windsurf",
+            "geminicli",
+            "copilot",
+            "openhands",
+            "antigravity",
+            "opencode",
+            "amp",
+            "omnigent",
+        ],
+        case_sensitive=False,
+    ),
+    default=None,
+    help="Agent framework connector (alias: --agent). "
+    "Quickstart configures one connector: an explicit value wins, otherwise "
+    "the single configured/detected connector is used. A picked_connector hint "
+    "is used only when no configured/detected connector exists. Bare quickstart "
+    "errors when the connector choice is ambiguous.",
+)
+@click.option(
+    "--skip-gateway",
+    is_flag=True,
+    help="Do not start the sidecar at the end of quickstart.",
+)
+@click.option("--json-summary", is_flag=True, help="Emit the first-run summary as JSON.")
+def quickstart_cmd(
+    mode: str | None,
+    scanner_mode: str,
+    with_judge: bool,
+    fail_mode: str | None,
+    human_approval: bool | None,
+    hilt_min_severity: str | None,
+    non_interactive: bool,
+    yes: bool,
+    force: bool,
+    agent_name: str | None,
+    skip_gateway: bool,
+    json_summary: bool,
+) -> None:
+    """Zero-prompt end-to-end setup with safe defaults.
+
+    Equivalent to running ``init`` → ``setup guardrail`` → ``gateway
+    start`` but with a scripted, non-interactive UX. Missing API keys
+    are listed at the end so the operator knows exactly what (if
+    anything) to wire up before the guardrail becomes useful.
+    """
+    from defenseclaw import config as cfg_mod
+    from defenseclaw.bootstrap import FirstRunOptions, run_first_run
+    from defenseclaw.commands.cmd_init import _render_first_run_report
+    from defenseclaw.commands.cmd_setup import (
+        _detect_installed_connectors,
+        _read_picked_connector,
+    )
+    from defenseclaw.ux import CLIRenderer
+
+    connector_source: dict[str, str] = {}
+    if agent_name:
+        connector = agent_name
+    else:
+        data_dir = str(cfg_mod.default_data_path())
+        picked_path = os.path.join(data_dir, "picked_connector")
+        picked = _read_picked_connector(data_dir)
+        detected = _detect_installed_connectors()
+        configured = _configured_quickstart_connectors(cfg_mod)
+        candidates = sorted({name for name in [*configured, *detected] if name})
+        if len(candidates) > 1:
+            click.echo(
+                "  ✗ Multiple connectors detected/configured: "
+                f"{', '.join(candidates)}.\n"
+                "    Quickstart configures one connector.\n"
+                "    Re-run with --connector <name>.",
+                err=True,
+            )
+            sys.exit(2)
+        if len(candidates) == 1:
+            connector = candidates[0]
+            if picked and picked != connector:
+                click.echo(
+                    "  ✗ Connector choice is ambiguous.\n"
+                    f"    picked_connector says {picked}, but the active/detected connector is {connector}.\n"
+                    "    Re-run with --connector <name>.",
+                    err=True,
+                )
+                sys.exit(2)
+        elif picked:
+            connector = picked
+            connector_source = {
+                "type": "picked_connector",
+                "connector": connector,
+                "path": picked_path,
+            }
+        else:
+            click.echo(
+                "  ✗ Could not detect an agent framework on this host.\n"
+                "    Re-run with an explicit connector, e.g. "
+                "`defenseclaw quickstart --connector hermes`.",
+                err=True,
+            )
+            sys.exit(2)
+
+    profile = mode or "observe"
+
+    report = run_first_run(
+        FirstRunOptions(
+            connector=connector,
+            profile=profile,
+            scanner_mode=scanner_mode,
+            with_judge=with_judge,
+            start_gateway=not skip_gateway,
+            verify=True,
+            force=force,
+            # Empty string when --fail-mode is omitted means "leave the
+            # existing cfg.guardrail.hook_fail_mode untouched". Quickstart
+            # is non-interactive so we never prompt — operators flip this
+            # via the flag or via `defenseclaw guardrail fail-mode`.
+            hook_fail_mode=(fail_mode or "").lower(),
+            # HITL: ``None`` preserves the current toggle, so a quickstart
+            # rerun never silently disables HITL on an operator who set
+            # it via ``defenseclaw setup guardrail`` last week.
+            human_approval=human_approval,
+            hilt_min_severity=hilt_min_severity or "",
+        )
+    )
+    _require_operational_success(
+        report,
+        gateway_requested=not skip_gateway,
+    )
+    if json_summary:
+        payload = report.to_dict()
+        if connector_source:
+            payload["connector_source"] = connector_source
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        if connector_source:
+            click.echo(
+                f"  Using picked connector hint: {connector} from {connector_source['path']}"
+            )
+        _render_first_run_report(report, CLIRenderer())
+    if report.status == "needs_attention":
+        sys.exit(1)
+
+
+def _require_operational_success(report, *, gateway_requested: bool) -> None:
+    """Make quickstart's requested operational outcomes command-fatal.
+
+    Bootstrap warnings are normally advisory so interactive first-run flows
+    can finish with remediation hints. Quickstart is an automation boundary:
+    its selected connector must be established, and a requested gateway start
+    must leave the sidecar running. Promote only those warnings before
+    rendering so human output, JSON, and the process exit status agree.
+    """
+    from defenseclaw.bootstrap import _rollup_status
+
+    if gateway_requested:
+        for step in report.setup + report.readiness:
+            if step.name in {"Connector", "Sidecar"} and step.status == "warn":
+                step.status = "fail"
+
+    report.status = _rollup_status(report.setup, report.readiness)
+
+
+def _configured_quickstart_connectors(cfg_mod) -> list[str]:
+    """Return meaningful active connectors from an existing config, if any."""
+    try:
+        config_file = cfg_mod.config_path()
+        if not os.path.exists(config_file):
+            return []
+        cfg_mod.require_v8_config()
+        cfg = cfg_mod.load()
+    except Exception:
+        return []
+
+    try:
+        if getattr(cfg.guardrail, "connectors", None):
+            return list(cfg.active_connectors())
+        active = cfg.active_connector()
+    except Exception:
+        return []
+    return [] if active == "openclaw" else [active]

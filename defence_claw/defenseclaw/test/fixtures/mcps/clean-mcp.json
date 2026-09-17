@@ -1,0 +1,14 @@
+{
+  "name": "weather-service",
+  "version": "1.0.0",
+  "url": "https://weather-api.example.com/mcp",
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get current weather for a location",
+      "parameters": {
+        "location": { "type": "string", "required": true }
+      }
+    }
+  ]
+}

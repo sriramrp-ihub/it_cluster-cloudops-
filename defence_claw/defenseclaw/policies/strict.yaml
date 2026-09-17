@@ -1,0 +1,183 @@
+# DefenseClaw Strict Policy
+# Maximum security — blocks MEDIUM and above, no allow-list bypass
+name: strict
+description: Maximum security policy for high-risk environments
+
+admission:
+  scan_on_install: true
+  allow_list_bypass_scan: false
+
+skill_actions:
+  critical:
+    file: quarantine
+    runtime: disable
+    install: block
+  high:
+    file: quarantine
+    runtime: disable
+    install: block
+  medium:
+    file: quarantine
+    runtime: disable
+    install: block
+  low:
+    file: none
+    runtime: enable
+    install: none
+  info:
+    file: none
+    runtime: enable
+    install: none
+
+scanner_overrides:
+  mcp:
+    medium:
+      file: quarantine
+      runtime: disable
+      install: block
+    low:
+      file: none
+      runtime: disable
+      install: none
+  plugin:
+    high:
+      file: quarantine
+      runtime: disable
+      install: block
+    medium:
+      file: none
+      runtime: enable
+      install: none
+
+first_party_allow_list:
+  # The first-party allow-list is connector-agnostic: a DefenseClaw
+  # install rooted at ~/.defenseclaw is always trusted, and so are
+  # any first-party assets (the defenseclaw plugin and the codeguard
+  # skill) that were materialised into the four supported claw homes
+  # by `defenseclaw setup`. Adding a new connector's directory here
+  # is what S3.2 / F10 fixes — without these entries a Codex /
+  # Claude Code / ZeptoClaw user's first scan of the codeguard skill
+  # would block under strict policy because the path component check
+  # only knew about ".openclaw/*". Order is not significant —
+  # _path_matches_provenance does an `any` over the path-component runs.
+  # F-0541: each marker pins the first-party asset's own leaf directory, not
+  # a broad parent (".defenseclaw" / ".openclaw/extensions" / ".codex-plugin")
+  # that any sibling plugin/skill could be dropped into to spoof first-party.
+  - target_type: plugin
+    target_name: defenseclaw
+    reason: first-party DefenseClaw plugin
+    # F-0902: a bare relative marker ("extensions/defenseclaw") blesses any
+    # attacker path that merely contains the subsequence; only home-anchored
+    # markers are trustworthy. (Mirror of default.yaml.)
+    source_path_contains:
+      - ".openclaw/extensions/defenseclaw"
+      - ".zeptoclaw/extensions/defenseclaw"
+      - ".claude/extensions/defenseclaw"
+      - ".codex/extensions/defenseclaw"
+      - ".config/amp/plugins/defenseclaw.ts"
+  - target_type: skill
+    target_name: codeguard
+    reason: first-party DefenseClaw skill
+    source_path_contains:
+      - ".openclaw/workspace/skills/codeguard"
+      - ".openclaw/skills/codeguard"
+      - ".zeptoclaw/skills/codeguard"
+      - ".claude/skills/codeguard"
+      - ".codex/skills/codeguard"
+
+guardrail:
+  block_threshold: 2
+  alert_threshold: 1
+  cisco_trust_level: full
+  patterns:
+    injection:
+      - "ignore previous"
+      - "ignore all instructions"
+      - "ignore above"
+      - "disregard previous"
+      - "disregard all"
+      - "you are now"
+      - "act as"
+      - "pretend you are"
+      - "bypass"
+      - "jailbreak"
+      - "do anything now"
+      - "dan mode"
+    secrets:
+      - "sk-"
+      - "sk-ant-"
+      - "sk-proj-"
+      - "api_key="
+      - "apikey="
+      - "-----begin rsa"
+      - "-----begin private"
+      - "-----begin openssh"
+      - "aws_access_key"
+      - "aws_secret_access"
+      - "password="
+      - "bearer "
+      - "ghp_"
+      - "gho_"
+      - "github_pat_"
+    exfiltration:
+      - "/etc/passwd"
+      - "/etc/shadow"
+      - "base64 -d"
+      - "base64 --decode"
+      - "exfiltrate"
+      - "send to my server"
+      - "curl http"
+  severity_mappings:
+    injection: HIGH
+    secrets: MEDIUM
+    exfiltration: HIGH
+
+firewall:
+  default_action: deny
+  blocked_destinations:
+    - "169.254.169.254"
+    - "fd00:ec2::254"
+  allowed_domains:
+    - "api.github.com"
+    - "github.com"
+    - "proxy.golang.org"
+    - "sum.golang.org"
+    - "registry.npmjs.org"
+    - "pypi.org"
+    - "files.pythonhosted.org"
+  allowed_ports:
+    - 443
+
+# Periodic rescan / drift detection settings (not policy file watching).
+watch:
+  rescan_enabled: true
+  rescan_interval_min: 30
+
+# webhooks:
+#   - url: "https://hooks.slack.com/services/T00/B00/xxx"
+#     type: slack
+#     min_severity: HIGH
+#     events: [block, drift, guardrail]
+#     enabled: true
+#   - url: "https://webexapis.com/v1/messages"
+#     type: webex
+#     secret_env: WEBEX_BOT_TOKEN
+#     room_id: "Y2lzY29zcGFyazovL3VzL1JPT00v..."
+#     min_severity: HIGH
+#     events: [block, drift, guardrail]
+#     enabled: true
+#   - url: "https://events.pagerduty.com/v2/enqueue"
+#     type: pagerduty
+#     secret_env: PAGERDUTY_ROUTING_KEY
+#     min_severity: CRITICAL
+#     events: [block]
+#     enabled: true
+webhooks: []
+
+enforcement:
+  max_enforcement_delay_seconds: 1
+
+audit:
+  log_all_actions: true
+  log_scan_results: true
+  retention_days: 365

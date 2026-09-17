@@ -1,0 +1,141 @@
+---
+title: Run the local observability stack
+description: defenseclaw setup local-observability up starts the bundled OTel Collector + Prometheus, Loki, Tempo, and Grafana stack and writes its named v8 destination.
+keywords:
+  - DefenseClaw local observability
+  - DefenseClaw OTLP local stack
+  - prometheus loki tempo grafana
+  - DefenseClaw OTel exporter
+---
+
+DefenseClaw can export to an existing telemetry stack, but the bundled local
+stack gives you a loopback-only environment for development and evaluation.
+
+<Video
+  src="local-observability"
+  caption="Quick tour: defenseclaw setup local-observability up → containers warm up → the named destination is written → restart the gateway → Grafana populates with live events."
+/>
+
+For the full deep-dive on flags, dashboards, and tear-down, see [Observability → Local stack](/docs/observability/local-observability).
+
+## What you get
+
+<Cards>
+  <Card title="Prometheus" description="Metrics exported through the local OTel Collector." />
+  <Card title="Loki" description="Canonical gateway logs with connector and severity attributes." />
+  <Card title="Tempo" description="Gateway and connector traces exported through OTLP." />
+  <Card title="Grafana" description="Fourteen provisioned DefenseClaw dashboards backed by Prometheus, Loki, and Tempo." />
+</Cards>
+
+## Run it
+
+<Steps>
+
+<Step>
+
+### Bring up the stack
+
+```bash
+defenseclaw setup local-observability up
+```
+
+Brings up five containers via Docker Compose:
+
+- `otel/opentelemetry-collector-contrib:0.153.0` on `127.0.0.1:4317`
+  (gRPC) and `127.0.0.1:4318` (HTTP)
+- `prom/prometheus:v2.54.1` on `127.0.0.1:9090`
+- `grafana/loki:3.2.0` on `127.0.0.1:3100`
+- `grafana/tempo:2.6.0` on `127.0.0.1:3200`
+- `grafana/grafana:11.3.0` on `127.0.0.1:3000`
+
+The Compose file binds all published ports to loopback by default.
+
+</Step>
+
+<Step>
+
+### Reload the gateway configuration
+
+```bash
+defenseclaw-gateway restart
+```
+
+Unless `up` was run with `--no-config`, it already created or updated
+`observability.destinations[local-observability]` with the selected
+logs/metrics/traces signals and the collector endpoint. Restart the gateway so
+the new destination takes effect. No connector setup command is required.
+
+</Step>
+
+<Step>
+
+### Open Grafana
+
+Visit [http://localhost:3000](http://localhost:3000). The bundled Compose
+configuration disables the login form and grants anonymous Admin access
+because Grafana is loopback-only by default. If you change `HOST_BIND`, secure
+Grafana before exposing it.
+
+Fourteen dashboards are provisioned, including Overview, Traffic, Security,
+Findings, Policy Decisions, HITL, Connectors, Connector Detail, Activity,
+Runtime, Scanners, AI Discovery, Agent Identity, and Agent 360. See
+[Grafana dashboards](/docs/observability/grafana-dashboards) for their exact
+queries and panels.
+
+</Step>
+
+<Step>
+
+### Tear it down
+
+```bash
+defenseclaw setup local-observability down
+```
+
+Stops the containers while preserving their named volumes and the configured
+destination. Your audit DB is untouched. To stop the stack and disable the
+destination in config, use:
+
+```bash
+defenseclaw setup local-observability down --disable-config
+```
+
+Use `reset --yes` only when you also intend to delete the stack's
+Prometheus/Loki/Tempo/Grafana data.
+
+</Step>
+
+</Steps>
+
+## Architecture
+
+<Flow
+  direction="TB"
+  compact
+  caption="The gateway exports three signals. The local stack receives all three and Grafana joins them."
+>
+  <Node id="gateway" kind="gateway">defenseclaw-gateway</Node>
+  <Node id="collector" kind="connector">{`OTel Collector\n:4317 / :4318`}</Node>
+  <Node id="prom" kind="datastore">{`Prometheus\n:9090`}</Node>
+  <Node id="loki" kind="datastore">{`Loki\n:3100`}</Node>
+  <Node id="tempo" kind="datastore">{`Tempo\n:3200`}</Node>
+  <Node id="graf" kind="datastore">{`Grafana\n:3000`}</Node>
+  <Edge from="gateway" to="collector" label="OTLP logs / metrics / traces" />
+  <Edge from="collector" to="prom" label="metrics" />
+  <Edge from="collector" to="loki" label="logs" />
+  <Edge from="collector" to="tempo" label="traces" />
+  <Edge from="prom" to="graf" />
+  <Edge from="loki" to="graf" />
+  <Edge from="tempo" to="graf" />
+</Flow>
+
+## When to graduate to your own stack
+
+The local stack is for building intuition. For production, replace each component with the equivalent in your existing telemetry estate:
+
+- Prometheus → your metrics platform (Datadog, New Relic, Honeycomb, ...).
+- Loki → your log aggregator (Splunk, Datadog Logs, ...).
+- Tempo → your tracing backend (Honeycomb, Tempo, Jaeger, ...).
+- Grafana → whatever your team already uses for dashboards.
+
+Point the gateway's OTLP exporter at your collector and DefenseClaw's signals land alongside the rest of your telemetry. See the [Reference / Configuration](/docs/reference/configuration) page for the full env-var list.

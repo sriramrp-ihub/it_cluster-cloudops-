@@ -1,0 +1,6 @@
+value,label,sort_order,color
+INFO,Info,10,#4C6EF5
+WARN,Warn,20,#E0A400
+ERROR,Error,30,#D9480F
+CRITICAL,Critical,40,#B02A37
+UNKNOWN,Unknown,50,#6C757D

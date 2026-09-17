@@ -1,0 +1,50 @@
+version: 1
+
+pre_judge_strips:
+  - id: STRIP-SYSTEM-SENDER
+    pattern: '\b(cli|system|bot|admin)\b'
+    context: "System sender metadata injected by agent framework"
+    applies_to: [pii]
+
+  - id: STRIP-MESSAGING-BRIDGE-STATUS
+    pattern: '(?im)^[ \t]*System:[ \t]*\[[^\]\n]+\][ \t]+[^\n]*?\b(?:connected|disconnected|reconnected|linked|unlinked|online|offline)\b[^\n]*$'
+    context: "Messaging bridge status banners (WhatsApp/Telegram/Slack/Discord gateway connect/disconnect lines) embed channel IDs or phone numbers that are transport metadata, not user-provided PII"
+    applies_to: [pii]
+
+  - id: STRIP-MESSAGING-BRIDGE-TIMESTAMP
+    pattern: '(?m)^[ \t]*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[ \t]+\d{4}-\d{2}-\d{2}[ \t]+\d{1,2}:\d{2}(?::\d{2})?(?:[ \t]+[A-Z]{2,5})?\][ \t]*'
+    context: "Per-message timestamp prefix injected by messaging bridges (e.g. [Wed 2026-04-22 12:03 EDT]) — not user content"
+    applies_to: [pii]
+
+finding_suppressions:
+  - id: SUPP-USERNAME-METADATA
+    finding_pattern: JUDGE-PII-USER
+    entity_pattern: '^(cli|system|bot|admin|root|19:[a-f0-9\-]+@.*)$'
+    reason: "System metadata, not real username"
+
+  - id: SUPP-IP-PRIVATE
+    finding_pattern: JUDGE-PII-IP
+    entity_pattern: '^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.0\.0\.|::1|localhost)'
+    reason: "Private/loopback IP address"
+
+  - id: SUPP-PHONE-EPOCH
+    finding_pattern: JUDGE-PII-PHONE
+    entity_pattern: '^\d{10}$'
+    condition: is_epoch
+    reason: "Unix timestamp, not phone number"
+
+  - id: SUPP-PHONE-PLATFORM-ID
+    finding_pattern: JUDGE-PII-PHONE
+    entity_pattern: '^\d{9,12}$'
+    condition: is_platform_id
+    reason: "Channel platform numeric ID (Telegram, Slack, etc.), not phone number"
+
+  - id: SUPP-EMAIL-CHATID
+    finding_pattern: JUDGE-PII-EMAIL
+    entity_pattern: '^19:[a-f0-9\-]+@unq\.gbl\.spaces$'
+    reason: "Teams chatId format, not email address"
+
+tool_suppressions:
+  - tool_pattern: '^(graph_auth_status|session_status|get_status)$'
+    suppress_findings: [JUDGE-PII-USER]
+    reason: "Status check tools return expected system metadata"

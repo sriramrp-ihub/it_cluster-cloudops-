@@ -1,0 +1,777 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Alerts panel parity tests."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import defenseclaw.tui.panels.alerts as alerts_panel
+from defenseclaw.tui.panels.alerts import (
+    AlertEvent,
+    AlertFinding,
+    AlertsPanelModel,
+    alerts_from_v8_history,
+    humanize_alert_details,
+)
+from defenseclaw.tui.services.v8_event_history import V8EventHistoryRow
+
+
+def _v8_alert_row(
+    row_id: str,
+    *,
+    bucket: str,
+    event_name: str,
+    severity: str = "INFO",
+    action: str = "",
+    payload: dict[str, object] | None = None,
+    finding_tags: tuple[str, ...] = (),
+    payload_truncated: bool = False,
+) -> V8EventHistoryRow:
+    return V8EventHistoryRow(
+        id=row_id,
+        timestamp=datetime(2026, 8, 10, 22, 14, tzinfo=timezone.utc),
+        bucket=bucket,
+        event_name=event_name,
+        source="gateway",
+        severity=severity,
+        action=action,
+        actor="gateway",
+        details="",
+        connector="codex",
+        redaction_profile="default",
+        payload=payload or {},
+        finding_tags=finding_tags,
+        payload_truncated=payload_truncated,
+    )
+
+
+def test_v8_alert_projection_excludes_clean_hook_and_scan_telemetry() -> None:
+    rows = (
+        _v8_alert_row("clean-scan", bucket="asset.scan", event_name="scan.completed", action="scan"),
+        _v8_alert_row(
+            "allowed-hook",
+            bucket="guardrail.evaluation",
+            event_name="hook_decision",
+            action="hook_decision",
+        ),
+        _v8_alert_row(
+            "legacy-hook",
+            bucket="guardrail.evaluation",
+            event_name="legacy.audit.connector.hook",
+            action="connector-hook",
+        ),
+        _v8_alert_row(
+            "finding",
+            bucket="security.finding",
+            event_name="finding.observed",
+            severity="HIGH",
+            action="scan-finding",
+        ),
+        _v8_alert_row(
+            "finding-summary",
+            bucket="guardrail.evaluation",
+            event_name="hook_decision",
+            severity="CRITICAL",
+            action="block",
+        ),
+        _v8_alert_row(
+            "detection-only",
+            bucket="security.finding",
+            event_name="finding.observed",
+            severity="HIGH",
+            action="scan-finding",
+            payload={"defenseclaw.finding.tags": ["secret", "detection-only"]},
+        ),
+        _v8_alert_row(
+            "truncated-detection-only",
+            bucket="security.finding",
+            event_name="finding.observed",
+            severity="HIGH",
+            action="scan-finding",
+            finding_tags=("secret", "detection-only"),
+            payload_truncated=True,
+        ),
+    )
+
+    alerts = alerts_from_v8_history(rows)
+
+    assert [alert.id for alert in alerts] == ["finding"]
+
+
+def test_v8_alert_projection_keeps_explicit_enforcement_egress_and_health_failures() -> None:
+    rows = (
+        _v8_alert_row(
+            "blocked-egress",
+            bucket="network.egress",
+            event_name="egress.decided",
+            action="egress",
+            payload={"defenseclaw.network.decision": "block"},
+        ),
+        _v8_alert_row(
+            "allowed-egress",
+            bucket="network.egress",
+            event_name="egress.decided",
+            action="egress",
+            payload={"defenseclaw.network.decision": "allow"},
+        ),
+        _v8_alert_row(
+            "enforced",
+            bucket="enforcement.action",
+            event_name="action.applied",
+            action="enforcement",
+            payload={"defenseclaw.enforcement.effective_action": "deny"},
+        ),
+        _v8_alert_row("healthy", bucket="platform.health", event_name="health.ready"),
+        _v8_alert_row(
+            "unhealthy",
+            bucket="platform.health",
+            event_name="health.failed",
+            severity="ERROR",
+        ),
+    )
+
+    alerts = alerts_from_v8_history(rows)
+
+    assert [alert.id for alert in alerts] == ["blocked-egress", "enforced", "unhealthy"]
+    assert [alert.severity for alert in alerts] == ["WARNING", "HIGH", "ERROR"]
+
+
+def test_alert_detail_hydration_preserves_visible_non_info_promotion() -> None:
+    projected = alerts_from_v8_history(
+        (
+            _v8_alert_row(
+                "legacy-info-block",
+                bucket="enforcement.action",
+                event_name="action.applied",
+                action="enforcement",
+                payload={"defenseclaw.enforcement.effective_action": "block"},
+            ),
+        )
+    )[0]
+
+    class Store:
+        @staticmethod
+        def get_event(_event_id: str) -> AlertEvent:
+            return AlertEvent(
+                id=projected.id,
+                severity="INFO",
+                action=projected.action,
+                target=projected.target,
+            )
+
+    model = AlertsPanelModel(store=Store())
+    model.set_events([projected])
+
+    detail = model.get_detail_info()
+
+    assert detail is not None
+    assert detail.event.severity == "HIGH"
+
+
+def test_alert_detail_survives_malformed_sqlite_history() -> None:
+    class CorruptDatabase:
+        def execute(self, *_args: object, **_kwargs: object) -> None:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+    event = AlertEvent(
+        id="corrupt-db-alert",
+        severity="CRITICAL",
+        action="scan-finding",
+        target="claudecode:PostToolBatch",
+        run_id="run-1",
+    )
+    model = AlertsPanelModel(store=SimpleNamespace(db=CorruptDatabase()))
+    model.set_events([event])
+    model.toggle_expand_or_detail()
+
+    detail = model.get_detail_info()
+
+    assert detail is not None
+    assert detail.event == event
+    assert detail.findings == ()
+    assert detail.history == ()
+    assert "CRITICAL scan-finding" in model.detail_text()
+
+
+def test_humanize_alert_details_fast_paths_and_host_port() -> None:
+    assert humanize_alert_details("") == ""
+    assert humanize_alert_details("scanner failed on upload") == "scanner failed on upload"
+    assert humanize_alert_details("host=api.example.com port=443 mode=strict") == "api.example.com:443 strict"
+    assert humanize_alert_details("port=443 mode=strict") == ":443 strict"
+    assert humanize_alert_details("host=api.example.com mode=strict") == "api.example.com strict"
+
+
+def test_humanize_alert_details_model_noise_and_duplicate_stability() -> None:
+    assert humanize_alert_details("model=openai/gpt-4o-mini mode=strict") == "strict gpt-4o-mini"
+    assert humanize_alert_details("model=openai/") == "openai/"
+    assert humanize_alert_details("host=h port=1 mode=x scanner=skill findings=3 max_severity=HIGH") == "h:1 x"
+    assert humanize_alert_details("host=h port=1 extra=thing tail") == "h:1 extra=thing tail"
+    assert humanize_alert_details("mode=first mode=second") == "first"
+
+
+def test_alerts_filter_selection_and_counts() -> None:
+    model = AlertsPanelModel()
+    model.set_events(
+        [
+            AlertEvent(id="a1", severity="HIGH", action="scan", target="skill://one", details="token"),
+            AlertEvent(id="a2", severity="LOW", action="proxy", target="gateway", details="safe"),
+        ]
+    )
+
+    assert model.severity_counts()["HIGH"] == 1
+    model.set_severity_filter("HIGH")
+    assert [row.event.id for row in model.filtered] == ["a1"]
+    model.toggle_select()
+    assert model.selected_ids == {"a1"}
+    model.select_all()
+    assert model.selected_ids == {"a1"}
+    model.deselect_all()
+    assert model.selected_ids == set()
+
+    action = model.handle_key("2")
+    assert action.filter_change is not None
+    assert action.filter_change.panel == "alerts"
+    assert action.filter_change.filter_type == "severity"
+    assert action.filter_change.new == "CRITICAL"
+
+
+def test_alert_mutation_intents_always_send_actual_ids() -> None:
+    model = AlertsPanelModel()
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    model.set_events(
+        [
+            AlertEvent(id="a1", severity="HIGH", action="scan", target="skill://one", timestamp=now),
+            AlertEvent(
+                id="a2",
+                severity="LOW",
+                action="proxy",
+                target="gateway",
+                timestamp=now - timedelta(seconds=1),
+            ),
+        ]
+    )
+
+    dismissed = model.handle_key("d")
+    assert dismissed.intent is not None
+    assert dismissed.intent.args == ("alerts", "dismiss", "--id", "a1")
+
+    model.set_severity_filter_exact("")
+    model.select_all()
+    acknowledged = model.handle_key("x")
+    assert acknowledged.intent is not None
+    assert acknowledged.intent.args == (
+        "alerts",
+        "acknowledge",
+        "--id",
+        "a1",
+        "--id",
+        "a2",
+        "--yes",
+    )
+
+    model.set_severity_filter_exact("HIGH")
+    filtered = model.handle_key("c")
+    assert filtered.intent is not None
+    assert filtered.intent.args == ("alerts", "dismiss", "--id", "a1")
+
+    all_loaded = model.handle_key("C")
+    assert all_loaded.intent is not None
+    assert all_loaded.intent.args == (
+        "alerts",
+        "dismiss",
+        "--id",
+        "a1",
+        "--id",
+        "a2",
+        "--yes",
+    )
+    assert "--severity" not in all_loaded.intent.args
+
+
+def test_alerts_set_events_owns_the_input_list() -> None:
+    events = [AlertEvent(id="a1", severity="HIGH", action="scan", target="skill://one")]
+    model = AlertsPanelModel()
+
+    model.set_events(events)
+    events.clear()
+    model.refresh()
+
+    assert [event.id for event in model.audit_events] == ["a1"]
+    assert [row.event.id for row in model.filtered] == ["a1"]
+
+
+def test_alerts_default_hides_low_signal_rows_until_all_opt_in() -> None:
+    model = AlertsPanelModel()
+    model.set_events(
+        [
+            AlertEvent(id="a1", severity="HIGH", action="scan", target="skill://one"),
+            AlertEvent(id="a2", severity="MEDIUM", action="proxy", target="gateway"),
+            AlertEvent(id="a3", severity="INFO", action="connector-hook", target="preToolUse"),
+            AlertEvent(id="a4", severity="MEDIUM", action="block", target="gateway"),
+        ]
+    )
+
+    assert {row.event.id for row in model.filtered} == {"a1", "a4"}
+    assert model.active_scope_key() == "actionable"
+    assert model.active_filter_label() == "Actionable"
+    assert model.actionable_count() == 2
+    assert "Actionable 2" in model.summary_text()
+    assert "In scope 4" in model.summary_text()
+    assert "No actionable" not in model.empty_state()
+
+    assert model.handle_key("1").handled is True
+    assert model.active_scope_key() == "all"
+    assert model.active_filter_label() == "All severities"
+    assert {row.event.id for row in model.filtered} == {"a1", "a2", "a3", "a4"}
+
+    model.set_actionable_scope()
+    assert model.active_scope_key() == "actionable"
+    assert {row.event.id for row in model.filtered} == {"a1", "a4"}
+
+
+def test_alerts_summary_collects_scope_metrics_in_one_pass(monkeypatch) -> None:
+    model = AlertsPanelModel()
+    model.set_events(
+        [
+            AlertEvent(
+                id="a1",
+                severity="HIGH",
+                action="scan",
+                target="skill://one",
+                details="connector=codex result=block",
+            ),
+            AlertEvent(
+                id="a2",
+                severity="INFO",
+                action="connector-hook",
+                target="preToolUse",
+                details="connector=codex action=allow severity=LOW",
+            ),
+            AlertEvent(
+                id="a3",
+                severity="HIGH",
+                action="connector-hook",
+                target="preToolUse",
+                details="connector=cursor action=block severity=LOW",
+            ),
+        ]
+    )
+    flat_rows_calls = 0
+    parse_details_calls = 0
+    original_flat_rows = model.flat_rows
+    original_parse_details = alerts_panel.parse_kv_details
+
+    def counted_flat_rows() -> list[alerts_panel.AlertRow]:
+        nonlocal flat_rows_calls
+        flat_rows_calls += 1
+        return original_flat_rows()
+
+    def counted_parse_details(value: str) -> dict[str, str]:
+        nonlocal parse_details_calls
+        parse_details_calls += 1
+        return original_parse_details(value)
+
+    monkeypatch.setattr(model, "flat_rows", counted_flat_rows)
+    monkeypatch.setattr(alerts_panel, "parse_kv_details", counted_parse_details)
+
+    summary = model.summary_text()
+
+    assert "Actionable 2" in summary
+    assert "In scope 3" in summary
+    assert "High 2" in summary
+    assert "Low 1" in summary
+    assert flat_rows_calls == 1
+    assert parse_details_calls == 1
+
+    flat_rows_calls = 0
+    parse_details_calls = 0
+    model.filter_text = "block"
+    summary = model.summary_text()
+
+    assert "In scope 2" in summary
+    assert flat_rows_calls == 1
+    assert parse_details_calls == 1
+
+    flat_rows_calls = 0
+    parse_details_calls = 0
+    model.filter_text = "connector:codex"
+    summary = model.summary_text()
+
+    assert "In scope 2" in summary
+    assert flat_rows_calls == 1
+    assert parse_details_calls == 3
+
+
+def test_alerts_apply_filter_parses_details_only_when_required(monkeypatch) -> None:
+    model = AlertsPanelModel()
+    parse_details_calls = 0
+    original_parse_details = alerts_panel.parse_kv_details
+
+    def counted_parse_details(value: str) -> dict[str, str]:
+        nonlocal parse_details_calls
+        parse_details_calls += 1
+        return original_parse_details(value)
+
+    monkeypatch.setattr(alerts_panel, "parse_kv_details", counted_parse_details)
+    model.set_events(
+        [
+            AlertEvent(
+                id="hook",
+                severity="INFO",
+                action="connector-hook",
+                target="preToolUse",
+                details="connector=codex action=block severity=HIGH",
+            ),
+            AlertEvent(
+                id="scan",
+                severity="HIGH",
+                action="scan",
+                target="skill://one",
+                details="connector=codex action=block",
+            ),
+        ]
+    )
+
+    assert {row.event.id for row in model.filtered} == {"hook", "scan"}
+    assert parse_details_calls == 1
+
+    parse_details_calls = 0
+    model.set_filter("block")
+
+    assert {row.event.id for row in model.filtered} == {"hook", "scan"}
+    assert parse_details_calls == 1
+
+
+def test_alerts_slash_search_and_exact_severity_filter() -> None:
+    model = AlertsPanelModel()
+    model.set_events(
+        [
+            AlertEvent(id="a1", severity="HIGH", action="scan", target="skill://one", details="token"),
+            AlertEvent(id="a2", severity="MEDIUM", action="proxy", target="gateway", details="rate limit"),
+        ]
+    )
+
+    assert model.handle_key("/").handled is True
+    assert model.filtering is True
+    for char in "token":
+        model.handle_key(char)
+    assert [row.event.id for row in model.filtered] == ["a1"]
+    assert model.scope_total_count() == 1
+    assert "In scope 1" in model.summary_text()
+    assert model.active_filter_label() == "All severities, search 'token'"
+
+    assert model.handle_key("enter").handled is True
+    assert model.filtering is False
+    model.set_severity_filter_exact("MEDIUM")
+    assert [row.event.id for row in model.filtered] == []
+    assert model.active_filter_label() == "Medium, search 'token'"
+
+    assert model.handle_key("escape").handled is True
+    assert model.filter_text == ""
+    assert model.filtered
+
+
+def test_alerts_connector_column_and_shared_filter() -> None:
+    """8.13: CONNECTOR column + shared connector filter on the Alerts panel."""
+
+    model = AlertsPanelModel()
+    model.show_all_severities = True
+    model.set_events(
+        [
+            AlertEvent(
+                id="a1",
+                severity="HIGH",
+                action="connector-hook",
+                target="preToolUse",
+                details="connector=codex action=block",
+            ),
+            AlertEvent(
+                id="a2",
+                severity="MEDIUM",
+                action="connector-hook",
+                target="preToolUse",
+                details="connector=cursor action=alert",
+            ),
+        ]
+    )
+
+    # Single-connector default: no CONNECTOR column.
+    assert model.data_table_columns() == ("Sel", "Severity", "Time", "Action", "Target", "Details")
+
+    model.show_connector_column = True
+    assert model.data_table_columns() == ("Sel", "Severity", "Time", "Action", "Connector", "Target", "Details")
+    # Connector cell is index 4 (after Action).
+    connectors = {row[4] for row in model.data_table_rows()}
+    assert connectors == {"codex", "cursor"}
+
+    model.set_connector_filter("codex")
+    assert [row.event.id for row in model.filtered] == ["a1"]
+    assert model.scope_severity_counts() == {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 0, "LOW": 0}
+    assert "In scope 1" in model.summary_text()
+    model.set_connector_filter("")
+    assert {row.event.id for row in model.filtered} == {"a1", "a2"}
+
+
+def test_alerts_connector_hook_uses_detail_severity_for_observe_findings() -> None:
+    """Observe-mode hook findings store INFO rows but carry policy severity in details."""
+
+    now = datetime(2026, 6, 24, 17, 46, tzinfo=timezone.utc)
+    model = AlertsPanelModel()
+    model.set_events(
+        [
+            AlertEvent(
+                id="plain",
+                timestamp=now,
+                severity="INFO",
+                action="connector-hook",
+                target="PostToolUse",
+                details="connector=codex action=allow raw_action=allow severity=NONE mode=observe",
+            ),
+            AlertEvent(
+                id="finding",
+                timestamp=now + timedelta(seconds=1),
+                severity="INFO",
+                action="connector-hook",
+                target="PostToolUse",
+                details="connector=codex action=allow raw_action=alert severity=HIGH mode=observe",
+            ),
+        ]
+    )
+
+    assert [row.event.id for row in model.filtered] == ["finding"]
+    assert model.severity_counts()["HIGH"] == 1
+    assert model.data_table_row_models()[0].cells[1] == "HIGH"
+
+    model.set_severity_filter_exact("HIGH")
+    assert [row.event.id for row in model.filtered] == ["finding"]
+
+
+def test_alerts_connector_token_filters_by_connector() -> None:
+    # E5: the Alerts panel honors the same ``connector:<name>`` search token
+    # as Audit, matching the kv connector in the event details. Free text in
+    # the same query still ANDs via the legacy substring search.
+    model = AlertsPanelModel()
+    model.set_events(
+        [
+            AlertEvent(
+                id="h1",
+                severity="LOW",
+                action="connector-hook",
+                target="preToolUse",
+                details="connector=codex action=allow severity=NONE",
+            ),
+            AlertEvent(
+                id="h2",
+                severity="LOW",
+                action="connector-hook",
+                target="preToolUse",
+                details="connector=cursor action=block severity=HIGH",
+            ),
+        ]
+    )
+
+    model.set_filter("connector:codex")
+    assert [row.event.id for row in model.filtered] == ["h1"]
+
+    # token + free text ANDs (block only on cursor).
+    model.set_filter("connector:cursor block")
+    assert [row.event.id for row in model.filtered] == ["h2"]
+
+    model.set_filter("connector:nope")
+    assert model.filtered == []
+
+
+def test_alerts_detail_pairs_copy_text_and_store_enrichment() -> None:
+    selected = AlertEvent(
+        id="a1",
+        severity="HIGH",
+        action="proxy",
+        target="gateway",
+        details="host=api port=443 mode=strict model=openai/gpt-4o",
+        run_id="run-1",
+        trace_id="trace-1",
+        request_id="req-1",
+        session_id="sess-1",
+    )
+
+    class FakeStore:
+        def list_findings_by_run_id(self, run_id: str) -> list[AlertFinding]:
+            assert run_id == "run-1"
+            return [
+                AlertFinding(
+                    id="f1",
+                    scan_id="run-1",
+                    severity="HIGH",
+                    title="Hardcoded credential",
+                    location="main.py:42",
+                    remediation="Load from keychain",
+                    scanner="skill-scanner",
+                )
+            ]
+
+        def list_events_by_target(self, target: str, limit: int) -> list[AlertEvent]:
+            assert target == "gateway"
+            assert limit == 10
+            return [
+                selected,
+                AlertEvent(id="a0", severity="LOW", action="allow", target="gateway"),
+            ]
+
+    model = AlertsPanelModel(store=FakeStore())
+    model.set_events([selected])
+    model.toggle_expand_or_detail()
+
+    pairs = dict(model.detail_pairs())
+    assert pairs["Summary"] == "api:443 strict gpt-4o"
+    assert pairs["Details"] == "host=api port=443 mode=strict model=openai/gpt-4o"
+    assert pairs["Run ID"] == "run-1"
+    assert pairs["Trace ID"] == "trace-1"
+    assert pairs["Request ID"] == "req-1"
+    assert "Hardcoded credential" in pairs["Finding 1"]
+    assert pairs["Remediation 1"] == "Load from keychain"
+    assert "allow" in pairs["History 1"]
+
+    copied = model.handle_key("y")
+    assert copied.copy_text
+    assert "Severity: HIGH" in copied.copy_text
+    assert "Summary: api:443 strict gpt-4o" in copied.copy_text
+    assert "Request ID: req-1" in copied.copy_text
+
+
+def test_alerts_connector_hook_row_surfaces_connector_and_decision() -> None:
+    """Hook rows should encode connector + decision in the table cells."""
+
+    hook_event = AlertEvent(
+        id="h1",
+        severity="LOW",
+        action="connector-hook",
+        target="preToolUse",
+        details=("connector=claudecode action=allow severity=LOW mode=observe elapsed=320ms tool=Bash audit_id=abc123"),
+    )
+    plain_event = AlertEvent(
+        id="p1",
+        severity="HIGH",
+        action="proxy",
+        target="gateway",
+        details="host=api port=443 mode=strict",
+    )
+
+    model = AlertsPanelModel()
+    model.show_all_severities = True
+    model.set_events([hook_event, plain_event])
+
+    rows = {row.alert_id: row for row in model.data_table_row_models()}
+    assert rows["h1"].cells[4] == "claudecode · preToolUse"
+    # ``LOW`` is non-NONE so it gets folded into the summary alongside
+    # the decision and elapsed; the rest of the kv blob is hidden.
+    assert rows["h1"].cells[5] == "allow · LOW · 320ms"
+
+    # Non-hook rows preserve their existing humanized rendering so the
+    # proxy/scan/egress legacy table layout is untouched.
+    assert rows["p1"].cells[4] == "gateway"
+    assert rows["p1"].cells[5] == "api:443 strict"
+
+
+def test_alerts_connector_hook_detail_pairs_expand_kv_into_rows() -> None:
+    """Hook detail panes should split kv details into labelled rows."""
+
+    hook_event = AlertEvent(
+        id="h1",
+        severity="INFO",
+        action="connector-hook",
+        target="preToolUse",
+        details=(
+            "connector=claudecode action=allow severity=NONE mode=observe "
+            "would_block=false elapsed=180ms tool=Bash "
+            "payload=<redacted len=12 sha=deadbeefcafebabe>"
+        ),
+    )
+
+    model = AlertsPanelModel()
+    model.show_all_severities = True
+    model.set_events([hook_event])
+    model.toggle_expand_or_detail()
+
+    pairs = dict(model.detail_pairs())
+    # The kv blob is exploded into its own rows…
+    assert pairs["Connector"] == "claudecode"
+    assert pairs["Decision"] == "allow"
+    assert pairs["Enforcement mode"] == "observe"
+    assert pairs["Elapsed"] == "180ms"
+    assert pairs["Tool"] == "Bash"
+    # …redacted blobs are prettified for humans, and noisy
+    # severity=NONE / would_block=false in observe mode are hidden.
+    assert "redacted" in pairs["Payload"]
+    assert "12 bytes" in pairs["Payload"]
+    assert "Severity" not in pairs or pairs["Severity"] != "NONE"
+    assert "Would block" not in pairs
+    # The legacy Summary/Details rows are no longer emitted because
+    # the exploded rows are strictly more useful.
+    assert "Summary" not in pairs
+    assert "Details" not in pairs
+
+
+def test_alerts_connector_hook_blocked_keeps_severity_and_block_flag() -> None:
+    """Enforce-mode blocked hooks must keep severity + would_block visible."""
+
+    hook_event = AlertEvent(
+        id="h1",
+        severity="HIGH",
+        action="connector-hook",
+        target="postToolUse",
+        details=(
+            "connector=claudecode action=block severity=HIGH mode=enforce "
+            "would_block=true elapsed=42ms reason=policy_match"
+        ),
+    )
+
+    model = AlertsPanelModel()
+    model.show_all_severities = True
+    model.set_events([hook_event])
+    model.toggle_expand_or_detail()
+
+    pairs = dict(model.detail_pairs())
+    assert pairs["Decision"] == "block"
+    # In enforce mode we keep the structured severity + block flag so
+    # operators see exactly why the request was rejected.
+    assert pairs["Severity"] == "HIGH"
+    assert pairs["Would block"] == "yes"
+    assert pairs["Reason"] == "policy_match"
+
+
+def test_alerts_connector_hook_copy_text_uses_structured_rows() -> None:
+    """`y` should copy the same hook-aware view shown in the detail pane."""
+
+    hook_event = AlertEvent(
+        id="h1",
+        severity="LOW",
+        action="connector-hook",
+        target="preToolUse",
+        details=("connector=claudecode action=allow severity=LOW mode=observe elapsed=99ms tool=Read"),
+    )
+
+    model = AlertsPanelModel()
+    model.show_all_severities = True
+    model.set_events([hook_event])
+    model.toggle_expand_or_detail()
+
+    copied = model.handle_key("y").copy_text
+    assert "Connector: claudecode" in copied
+    assert "Decision: allow" in copied
+    assert "Tool: Read" in copied
+    # Hook copy text drops the noisy ``Summary``/``Details`` lines
+    # used for proxy/scan rows; structured rows are the source of
+    # truth.
+    assert "Summary:" not in copied
+    assert "Details: connector=" not in copied

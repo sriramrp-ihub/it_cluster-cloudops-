@@ -41,4 +41,19 @@ coverage/
 # Scratch
 scratch/
 tmp/
-defence_claw/
+
+# DefenseClaw build artifacts & large assets
+defence_claw/defenseclaw/.git_backup/
+defence_claw/defenseclaw/defenseclaw
+defence_claw/defenseclaw/defenseclaw-*
+defence_claw/defenseclaw/docs-site/public/videos/
+defence_claw/defenseclaw/bin/
+defence_claw/defenseclaw/dist/
+defence_claw/defenseclaw/build/
+defence_claw/defenseclaw/*.test
+defence_claw/defenseclaw/*.exe
+defence_claw/defenseclaw/.venv/
+defence_claw/defenseclaw/__pycache__/
+defence_claw/defenseclaw/.gocache/
+defence_claw/defenseclaw/.gomodcache/
+

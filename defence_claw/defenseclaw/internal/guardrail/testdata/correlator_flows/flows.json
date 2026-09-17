@@ -1,0 +1,61 @@
+{
+  "flows": [
+    {
+      "id": "lethal-trifecta/ssh-leak-via-webhook",
+      "description": "Classic lethal trifecta — user turn brings untrusted instructions, tool call reads SSH key, completion sends to webhook.site.",
+      "events": [
+        {"rule_id": "INJ-IGNORE-PREVIOUS", "severity": "HIGH"},
+        {"rule_id": "PATH-SSH-KEY", "severity": "HIGH"},
+        {"rule_id": "C2-WEBHOOK-SITE", "severity": "HIGH"}
+      ],
+      "expect_fires": ["LETHAL-TRIFECTA"]
+    },
+    {
+      "id": "lethal-trifecta/aws-cred-to-ngrok",
+      "description": "Same trifecta with different rule IDs — tests axis-based matching independent of specific rules.",
+      "events": [
+        {"rule_id": "TRUST-AUTHORITY-CLAIM", "severity": "HIGH"},
+        {"rule_id": "CRED-AWS-FILE", "severity": "HIGH"},
+        {"rule_id": "C2-NGROK", "severity": "HIGH"}
+      ],
+      "expect_fires": ["LETHAL-TRIFECTA"]
+    },
+    {
+      "id": "lethal-trifecta/missing-ingress",
+      "description": "Sensitive access + egress but no ingress-untrusted marker — should NOT fire trifecta (covered by a narrower pattern if needed).",
+      "events": [
+        {"rule_id": "PATH-SSH-KEY", "severity": "HIGH"},
+        {"rule_id": "C2-WEBHOOK-SITE", "severity": "HIGH"}
+      ],
+      "expect_not_fires": ["LETHAL-TRIFECTA"]
+    },
+    {
+      "id": "fingerprint-chain/same-value-exfil",
+      "description": "Same fingerprint appears in sensitive-access and egress — direct exfil evidence.",
+      "events": [
+        {"rule_id": "PATH-SSH-KEY", "severity": "HIGH", "content_fingerprint": "abc12345"},
+        {"rule_id": "C2-WEBHOOK-SITE", "severity": "HIGH", "content_fingerprint": "abc12345"}
+      ],
+      "expect_fires": ["TRIFECTA-WITH-FINGERPRINT-MATCH"]
+    },
+    {
+      "id": "fingerprint-chain/different-values",
+      "description": "Sensitive-access and egress findings present, but fingerprints differ — no direct link.",
+      "events": [
+        {"rule_id": "PATH-SSH-KEY", "severity": "HIGH", "content_fingerprint": "aaaaaaaa"},
+        {"rule_id": "C2-WEBHOOK-SITE", "severity": "HIGH", "content_fingerprint": "bbbbbbbb"}
+      ],
+      "expect_not_fires": ["TRIFECTA-WITH-FINGERPRINT-MATCH"]
+    },
+    {
+      "id": "no-match/benign-session",
+      "description": "Session with only individual LOW findings, no combinations.",
+      "events": [
+        {"severity": "LOW"},
+        {"severity": "LOW"},
+        {"severity": "LOW"}
+      ],
+      "expect_not_fires": ["LETHAL-TRIFECTA", "TRIFECTA-WITH-FINGERPRINT-MATCH"]
+    }
+  ]
+}

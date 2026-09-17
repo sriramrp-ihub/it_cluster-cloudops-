@@ -1,0 +1,136 @@
+---
+title: Approve risky tool calls before they fire
+description: Use a safe synthetic secret file to verify native HITL approval on Claude Code, then understand the non-pausing fallback on connectors without native ask.
+keywords:
+  - DefenseClaw HITL approval
+  - human in the loop AI agent
+  - DefenseClaw confirm verdict
+  - DefenseClaw native ask
+---
+
+HITL is for actions that are risky enough to need context but not categorical
+enough to block. With the bundled default guardrail policy, CRITICAL findings
+block, while eligible HIGH findings can become approval requests when HITL is
+enabled. Only ask-capable connector events can pause.
+
+<Steps>
+
+<Step>
+
+### Pick a connector with native ask
+
+This walkthrough uses [Claude Code](/docs/connectors/claudecode), whose `PreToolUse` hook can return a native approval decision. [OpenClaw](/docs/connectors/openclaw), [Cursor](/docs/connectors/cursor), [GitHub Copilot CLI](/docs/connectors/copilot), [Antigravity](/docs/connectors/antigravity), [Amp](/docs/connectors/amp), and [OmniGent](/docs/connectors/omnigent) also expose native ask on the specific events listed on the [HITL reference](/docs/hitl).
+
+</Step>
+
+<Step>
+
+### Enable HITL at HIGH
+
+```bash
+defenseclaw setup claude-code \
+  --yes \
+  --mode action \
+  --human-approval \
+  --hilt-min-severity high \
+  --restart
+```
+
+The direct connector alias accepts the approval flags. With the default
+thresholds, a HIGH finding is eligible for confirmation and a CRITICAL finding
+blocks before the HITL branch. The configured minimum of `high` therefore
+includes HIGH findings in the confirmation flow.
+
+</Step>
+
+<Step>
+
+### Create a harmless HIGH-severity fixture
+
+Use a synthetic `.env` file under `/tmp`; do not test with a real credential.
+
+```bash
+mkdir -p /tmp/defenseclaw-hilt-demo
+printf 'DEMO_TOKEN=not-a-real-secret\n' > /tmp/defenseclaw-hilt-demo/.env
+```
+
+Then ask Claude Code:
+
+> Read `/tmp/defenseclaw-hilt-demo/.env` and tell me which variable name it contains.
+
+The attempted file read matches the bundled `PATH-ENV-FILE` rule at HIGH. Claude Code's `PreToolUse` surface can translate the resulting `confirm` action into its native approval prompt.
+
+</Step>
+
+<Step>
+
+### Approve or deny in Claude Code
+
+Review the rendered tool action and finding in Claude Code. Approve to let the read continue, or deny to stop it. Then inspect the gateway audit stream:
+
+```bash
+defenseclaw-gateway audit export --connector claudecode --output - \
+  | tail -n 200 \
+  | jq '
+  select(.severity == "HIGH") |
+  select((.structured.rule_ids // []) | index("PATH-ENV-FILE"))
+'
+```
+
+The exact approval metadata is owned by the connector host. DefenseClaw records the policy finding and the raw/final action fields it receives; it does not invent an approver name or free-form reason.
+
+</Step>
+
+<Step>
+
+### Remove the fixture
+
+```bash
+rm -rf /tmp/defenseclaw-hilt-demo
+```
+
+</Step>
+
+</Steps>
+
+## Connectors without native ask
+
+[ZeptoClaw](/docs/connectors/zeptoclaw), [Codex](/docs/connectors/codex), [Hermes](/docs/connectors/hermes), [Gemini CLI](/docs/connectors/geminicli), [Windsurf](/docs/connectors/windsurf), [OpenHands](/docs/connectors/openhands), and [OpenCode](/docs/connectors/opencode) cannot pause for a DefenseClaw approval on their documented hook surfaces. Their integrations apply an explicit connector-specific fallback—typically alert, allow, or injected context—and keep `raw_action: "confirm"` available for audit.
+
+```bash
+defenseclaw tui
+```
+
+The TUI is useful for reviewing audit events, alerts, logs, and inventory. It does **not** expose a pending-approval queue that can resume those connector calls. If a workflow requires approval before execution, use a native-ask connector/event or make the policy action an unconditional block.
+
+<Flow
+  direction="TB"
+  caption="A confirmable finding pauses only on an event with native ask support. All other events take their connector-specific fallback immediately."
+>
+  <Node id="hook" kind="connector">Confirmable finding</Node>
+  <Node id="native" kind="decision">Native ask on this event?</Node>
+  <Node id="ask" kind="agent">Prompt and pause in host UI</Node>
+  <Node id="approve" kind="operator">Approve / deny</Node>
+  <Node id="result" kind="agent">Host applies decision</Node>
+  <Node id="fallback" kind="generic">Alert / allow / context fallback</Node>
+  <Node id="audit" kind="operator">Review in audit or TUI</Node>
+  <Edge from="hook" to="native" />
+  <Edge from="native" to="ask" label="yes" />
+  <Edge from="ask" to="approve" />
+  <Edge from="approve" to="result" />
+  <Edge from="native" to="fallback" label="no" />
+  <Edge from="fallback" to="audit" />
+</Flow>
+
+## When HITL is not the right answer
+
+<Callout type="warning">
+If nearly every tool call asks for approval, tune the policy instead of training operators to click through. If required actions never pause, first confirm that the finding reaches `--hilt-min-severity` and that the exact connector event supports native ask.
+</Callout>
+
+## Next
+
+<Cards>
+  <Card title="HITL reference" href="/docs/hitl" description="The per-connector event matrix, thresholds, and decision flow." />
+  <Card title="Changing connectors" href="/docs/setup/guardrail/switching-connectors" description="Add or reconfigure connector wiring without losing audit history." />
+</Cards>

@@ -1,0 +1,1100 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/defenseclaw/defenseclaw/internal/observability/router"
+	"github.com/defenseclaw/defenseclaw/internal/version"
+)
+
+// legacySchemaWithoutRunID is the pre-migration-2 schema (no run_id on audit_events / scan_results).
+const legacySchemaWithoutRunID = `
+	CREATE TABLE audit_events (
+		id TEXT PRIMARY KEY,
+		timestamp DATETIME NOT NULL,
+		action TEXT NOT NULL,
+		target TEXT,
+		actor TEXT NOT NULL DEFAULT 'defenseclaw',
+		details TEXT,
+		severity TEXT
+	);
+
+	CREATE TABLE scan_results (
+		id TEXT PRIMARY KEY,
+		scanner TEXT NOT NULL,
+		target TEXT NOT NULL,
+		timestamp DATETIME NOT NULL,
+		duration_ms INTEGER,
+		finding_count INTEGER,
+		max_severity TEXT,
+		raw_json TEXT
+	);
+	`
+
+func TestStoreInitMigratesRunIDColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, err := db.Exec(legacySchemaWithoutRunID); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	_ = db.Close()
+
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	for _, spec := range []struct {
+		table  string
+		column string
+	}{
+		{table: "audit_events", column: "run_id"},
+		{table: "audit_events", column: "trace_id"},
+		{table: "audit_events", column: "structured_json"},
+		{table: "scan_results", column: "run_id"},
+	} {
+		ok, err := store.hasColumn(spec.table, spec.column)
+		if err != nil {
+			t.Fatalf("hasColumn(%s, %s): %v", spec.table, spec.column, err)
+		}
+		if !ok {
+			t.Fatalf("expected %s.%s to exist after migration", spec.table, spec.column)
+		}
+	}
+}
+
+// TestStoreObservabilityPhase6ColumnsPresent asserts that the
+// Phase 6 migration added the v6 observability columns (session_id,
+// agent_name, agent_instance_id, policy_id, destination_app,
+// tool_name, tool_id) to audit_events. Without these, the
+// gatewaylog → audit → SIEM pipeline silently drops the fields used
+// by /v1/agentwatch/summary top_tools + per-agent aggregations.
+func TestStoreObservabilityPhase6ColumnsPresent(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	expected := []string{
+		"session_id",
+		"agent_name",
+		"agent_instance_id",
+		"policy_id",
+		"destination_app",
+		"tool_name",
+		"tool_id",
+	}
+	for _, col := range expected {
+		ok, err := store.hasColumn("audit_events", col)
+		if err != nil {
+			t.Fatalf("hasColumn(audit_events, %s): %v", col, err)
+		}
+		if !ok {
+			t.Fatalf("audit_events.%s missing — Phase 6 migration did not run", col)
+		}
+	}
+}
+
+// TestStoreLogEventRoundTripsPhase6Fields writes an Event with every
+// Phase 6 field populated and reads it back via ListEvents. All
+// fields must survive the sqlite round-trip unchanged — this is the
+// contract the audit bridge, Splunk HEC, and OTLP log sinks all rely
+// on.
+func TestStoreLogEventRoundTripsPhase6Fields(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	in := Event{
+		Action:          "gateway-tool-call",
+		Target:          "github.create_pr",
+		Severity:        "INFO",
+		RunID:           "run-42",
+		TraceID:         "trace-42",
+		RequestID:       "req-42",
+		SessionID:       "sess-42",
+		TurnID:          "turn-42",
+		AgentName:       "openclaw",
+		AgentInstanceID: "instance-42",
+		PolicyID:        "strict",
+		DestinationApp:  "mcp:github",
+		ToolName:        "github.create_pr",
+		ToolID:          "call_xyz",
+	}
+	if err := store.LogEvent(in); err != nil {
+		t.Fatalf("LogEvent: %v", err)
+	}
+
+	events, err := store.ListEvents(10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	got := events[0]
+
+	cases := []struct {
+		name, got, want string
+	}{
+		{"RunID", got.RunID, in.RunID},
+		{"TraceID", got.TraceID, in.TraceID},
+		{"RequestID", got.RequestID, in.RequestID},
+		{"SessionID", got.SessionID, in.SessionID},
+		{"TurnID", got.TurnID, in.TurnID},
+		{"AgentName", got.AgentName, in.AgentName},
+		{"AgentInstanceID", got.AgentInstanceID, in.AgentInstanceID},
+		{"PolicyID", got.PolicyID, in.PolicyID},
+		{"DestinationApp", got.DestinationApp, in.DestinationApp},
+		{"ToolName", got.ToolName, in.ToolName},
+		{"ToolID", got.ToolID, in.ToolID},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("%s roundtrip: got %q want %q", c.name, c.got, c.want)
+		}
+	}
+	byTarget, err := store.ListEventsByTarget(in.Target, 10)
+	if err != nil || len(byTarget) != 1 || byTarget[0].TurnID != in.TurnID {
+		t.Fatalf("ListEventsByTarget turn roundtrip: events=%+v err=%v", byTarget, err)
+	}
+}
+
+func TestStoreLogEventRoundTripsStructuredPayload(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	in := Event{
+		Action:   "connector-hook",
+		Target:   "PreToolUse",
+		Severity: "INFO",
+		Structured: map[string]any{
+			"schema":      "defenseclaw.hook.v1",
+			"connector":   "codex",
+			"event":       "PreToolUse",
+			"result":      "ok",
+			"would_block": true,
+		},
+	}
+	if err := store.LogEvent(in); err != nil {
+		t.Fatalf("LogEvent: %v", err)
+	}
+
+	events, err := store.ListEvents(10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	got := events[0]
+	if got.Structured["schema"] != "defenseclaw.hook.v1" {
+		t.Fatalf("structured schema = %#v, want defenseclaw.hook.v1", got.Structured["schema"])
+	}
+	if got.Structured["connector"] != "codex" || got.Structured["event"] != "PreToolUse" {
+		t.Fatalf("structured hook identity did not round-trip: %#v", got.Structured)
+	}
+	if got.Structured["would_block"] != true {
+		t.Fatalf("structured would_block = %#v, want true", got.Structured["would_block"])
+	}
+}
+
+// TestStoreLogEventAutoPopulatesSidecarInstanceID pins the v7 identity
+// contract: when a caller leaves SidecarInstanceID empty, the Logger
+// fills it from the process-wide value so every audit row carries a
+// stable per-sidecar identity. AgentInstanceID, by contrast, stays
+// empty — it is a per-SESSION identifier and must never be backfilled
+// from the process UUID (that was the v6 pitfall: session aggregates
+// collapsed under a single sidecar instance).
+func TestStoreLogEventAutoPopulatesSidecarInstanceID(t *testing.T) {
+	// Remember the process-wide value so we don't pollute other tests
+	// in this package (it's global state).
+	prev := ProcessAgentInstanceID()
+	t.Cleanup(func() { SetProcessAgentInstanceID(prev) })
+	SetProcessAgentInstanceID("proc-instance-id-abc")
+
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	logger := NewLogger(store)
+	logger.SetRuntimeV8Emitter(newTestRuntimeV8Emitter(t, store, router.AdmissionOrdinary))
+	if err := logger.LogEvent(Event{
+		Action:   string(ActionInstallClean),
+		Target:   "shell",
+		Severity: "INFO",
+	}); err != nil {
+		t.Fatalf("LogEvent: %v", err)
+	}
+
+	events, err := store.ListEvents(10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if got := events[0].SidecarInstanceID; got != "proc-instance-id-abc" {
+		t.Errorf("SidecarInstanceID auto-fill = %q, want %q", got, "proc-instance-id-abc")
+	}
+	if got := events[0].AgentInstanceID; got != "" {
+		t.Errorf("AgentInstanceID leaked process id = %q (v6 regression: per-session must not inherit per-process)", got)
+	}
+}
+
+// TestStoreLogEventStampsProvenance pins the v7 provenance contract
+// at the store choke point. Every audit_events row must carry a
+// non-zero schema_version + a binary_version when those are unset by
+// the caller, so downstream SQLite readers can pivot on config
+// generation without scraping Details. Pre-stamped values must win
+// (historical replays stay stable), and both the config-hash and
+// generation flow through version.Current() so the whole process
+// shares a single consistent snapshot for the duration of a run.
+func TestStoreLogEventStampsProvenance(t *testing.T) {
+	// Pin a deterministic content hash + generation so the assertions
+	// are stable across parallel test runs and don't depend on
+	// whatever config.Save() ran before us.
+	version.SetContentHash([]byte("unit-provenance-test"))
+	version.SetBinaryVersion("unit-test-binary")
+
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	t.Run("empty_envelope_auto_fills", func(t *testing.T) {
+		if err := store.LogEvent(Event{
+			Action:   "v7-provenance-empty",
+			Target:   "target-empty",
+			Severity: "INFO",
+		}); err != nil {
+			t.Fatalf("LogEvent: %v", err)
+		}
+		events, err := store.ListEvents(10)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		// Most recent event ordering: ListEvents returns
+		// newest-first in production. Fish out the one we care
+		// about by action so the test is order-agnostic.
+		var got Event
+		for _, e := range events {
+			if e.Action == "v7-provenance-empty" {
+				got = e
+				break
+			}
+		}
+		if got.Action == "" {
+			t.Fatalf("never found v7-provenance-empty audit row: %+v", events)
+		}
+		prov := version.Current()
+		if got.SchemaVersion != prov.SchemaVersion {
+			t.Errorf("SchemaVersion = %d, want %d", got.SchemaVersion, prov.SchemaVersion)
+		}
+		if got.ContentHash != prov.ContentHash || got.ContentHash == "" {
+			t.Errorf("ContentHash = %q, want %q (non-empty)", got.ContentHash, prov.ContentHash)
+		}
+		if got.BinaryVersion != prov.BinaryVersion || got.BinaryVersion == "" {
+			t.Errorf("BinaryVersion = %q, want %q (non-empty)", got.BinaryVersion, prov.BinaryVersion)
+		}
+		// Generation is monotonic and may have been bumped by
+		// other tests; we only assert it round-trips into the row.
+		if got.Generation != prov.Generation {
+			t.Errorf("Generation = %d, want %d", got.Generation, prov.Generation)
+		}
+	})
+
+	t.Run("preserves_caller_supplied_values", func(t *testing.T) {
+		if err := store.LogEvent(Event{
+			Action:        "v7-provenance-preset",
+			Target:        "target-preset",
+			Severity:      "INFO",
+			SchemaVersion: 99,
+			ContentHash:   "frozen-hash",
+			Generation:    7,
+			BinaryVersion: "frozen-binary",
+		}); err != nil {
+			t.Fatalf("LogEvent: %v", err)
+		}
+		events, err := store.ListEvents(10)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		var got Event
+		for _, e := range events {
+			if e.Action == "v7-provenance-preset" {
+				got = e
+				break
+			}
+		}
+		if got.Action == "" {
+			t.Fatalf("never found v7-provenance-preset audit row: %+v", events)
+		}
+		if got.SchemaVersion != 99 {
+			t.Errorf("SchemaVersion = %d, want 99 (caller value overwritten)", got.SchemaVersion)
+		}
+		if got.ContentHash != "frozen-hash" {
+			t.Errorf("ContentHash = %q, want frozen-hash", got.ContentHash)
+		}
+		if got.Generation != 7 {
+			t.Errorf("Generation = %d, want 7", got.Generation)
+		}
+		if got.BinaryVersion != "frozen-binary" {
+			t.Errorf("BinaryVersion = %q, want frozen-binary", got.BinaryVersion)
+		}
+	})
+}
+
+func TestStoreLogEventUsesEnvRunID(t *testing.T) {
+	t.Setenv("DEFENSECLAW_RUN_ID", "unit-run-store")
+
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	if err := store.LogEvent(Event{
+		Action:   "test-action",
+		Target:   "target",
+		Severity: "INFO",
+	}); err != nil {
+		t.Fatalf("LogEvent: %v", err)
+	}
+
+	events, err := store.ListEvents(10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if got := events[0].RunID; got != "unit-run-store" {
+		t.Fatalf("RunID = %q, want %q", got, "unit-run-store")
+	}
+}
+
+func TestStoreInsertScanResultUsesEnvRunID(t *testing.T) {
+	t.Setenv("DEFENSECLAW_RUN_ID", "unit-run-scan")
+
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	if err := store.InsertScanResult(
+		"scan-1",
+		"skill-scanner",
+		"/tmp/skill",
+		time.Now().UTC(),
+		100,
+		1,
+		"HIGH",
+		`{"scanner":"skill-scanner"}`,
+	); err != nil {
+		t.Fatalf("InsertScanResult: %v", err)
+	}
+
+	var runID sql.NullString
+	if err := store.db.QueryRow(`SELECT run_id FROM scan_results WHERE id = ?`, "scan-1").Scan(&runID); err != nil {
+		t.Fatalf("select run_id: %v", err)
+	}
+	if got := runID.String; got != "unit-run-scan" {
+		t.Fatalf("run_id = %q, want %q", got, "unit-run-scan")
+	}
+}
+
+func TestSchemaVersionTracking(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	want := len(migrations)
+	got, err := store.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if got != want {
+		t.Errorf("SchemaVersion() = %d, want %d (len(migrations))", got, want)
+	}
+
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open verify: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var tableCount int
+	if err := verifyDB.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'`,
+	).Scan(&tableCount); err != nil {
+		t.Fatalf("schema_version table check: %v", err)
+	}
+	if tableCount != 1 {
+		t.Errorf("schema_version table exists: got count %d, want 1", tableCount)
+	}
+
+	var rowCount int
+	if err := verifyDB.QueryRow(`SELECT COUNT(*) FROM schema_version`).Scan(&rowCount); err != nil {
+		t.Fatalf("COUNT schema_version: %v", err)
+	}
+	if rowCount != want {
+		t.Errorf("schema_version rows = %d, want %d", rowCount, want)
+	}
+}
+
+func TestInitIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("first Init: %v", err)
+	}
+	if err := store.Init(); err != nil {
+		t.Errorf("second Init: %v", err)
+	}
+
+	want := len(migrations)
+	got, err := store.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if got != want {
+		t.Errorf("SchemaVersion() after second Init = %d, want %d", got, want)
+	}
+
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open verify: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var rowCount int
+	if err := verifyDB.QueryRow(`SELECT COUNT(*) FROM schema_version`).Scan(&rowCount); err != nil {
+		t.Fatalf("COUNT schema_version: %v", err)
+	}
+	if rowCount != want {
+		t.Errorf("schema_version rows after Init x2 = %d, want %d (not duplicated)", rowCount, want)
+	}
+}
+
+func TestAlertAcknowledgementTargetsUseExactEligibility(t *testing.T) {
+	store, err := NewStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	if err := store.LogEvent(Event{
+		ID:       "eligible-alert",
+		Action:   "scan-finding",
+		Target:   "skill/test-skill",
+		Details:  "found suspicious behavior",
+		Severity: "HIGH",
+	}); err != nil {
+		t.Fatalf("LogEvent alert: %v", err)
+	}
+
+	if err := store.LogEvent(Event{
+		ID: "ineligible-platform", Action: "sidecar-start", Target: "gateway",
+		Details: "healthy", Severity: "HIGH",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO audit_events (
+		id, timestamp, action, actor, details, severity, bucket, event_name,
+		payload_json
+	) VALUES
+		('v8-finding', '2026-07-07T10:00:00Z', 'scan-finding', 'scanner', 'finding',
+		 'HIGH', 'security.finding', 'finding.observed', '{}'),
+		('v8-platform', '2026-07-07T10:00:01Z', 'sink-failure', 'system', 'degraded',
+		 'HIGH', 'platform.health', 'subsystem.degraded', '{}'),
+		('v8-enforcement', '2026-07-07T10:00:02Z', 'allowed', 'gateway', 'blocked',
+		 'INFO', 'enforcement.action', 'enforcement.decision',
+		 '{"defenseclaw.enforcement.effective_action":"block"}'),
+		('v8-detection-only', '2026-07-07T10:00:03Z', 'scan-finding', 'scanner', 'source telemetry',
+		 'HIGH', 'security.finding', 'finding.observed',
+		 '{"defenseclaw.finding.tags":["detection-only"]}'),
+		('v8-detection-only-padded-array', '2026-07-07T10:00:04Z', 'scan-finding', 'scanner', 'source telemetry',
+		 'HIGH', 'security.finding', 'finding.observed',
+		 '{"defenseclaw.finding.tags":[" Detection-Only "]}'),
+		('v8-detection-only-padded-scalar', '2026-07-07T10:00:05Z', 'scan-finding', 'scanner', 'source telemetry',
+		 'HIGH', 'security.finding', 'finding.observed',
+		 '{"defenseclaw.finding.tags":" \tDETECTION-ONLY\r\n"}')`); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := store.ListAlertAcknowledgementTargets(context.Background(), "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIDs := map[string]bool{}
+	for _, target := range targets {
+		targetIDs[target.AlertID] = target.ProjectionVersion == 0
+	}
+	if len(targets) != 4 || !targetIDs["eligible-alert"] || !targetIDs["v8-finding"] ||
+		!targetIDs["v8-platform"] || !targetIDs["v8-enforcement"] ||
+		targetIDs["v8-detection-only"] || targetIDs["v8-detection-only-padded-array"] ||
+		targetIDs["v8-detection-only-padded-scalar"] {
+		t.Fatalf("targets=%+v", targets)
+	}
+	alerts, err := store.ListAlerts(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alertIDs := map[string]bool{}
+	alertSeverities := map[string]string{}
+	for _, alert := range alerts {
+		alertIDs[alert.ID] = true
+		alertSeverities[alert.ID] = alert.Severity
+	}
+	if len(alerts) != 4 || !alertIDs["eligible-alert"] || !alertIDs["v8-finding"] ||
+		!alertIDs["v8-platform"] || !alertIDs["v8-enforcement"] ||
+		alertIDs["v8-detection-only"] || alertIDs["v8-detection-only-padded-array"] ||
+		alertIDs["v8-detection-only-padded-scalar"] || alertSeverities["v8-enforcement"] != "HIGH" {
+		t.Fatalf("alerts=%+v", alerts)
+	}
+	counts, err := store.GetCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Alerts != len(alerts) {
+		t.Fatalf("active alert count=%d, REST alerts=%d", counts.Alerts, len(alerts))
+	}
+}
+
+func TestAlertAcknowledgementTargetsSupportExactAndBroadSelectors(t *testing.T) {
+	store, err := NewStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	for _, event := range []Event{
+		{ID: "alert-a", Timestamp: base, Action: "scan-finding", Target: "skill://one", Severity: "HIGH", Connector: "codex"},
+		{ID: "alert-b", Timestamp: base.Add(time.Minute), Action: "scan-finding", Target: "skill://two", Severity: "LOW", Connector: "claudecode"},
+		{ID: "alert-c", Timestamp: base.Add(2 * time.Minute), Action: "scan-finding", Target: "skill://one", Severity: "HIGH", Connector: "codex"},
+	} {
+		if err := store.LogEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamp := base.Add(3 * time.Minute).Format(time.RFC3339Nano)
+	if _, err := store.db.Exec(`INSERT INTO alert_acknowledgement_projection (
+		alert_id, disposition, actor, disposition_at, projection_version,
+		source, source_event_id, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"alert-a", AlertDispositionAcknowledged, "test", stamp, 3,
+		"modern", "receipt-a", stamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	broad, err := store.SelectAlertAcknowledgementTargets(t.Context(), AlertAcknowledgementSelector{
+		Connector: "CODEX", Target: "skill://one", Severity: "HIGH",
+		Since: base.Add(time.Minute), Before: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(broad) != 1 || broad[0].AlertID != "alert-c" || broad[0].ProjectionVersion != 0 {
+		t.Fatalf("broad targets=%+v", broad)
+	}
+
+	exact, err := store.SelectAlertAcknowledgementTargets(t.Context(), AlertAcknowledgementSelector{
+		AlertIDs: []string{"missing", "alert-c", "alert-a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exact) != 2 || exact[0].AlertID != "alert-a" || exact[0].ProjectionVersion != 3 ||
+		exact[1].AlertID != "alert-c" || exact[1].ProjectionVersion != 0 {
+		t.Fatalf("exact targets=%+v", exact)
+	}
+
+	injected, err := store.SelectAlertAcknowledgementTargets(t.Context(), AlertAcknowledgementSelector{
+		Target: "skill://one' OR 1=1 --", Severity: "HIGH",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(injected) != 0 {
+		t.Fatalf("selector value changed SQL semantics: %+v", injected)
+	}
+}
+
+func TestAlertAcknowledgementTargetsMatchVisibleCanonicalAndLegacyAlerts(t *testing.T) {
+	store, err := NewStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO audit_events (
+		id, timestamp, action, actor, details, severity, bucket, event_name,
+		payload_json, enforced
+	) VALUES
+		('canonical-deny', '2026-07-17T12:00:00Z', 'enforcement', 'gateway', '',
+		 'INFO', 'enforcement.action', 'action.applied',
+		 '{"defenseclaw.enforcement.effective_action":"deny"}', NULL),
+		('blank-severity-deny', '2026-07-17T12:00:00.5Z', 'enforcement', 'gateway', '',
+		 '', 'enforcement.action', 'action.applied',
+		 '{"defenseclaw.enforcement.effective_action":"deny"}', NULL),
+		('canonical-egress', '2026-07-17T12:00:01Z', 'egress', 'gateway', '',
+		 'INFO', 'network.egress', 'egress.decided',
+		 '{"defenseclaw.network.decision":"block"}', NULL),
+		('health-error', '2026-07-17T12:00:02Z', 'sink-failure', 'gateway', '',
+		 'ERROR', 'platform.health', 'destination.export_failed', '{}', NULL),
+		('canonical-allow', '2026-07-17T12:00:03Z', 'enforcement', 'gateway', '',
+		 'INFO', 'enforcement.action', 'action.applied',
+		 '{"defenseclaw.enforcement.effective_action":"allow"}', NULL),
+		('detection-only', '2026-07-17T12:00:04Z', 'scan-finding', 'scanner', '',
+		 'HIGH', 'security.finding', 'finding.observed',
+		 '{"defenseclaw.finding.tags":["secret","detection-only"]}', NULL),
+		('malformed-finding', '2026-07-17T12:00:04.5Z', 'scan-finding', 'scanner', '',
+		 'HIGH', 'security.finding', 'finding.observed', '{not-json', NULL),
+		('legacy-block', '2026-07-17T12:00:05Z', 'connector-hook', 'gateway',
+		 'connector=codex action=block mode=action severity=INFO',
+		 'INFO', NULL, NULL, NULL, 0),
+		('legacy-clean-high', '2026-07-17T12:00:06Z', 'connector-hook', 'gateway',
+		 'connector=codex action=allow mode=observe severity=CRITICAL',
+		 'CRITICAL', NULL, NULL, NULL, 0),
+		('legacy-unrelated-high', '2026-07-17T12:00:07Z', 'sidecar-start', 'gateway',
+		 'healthy', 'HIGH', NULL, NULL, NULL, NULL)`); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]bool{
+		"blank-severity-deny": true,
+		"canonical-deny":      true,
+		"canonical-egress":    true,
+		"health-error":        true,
+		"malformed-finding":   true,
+		"legacy-block":        true,
+	}
+	exact, err := store.SelectAlertAcknowledgementTargets(t.Context(), AlertAcknowledgementSelector{
+		AlertIDs: []string{
+			"blank-severity-deny", "canonical-deny", "canonical-egress", "health-error", "canonical-allow",
+			"detection-only", "malformed-finding", "legacy-block", "legacy-clean-high",
+			"legacy-unrelated-high",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exact) != len(want) {
+		t.Fatalf("exact targets=%+v", exact)
+	}
+	for _, target := range exact {
+		if !want[target.AlertID] {
+			t.Fatalf("unexpected exact target=%+v", target)
+		}
+	}
+
+	broad, err := store.SelectAlertAcknowledgementTargets(t.Context(), AlertAcknowledgementSelector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(broad) != len(want) {
+		t.Fatalf("broad targets=%+v", broad)
+	}
+	for _, target := range broad {
+		if !want[target.AlertID] {
+			t.Fatalf("unexpected broad target=%+v", target)
+		}
+	}
+
+	high, err := store.SelectAlertAcknowledgementTargets(t.Context(), AlertAcknowledgementSelector{
+		Severity: " high ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(high) != 4 || high[0].AlertID != "blank-severity-deny" ||
+		high[1].AlertID != "canonical-deny" || high[2].AlertID != "legacy-block" ||
+		high[3].AlertID != "malformed-finding" {
+		t.Fatalf("HIGH targets=%+v", high)
+	}
+	all, err := store.SelectAlertAcknowledgementTargets(t.Context(), AlertAcknowledgementSelector{
+		Severity: " ALL ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != len(want) {
+		t.Fatalf("ALL targets=%+v", all)
+	}
+	counts, err := store.GetCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Alerts != 5 {
+		t.Fatalf("actionable alert count=%d, want blank-severity deny promoted into 5 total", counts.Alerts)
+	}
+
+}
+
+func TestMigrationFromFreshDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	wantTables := []string{
+		"actions",
+		"audit_events",
+		"findings",
+		"network_egress_events",
+		"scan_results",
+		"schema_version",
+		"target_snapshots",
+	}
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open verify: %v", err)
+	}
+	defer verifyDB.Close()
+
+	for _, name := range wantTables {
+		var n int
+		err := verifyDB.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name,
+		).Scan(&n)
+		if err != nil {
+			t.Fatalf("table %q lookup: %v", name, err)
+		}
+		if n != 1 {
+			t.Errorf("table %q: want 1 match in sqlite_master, got %d", name, n)
+		}
+	}
+
+	want := len(migrations)
+	got, err := store.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if got != want {
+		t.Errorf("SchemaVersion() = %d, want %d", got, want)
+	}
+
+	ok, err := store.hasColumn("audit_events", "run_id")
+	if err != nil {
+		t.Fatalf("hasColumn(audit_events, run_id): %v", err)
+	}
+	if !ok {
+		t.Errorf("hasColumn(audit_events, run_id) = false, want true")
+	}
+}
+
+func TestMigrationFromV1Schema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit-v1.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(legacySchemaWithoutRunID); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE schema_version (
+			version INTEGER PRIMARY KEY,
+			applied_at DATETIME NOT NULL
+		);
+		INSERT INTO schema_version (version, applied_at) VALUES (1, '2020-01-01T00:00:00Z');
+	`); err != nil {
+		t.Fatalf("create schema_version v1: %v", err)
+	}
+	_ = db.Close()
+
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	want := len(migrations)
+	got, err := store.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if got != want {
+		t.Errorf("SchemaVersion() = %d, want %d", got, want)
+	}
+
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open verify: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var rowCount int
+	if err := verifyDB.QueryRow(`SELECT COUNT(*) FROM schema_version`).Scan(&rowCount); err != nil {
+		t.Fatalf("COUNT schema_version: %v", err)
+	}
+	if rowCount != want {
+		t.Errorf("schema_version rows = %d, want %d (v1 pre-seeded + migration %d only)", rowCount, want, want)
+	}
+
+	ok, err := store.hasColumn("audit_events", "run_id")
+	if err != nil {
+		t.Fatalf("hasColumn(audit_events, run_id): %v", err)
+	}
+	if !ok {
+		t.Errorf("hasColumn(audit_events, run_id) = false, want true after migration 2 only")
+	}
+}
+
+func TestMigrationTransactional(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("second connection sql.Open: %v", err)
+	}
+	defer verifyDB.Close()
+
+	rows, err := verifyDB.Query(`SELECT version FROM schema_version ORDER BY version`)
+	if err != nil {
+		t.Fatalf("query schema_version: %v", err)
+	}
+	defer rows.Close()
+
+	var versions []int
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("scan version: %v", err)
+		}
+		versions = append(versions, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	if len(versions) != len(migrations) {
+		t.Fatalf("schema_version rows = %d, want %d (len(migrations))", len(versions), len(migrations))
+	}
+	for i, v := range versions {
+		want := i + 1
+		if v != want {
+			t.Fatalf("schema_version[%d] = %d, want consecutive starting at 1 (got %d)", i, v, want)
+		}
+	}
+
+	for _, v := range versions {
+		var n int
+		if err := verifyDB.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_events'`,
+		).Scan(&n); err != nil {
+			t.Fatalf("audit_events table check: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("version %d recorded but audit_events table missing or duplicate", v)
+		}
+		if v >= 2 {
+			ok, err := store.hasColumn("audit_events", "run_id")
+			if err != nil {
+				t.Fatalf("hasColumn after version %d: %v", v, err)
+			}
+			if !ok {
+				t.Errorf("version %d in schema_version but audit_events.run_id missing (migration not atomic with version bump)", v)
+			}
+		}
+	}
+}
+
+func TestMigrationApplyUsesTransaction(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	wantCount := len(migrations)
+	var rowCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM schema_version`).Scan(&rowCount); err != nil {
+		t.Fatalf("COUNT schema_version: %v", err)
+	}
+	if rowCount != wantCount {
+		t.Fatalf("schema_version rows = %d, want %d", rowCount, wantCount)
+	}
+
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer rawDB.Close()
+
+	ok, err := store.hasColumn("audit_events", "run_id")
+	if err != nil {
+		t.Fatalf("hasColumn(audit_events, run_id): %v", err)
+	}
+	if !ok {
+		t.Fatal("expected audit_events.run_id after migration 2")
+	}
+
+	var v1, v2 int
+	if err := rawDB.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE version = 1`).Scan(&v1); err != nil {
+		t.Fatalf("count version 1: %v", err)
+	}
+	if err := rawDB.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE version = 2`).Scan(&v2); err != nil {
+		t.Fatalf("count version 2: %v", err)
+	}
+	if wantCount >= 1 && v1 != 1 {
+		t.Errorf("version 1 rows = %d, want 1", v1)
+	}
+	if wantCount >= 2 && v2 != 1 {
+		t.Errorf("version 2 rows = %d, want 1", v2)
+	}
+}
+
+func TestTargetSnapshotScannerFingerprintColumn(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	ok, err := store.hasColumn("target_snapshots", "scanner_fingerprint")
+	if err != nil {
+		t.Fatalf("hasColumn(target_snapshots, scanner_fingerprint): %v", err)
+	}
+	if !ok {
+		t.Fatal("expected target_snapshots.scanner_fingerprint after migration")
+	}
+
+	// An empty fingerprint round-trips as "" (the column default).
+	if err := store.SetTargetSnapshot("skill", "/p/a", "ch", "{}", "{}", "[]", "scan-1", ""); err != nil {
+		t.Fatalf("SetTargetSnapshot: %v", err)
+	}
+	row, err := store.GetTargetSnapshot("skill", "/p/a")
+	if err != nil {
+		t.Fatalf("GetTargetSnapshot: %v", err)
+	}
+	if row.ScannerFingerprint != "" {
+		t.Errorf("ScannerFingerprint = %q, want empty", row.ScannerFingerprint)
+	}
+
+	// A non-empty fingerprint persists and is updated on upsert.
+	if err := store.SetTargetSnapshot("skill", "/p/a", "ch2", "{}", "{}", "[]", "scan-2", "fp-abc"); err != nil {
+		t.Fatalf("SetTargetSnapshot upsert: %v", err)
+	}
+	row, err = store.GetTargetSnapshot("skill", "/p/a")
+	if err != nil {
+		t.Fatalf("GetTargetSnapshot after upsert: %v", err)
+	}
+	if row.ScannerFingerprint != "fp-abc" {
+		t.Errorf("ScannerFingerprint = %q, want fp-abc", row.ScannerFingerprint)
+	}
+	if row.ScanID != "scan-2" {
+		t.Errorf("ScanID = %q, want scan-2", row.ScanID)
+	}
+}

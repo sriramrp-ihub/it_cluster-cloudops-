@@ -1,0 +1,166 @@
+# DefenseClaw local observability stack.
+#
+# Brings up a full OTLP pipeline on loopback so the sidecar can be
+# pointed at 127.0.0.1:4317 (gRPC) / 127.0.0.1:4318 (HTTP) and have
+# every span / metric / log land in Tempo / Prometheus / Loki, all
+# queryable from a pre-provisioned Grafana at http://localhost:3000.
+#
+# Usage:
+#   # Preferred — boots the stack, waits for readiness, and wires
+#   # ~/.defenseclaw/config.yaml to point at the local collector:
+#   defenseclaw setup local-observability up
+#
+#   # Manual compose access (no CLI side-effects on config.yaml):
+#   cd bundles/local_observability_stack
+#   docker compose up -d
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+#     DEFENSECLAW_TELEMETRY_ENABLED=1 \
+#     go run ./cmd/defenseclaw gateway
+#
+# Ports (host, bound to 127.0.0.1 by default):
+#   4317 / 4318 — OTel Collector OTLP receivers
+#   3000        — Grafana UI (login: admin / admin)
+#   3100        — Loki HTTP (scraped by Grafana)
+#   3200        — Tempo HTTP
+#   9090        — Prometheus UI
+#   8888        — Collector self-metrics
+#
+# SECURITY: all host-side port publishes default to the loopback interface
+# (127.0.0.1) so a developer laptop joining a coffee-shop Wi-Fi does not
+# accidentally expose Grafana/Prometheus/Tempo to the LAN. The managed
+# `defenseclaw setup` path always removes inherited HOST_BIND values. Operators
+# who intentionally need a different bind must use the manual Compose procedure
+# documented in README.md and secure the exposed services independently.
+#
+# Teardown drops everything including persisted data volumes:
+#   docker compose down -v
+
+name: defenseclaw-observability
+
+networks:
+  defenseclaw-o11y:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:
+
+services:
+  otel-collector:
+    # v0.111.0 can panic while Prometheus scrapes the Collector's own
+    # metrics after the spanmetrics connector registers callbacks. Keep this
+    # pinned to a tested release so the metrics pipeline does not restart on
+    # every scrape and reset Agent360 counters.
+    image: otel/opentelemetry-collector-contrib:0.153.0
+    container_name: defenseclaw-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:4317:4317"   # OTLP gRPC (traces, metrics, logs)
+      - "${HOST_BIND:-127.0.0.1}:4318:4318"   # OTLP HTTP
+      - "${HOST_BIND:-127.0.0.1}:8888:8888"   # Collector telemetry
+      - "${HOST_BIND:-127.0.0.1}:13133:13133" # health check extension
+    networks:
+      - defenseclaw-o11y
+    depends_on:
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: defenseclaw-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+      # Developer-laptop stack, published on loopback only (see ports below).
+      # The admin + remote-write APIs are convenient for local work (purge
+      # stale series after a histogram-bucket change, push test data) and the
+      # 127.0.0.1 bind keeps them off the network. Drop these flags if you
+      # ever publish 9090 through the documented manual Compose override.
+      - "--web.enable-admin-api"
+      - "--web.enable-remote-write-receiver"
+      - "--enable-feature=exemplar-storage,native-histograms"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:9090:9090"
+    networks:
+      - defenseclaw-o11y
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: defenseclaw-loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:3100:3100"
+    networks:
+      - defenseclaw-o11y
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.0
+    container_name: defenseclaw-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:3200:3200" # tempo HTTP
+      - "${HOST_BIND:-127.0.0.1}:9095:9095" # tempo gRPC (internal)
+    networks:
+      - defenseclaw-o11y
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: defenseclaw-grafana
+    environment:
+      # This is a developer-laptop stack: every host port is published on
+      # ${HOST_BIND:-127.0.0.1} (loopback by default), so the dashboard is only
+      # reachable from the same machine. A login prompt on a localhost-only
+      # dashboard is pure friction, so Grafana opens with no login —
+      # anonymous access with the Admin role and the login form disabled.
+      # The loopback bind is the security boundary here. If you expose this
+      # through the documented manual override, turn auth back on: set
+      # GF_AUTH_ANONYMOUS_ENABLED=false and GF_SECURITY_ADMIN_PASSWORD=<pw>.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      # Layered Node Graph layout keeps causal agent DAGs readable. The graph
+      # falls back to Grafana's force layout above its supported node limit.
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor,nodeGraphDotLayout
+      - GF_USERS_DEFAULT_THEME=dark
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:3000:3000"
+    networks:
+      - defenseclaw-o11y
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped

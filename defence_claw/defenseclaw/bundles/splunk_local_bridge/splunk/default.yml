@@ -1,0 +1,77 @@
+---
+ansible_post_tasks:
+  - file:///opt/splunk-claw-bridge/splunk/ansible/configure_product_telemetry.yml
+  - file:///opt/splunk-claw-bridge/splunk/ansible/sync_security_ops_support_layer.yml
+
+splunk:
+  role: splunk_standalone
+  admin_user: admin
+  http_port: 8000
+  apps_location:
+    - file:///opt/splunk-claw-bridge/splunk/build/defenseclaw_local_mode.tgz
+  hec:
+    enable: true
+    ssl: true
+    port: 8088
+    token: "{{ lookup('env', 'SPLUNK_HEC_TOKEN') }}"
+  app_paths:
+    httpinput: /opt/splunk/etc/apps/splunk_httpinput
+  conf:
+    - key: indexes
+      value:
+        directory: /opt/splunk/etc/system/local
+        content:
+          defenseclaw_local:
+            homePath: $SPLUNK_DB/defenseclaw_local/db
+            coldPath: $SPLUNK_DB/defenseclaw_local/colddb
+            thawedPath: $SPLUNK_DB/defenseclaw_local/thaweddb
+            frozenTimePeriodInSecs: 5184000
+            maxTotalDataSizeMB: 30720
+    - key: inputs
+      value:
+        directory: /opt/splunk/etc/apps/splunk_httpinput/local
+        content:
+          http:
+            disabled: 0
+            maxSockets: 8
+            maxThreads: 4
+          http://splunk_hec_token:
+            disabled: 0
+            token: "{{ lookup('env', 'SPLUNK_HEC_TOKEN') }}"
+            index: "{{ lookup('env', 'DEFENSECLAW_INDEX') }}"
+            sourcetype: "{{ lookup('env', 'DEFENSECLAW_SOURCETYPE') }}"
+            source: "{{ lookup('env', 'DEFENSECLAW_SOURCE') }}"
+    - key: outputs
+      value:
+        directory: /opt/splunk/etc/system/local
+        content:
+          tcpout:
+            disabled: true
+    - key: server
+      value:
+        directory: /opt/splunk/etc/system/local
+        content:
+          general:
+            allowRemoteLogin: always
+          kvstore:
+            disabled: true
+          diskUsage:
+            minFreeSpace: 500
+    - key: limits
+      value:
+        directory: /opt/splunk/etc/system/local
+        content:
+          search:
+            total_search_concurrency_limit: 2
+            max_rt_search_multiplier: 0
+          scheduler:
+            max_searches_perc: 25
+            saved_searches_disabled: false
+    - key: global-banner
+      value:
+        directory: /opt/splunk/etc/system/local
+        content:
+          BANNER_MESSAGE_SINGLETON:
+            global_banner.visible: "true"
+            global_banner.message: Built specifically for DefenseClaw local developer workflows. Starts in Splunk Free mode from day 1. Unsupported. No supported upgrade or migration experience. Use only for local development, testing, and investigation.
+            global_banner.background_color: orange

@@ -1,0 +1,1024 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Central credential registry.
+
+Single source of truth for every environment variable DefenseClaw reads.
+Each entry has a predicate that classifies it against the *current*
+``Config`` — so a key the operator hasn't opted into is reported as
+``NOT_USED`` rather than pestered as missing.
+
+Consumed by:
+
+* ``defenseclaw keys`` (list / set / fill-missing)
+* ``defenseclaw quickstart`` (post-install summary)
+* ``defenseclaw doctor`` (credentials section, replaces bespoke probes
+  with a data-driven loop)
+
+Keep this file free of heavy imports so importing ``credentials`` has
+no side effects — it's loaded on every CLI invocation.
+"""
+
+from __future__ import annotations
+
+import enum
+import os
+from collections.abc import Callable, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+
+from defenseclaw import credential_provenance
+
+if TYPE_CHECKING:
+    from defenseclaw.config import Config
+
+
+class Requirement(str, enum.Enum):
+    """How critical a credential is *given the current config*.
+
+    Using an ``Enum`` with a ``str`` mixin keeps serialization in JSON
+    output trivial (``json.dumps`` handles str subclasses natively) while
+    still giving us typed comparisons.
+    """
+
+    REQUIRED = "REQUIRED"   # Feature is enabled and the key is mandatory.
+    OPTIONAL = "OPTIONAL"   # Feature is enabled but the key is optional.
+    NOT_USED = "NOT_USED"   # Feature is off — key is irrelevant right now.
+
+
+@dataclass(frozen=True)
+class CredentialSpec:
+    """Declarative entry describing one credential we know about.
+
+    ``env_name`` is the *canonical* name used when the operator has
+    not overridden it via a ``*_env`` field in config. When
+    ``effective_env_name`` is provided, it's consulted at classify
+    time and, if it returns a non-empty string, takes precedence.
+    This lets the registry track the real env var the user wired up
+    (e.g. ``MY_CUSTOM_JUDGE_KEY``) instead of pretending the canonical
+    one is expected.
+
+    ``bound_endpoint`` lets the registry attach the URL/host the
+    credential is paired with in ``config.yaml`` (e.g. AI Defense
+    region endpoint, Splunk HEC URL, judge LLM base URL). UX layers
+    (``keys set`` / ``keys fill-missing`` / doctor) can then render a
+    "↪ bound to <url>" hint right after the secret is saved or
+    probed, which is the primary signal an operator gets that a
+    fresh key is being paired with the wrong region/host. Returns
+    ``""`` when the credential has no paired endpoint or when the
+    config doesn't expose one.
+    """
+
+    env_name: str
+    feature: str
+    description: str
+    required: Callable[[Config], Requirement]
+    auto_detected: bool = False
+    effective_env_name: Callable[[Config], str] | None = None
+    bound_endpoint: Callable[[Config], str] | None = None
+
+    def resolve_env_name(self, cfg: Config) -> str:
+        """Return the env var name currently in effect for *cfg*."""
+        if self.effective_env_name is not None:
+            override = self.effective_env_name(cfg)
+            if override:
+                return override
+        return self.env_name
+
+    def resolve_bound_endpoint(self, cfg: Config) -> str:
+        """Return the paired endpoint URL/host for *cfg*, or ``""``.
+
+        Never raises — UX callers depend on a stable empty-string
+        sentinel so they can branch on truthiness without try/except.
+        """
+        if self.bound_endpoint is None:
+            return ""
+        try:
+            return self.bound_endpoint(cfg) or ""
+        except Exception:
+            return ""
+
+
+# ---------------------------------------------------------------------------
+# Predicates
+# ---------------------------------------------------------------------------
+#
+# Predicates are intentionally small and self-contained so they can be
+# unit-tested without a full ``Config`` fixture. They each take a
+# ``Config`` (positional) and return a ``Requirement``.
+#
+# Convention: when a feature is *disabled* we return ``NOT_USED``, never
+# ``OPTIONAL``. ``OPTIONAL`` is reserved for "feature is on and this key
+# would add capability but the operator can run without it".
+
+
+def _connector_name(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "")
+
+
+def _openclaw_gateway_token(cfg: Config) -> Requirement:
+    guardrail = getattr(cfg, "guardrail", None)
+    connectors = getattr(guardrail, "connectors", {}) if guardrail is not None else {}
+    if isinstance(connectors, dict) and connectors:
+        return (
+            Requirement.REQUIRED
+            if any(_connector_name(name) == "openclaw" for name in connectors)
+            else Requirement.NOT_USED
+        )
+
+    guardrail_connector = getattr(guardrail, "connector", "") if guardrail is not None else ""
+    if str(guardrail_connector or "").strip():
+        return Requirement.REQUIRED if _connector_name(guardrail_connector) == "openclaw" else Requirement.NOT_USED
+
+    claw = getattr(cfg, "claw", None)
+    claw_mode = getattr(claw, "mode", "")
+    if str(claw_mode or "").strip():
+        return Requirement.REQUIRED if _connector_name(claw_mode) == "openclaw" else Requirement.NOT_USED
+
+    # Old configs defaulted to OpenClaw when no connector was specified.
+    # We auto-detect it from ~/.openclaw/openclaw.json when available,
+    # but it is still required — "REQUIRED but auto-detected" is shown
+    # in the keys list UX as a friendly hint.
+    return Requirement.REQUIRED
+
+
+def _any_llm_component_uses_default_key(cfg: Config) -> bool:
+    """Return True when any enabled LLM-using component would fall back
+    to ``DEFENSECLAW_LLM_KEY`` and isn't a local (no-key) provider.
+
+    Mirrors the resolver logic in :meth:`Config.resolve_llm`: a component
+    that has its own ``llm.api_key_env`` override is classified under
+    that env var instead. Local providers (ollama/vllm/lm_studio) don't
+    need a key, so we skip them even if the component is on.
+    """
+    def needs_key(path: str) -> bool:
+        r = cfg.resolve_llm(path)
+        if r.is_local_provider() or r.provider_prefix() == "bedrock":
+            return False
+        # If the resolved api_key_env is empty, the component falls back
+        # to DEFENSECLAW_LLM_KEY — so this IS the canonical env var that
+        # must be set. If it's non-empty, the operator pointed at a
+        # different env var (handled by the judge/inspect entries below).
+        return not r.api_key_env or r.api_key_env == "DEFENSECLAW_LLM_KEY"
+
+    gc = getattr(cfg, "guardrail", None)
+    if gc is not None and getattr(gc, "enabled", False):
+        if _guardrail_proxy_uses_llm(cfg) and needs_key("guardrail"):
+            return True
+        judge = getattr(gc, "judge", None)
+        if judge is not None and getattr(judge, "enabled", False) and needs_key("guardrail.judge"):
+            return True
+    sc = getattr(cfg, "scanners", None)
+    if sc is not None:
+        ss = getattr(sc, "skill_scanner", None)
+        # Skill and plugin scan commands use their resolved model as the
+        # default-on signal. Surface the missing key in Setup/Keys before the
+        # operator encounters a scan-time skip warning.
+        if ss is not None:
+            skill_llm = cfg.resolve_llm("scanners.skill")
+            if (
+                getattr(ss, "use_llm", False) or skill_llm.model
+            ) and needs_key("scanners.skill"):
+                return True
+        plugin_llm = cfg.resolve_llm("scanners.plugin")
+        if plugin_llm.model and needs_key("scanners.plugin"):
+            return True
+        ms = getattr(sc, "mcp_scanner", None)
+        if ms is not None:
+            analyzers = str(getattr(ms, "analyzers", "auto") or "").lower()
+            selected = {item.strip() for item in analyzers.split(",") if item.strip()}
+            mcp_llm = cfg.resolve_llm("scanners.mcp")
+            uses_llm = not selected or "llm" in selected or "auto" in selected
+            if mcp_llm.model and uses_llm and needs_key("scanners.mcp"):
+                return True
+    return False
+
+
+_HOOK_POLICY_ONLY_CONNECTORS = frozenset(
+    {
+        "codex",
+        "claudecode",
+        "hermes",
+        "cursor",
+        "windsurf",
+        "geminicli",
+        "copilot",
+        "openhands",
+        "antigravity",
+        "opencode",
+        "amp",
+        "omnigent",
+    }
+)
+
+
+def _guardrail_proxy_uses_llm(cfg: Config) -> bool:
+    """Whether any enabled connector sends LLM traffic through the proxy."""
+    gc = getattr(cfg, "guardrail", None)
+    connectors = getattr(gc, "connectors", {}) if gc is not None else {}
+    if isinstance(connectors, dict) and connectors:
+        active: list[str] = []
+        for name, override in connectors.items():
+            if getattr(override, "enabled", None) is False:
+                continue
+            active.append(_connector_name(name))
+        if active:
+            return any(name not in _HOOK_POLICY_ONLY_CONNECTORS for name in active)
+
+    connector = _connector_name(getattr(gc, "connector", "") if gc is not None else "")
+    if not connector:
+        claw = getattr(cfg, "claw", None)
+        connector = _connector_name(getattr(claw, "mode", ""))
+    # An unconfigured legacy install historically defaults to OpenClaw.
+    return not connector or connector not in _HOOK_POLICY_ONLY_CONNECTORS
+
+
+def _defenseclaw_llm_key(cfg: Config) -> Requirement:
+    """DEFENSECLAW_LLM_KEY is the single canonical LLM env var. It's
+    REQUIRED whenever any LLM-using component would fall back to it
+    (i.e. no per-component override) and isn't a local provider.
+    """
+    if _any_llm_component_uses_default_key(cfg):
+        return Requirement.REQUIRED
+    # Surface it as OPTIONAL when the guardrail is on so operators see
+    # the knob exists even if every component has a custom override.
+    gc = getattr(cfg, "guardrail", None)
+    if gc is not None and getattr(gc, "enabled", False):
+        return Requirement.OPTIONAL
+    return Requirement.NOT_USED
+
+
+def _judge_api_key(cfg: Config) -> Requirement:
+    gc = getattr(cfg, "guardrail", None)
+    if gc is None or not gc.enabled:
+        return Requirement.NOT_USED
+    judge = getattr(gc, "judge", None)
+    if judge is None or not judge.enabled:
+        return Requirement.NOT_USED
+    # If the judge uses a local provider (e.g. ollama) no key is needed.
+    if cfg.resolve_llm("guardrail.judge").is_local_provider():
+        return Requirement.NOT_USED
+    # If the judge falls back to DEFENSECLAW_LLM_KEY, that top-level
+    # entry covers it — this spec tracks only the *custom* override.
+    r = cfg.resolve_llm("guardrail.judge")
+    if not r.api_key_env or r.api_key_env == "DEFENSECLAW_LLM_KEY":
+        return Requirement.NOT_USED
+    return Requirement.REQUIRED
+
+
+def _cisco_ai_defense_key(cfg: Config) -> Requirement:
+    gc = getattr(cfg, "guardrail", None)
+    if gc is None or not gc.enabled:
+        return Requirement.NOT_USED
+    # The guardrail has three scanner modes (local | remote | both).
+    # Remote and both send traffic to Cisco AI Defense, so the key is
+    # required; local-only mode doesn't touch it.
+    if gc.scanner_mode in ("remote", "both"):
+        return Requirement.REQUIRED
+    return Requirement.NOT_USED
+
+
+def _virustotal_key(cfg: Config) -> Requirement:
+    sc = getattr(cfg, "scanners", None)
+    if sc is None:
+        return Requirement.NOT_USED
+    ss = getattr(sc, "skill_scanner", None)
+    if ss is None or not getattr(ss, "use_virustotal", False):
+        return Requirement.NOT_USED
+    return Requirement.REQUIRED
+
+
+@dataclass(frozen=True)
+class _ObservabilityCredentialRef:
+    """One enabled canonical-v8 destination environment reference."""
+
+    env_name: str
+    feature: str
+    endpoint: str
+
+
+_ObservabilityCredentialRefs = tuple[_ObservabilityCredentialRef, ...] | None
+_OBSERVABILITY_REF_CACHE: ContextVar[
+    dict[int, _ObservabilityCredentialRefs] | None
+] = ContextVar("credential_observability_ref_cache", default=None)
+
+
+def _header_env_reference(headers: object, name: str) -> str:
+    if not isinstance(headers, Mapping):
+        return ""
+    wanted = name.casefold()
+    for key, value in headers.items():
+        if str(key).casefold() != wanted or not isinstance(value, Mapping):
+            continue
+        env_name = value.get("env")
+        return str(env_name).strip() if isinstance(env_name, str) else ""
+    return ""
+
+
+def _credential_endpoint_authority(endpoint: str) -> str:
+    """Return only the display-safe scheme/host/port for a key binding.
+
+    The validated v8 source projection intentionally masks endpoint paths,
+    queries, and fragments because providers may embed credentials there.
+    Credential prompts need only the destination authority to catch a
+    region/host mismatch, so never propagate even the masked path marker.
+    """
+
+    value = str(endpoint or "").strip()
+    if not value or value in {"[REDACTED_URL]", "—"}:
+        return ""
+    has_scheme = "://" in value
+    try:
+        parsed = urlsplit(value if has_scheme else f"//{value}")
+        hostname = parsed.hostname
+        if not hostname:
+            return ""
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+    except (TypeError, ValueError):
+        return ""
+    return f"{parsed.scheme}://{host}" if has_scheme else host
+
+
+def _load_v8_observability_credential_refs(
+    cfg: Config,
+) -> _ObservabilityCredentialRefs:
+    """Return validated enabled destination refs, or ``None`` off the v8 path.
+
+    The legacy Python dataclass intentionally does not model the canonical v8
+    destination graph. Read the active source through the existing offline v8
+    validator instead of guessing from retired Splunk/OTel compatibility DTOs.
+    Validation retains environment-reference names while masking literal header
+    values and performs no secret resolution or network I/O.
+    """
+
+    if getattr(cfg, "_source_config_version", None) != 8:
+        return None
+    try:
+        from defenseclaw.config import config_path  # noqa: PLC0415
+        from defenseclaw.observability.v8_config import load_validate_v8  # noqa: PLC0415
+
+        path = config_path()
+        source = load_validate_v8(path.read_bytes(), source_name=str(path)).source
+    except (OSError, ValueError):
+        # Credential UX is advisory. The owning config validation/upgrade path
+        # reports malformed or unavailable source with its precise safe error.
+        return None
+
+    observability = source.get("observability")
+    destinations = observability.get("destinations") if isinstance(observability, Mapping) else None
+    if not isinstance(destinations, list):
+        return ()
+
+    refs: list[_ObservabilityCredentialRef] = []
+    seen: set[tuple[str, str]] = set()
+    for destination in destinations:
+        if not isinstance(destination, Mapping) or destination.get("enabled") is False:
+            continue
+        kind = str(destination.get("kind") or "").strip()
+        endpoint = _credential_endpoint_authority(
+            str(destination.get("endpoint") or "").strip()
+        )
+        candidates: list[tuple[str, str]] = []
+        if kind == "splunk_hec":
+            token_env = destination.get("token_env")
+            if isinstance(token_env, str) and token_env.strip():
+                candidates.append(("observability.splunk", token_env.strip()))
+        if kind == "otlp":
+            headers = destination.get("headers")
+            splunk_env = _header_env_reference(headers, "X-SF-Token")
+            if splunk_env:
+                candidates.append(("observability.splunk", splunk_env))
+            if str(destination.get("preset") or "").strip() == "galileo":
+                galileo_env = _header_env_reference(headers, "Galileo-API-Key")
+                if galileo_env:
+                    candidates.append(("observability.galileo", galileo_env))
+        for feature, env_name in candidates:
+            identity = (feature, env_name)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            refs.append(_ObservabilityCredentialRef(env_name, feature, endpoint))
+    return tuple(refs)
+
+
+def _v8_observability_credential_refs(
+    cfg: Config,
+) -> _ObservabilityCredentialRefs:
+    """Return v8 refs, memoized only for the active classification pass."""
+
+    cache = _OBSERVABILITY_REF_CACHE.get()
+    key = id(cfg)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    refs = _load_v8_observability_credential_refs(cfg)
+    if cache is not None:
+        # Membership, rather than truthiness, deliberately caches both the
+        # empty tuple and ``None`` fallback results.
+        cache[key] = refs
+    return refs
+
+
+def _v8_refs_for_feature(
+    cfg: Config,
+    feature: str,
+) -> tuple[_ObservabilityCredentialRef, ...] | None:
+    refs = _v8_observability_credential_refs(cfg)
+    if refs is None:
+        return None
+    return tuple(ref for ref in refs if ref.feature == feature)
+
+
+def _splunk_token(cfg: Config) -> Requirement:
+    refs = _v8_refs_for_feature(cfg, "observability.splunk")
+    if refs is not None:
+        return Requirement.REQUIRED if refs else Requirement.NOT_USED
+    # Upgrade/preview compatibility for callers still holding a v7 DTO.
+    sp = getattr(cfg, "splunk", None)
+    if sp is None or not getattr(sp, "enabled", False):
+        return Requirement.NOT_USED
+    return Requirement.REQUIRED
+
+
+def _galileo_key(cfg: Config) -> Requirement:
+    refs = _v8_refs_for_feature(cfg, "observability.galileo")
+    if refs is not None:
+        return Requirement.REQUIRED if refs else Requirement.NOT_USED
+    # Upgrade/preview compatibility for callers still holding a v7 DTO.
+    otel = getattr(cfg, "otel", None)
+    if not getattr(otel, "enabled", False):
+        return Requirement.NOT_USED
+    for destination in getattr(otel, "destinations", ()) or ():
+        if (
+            getattr(destination, "preset", "") == "galileo"
+            and getattr(destination, "enabled", False)
+        ):
+            return Requirement.REQUIRED
+    return Requirement.NOT_USED
+
+
+def _galileo_endpoint(cfg: Config) -> str:
+    refs = _v8_refs_for_feature(cfg, "observability.galileo")
+    if refs is not None:
+        return refs[0].endpoint if refs else ""
+    otel = getattr(cfg, "otel", None)
+    if not getattr(otel, "enabled", False):
+        return ""
+    for destination in getattr(otel, "destinations", ()) or ():
+        if (
+            getattr(destination, "preset", "") == "galileo"
+            and getattr(destination, "enabled", False)
+        ):
+            return str(getattr(destination, "endpoint", "") or "")
+    return ""
+
+
+def _inspect_llm_key(cfg: Config) -> Requirement:
+    """Tracks a *custom* skill-scanner LLM env var — only surfaces when
+    the operator has overridden ``scanners.skill_scanner.llm.api_key_env``
+    away from the default. The default DEFENSECLAW_LLM_KEY fallback is
+    handled by the top-level entry.
+    """
+    sc = getattr(cfg, "scanners", None)
+    if sc is None:
+        return Requirement.NOT_USED
+    ss = getattr(sc, "skill_scanner", None)
+    if ss is None or not getattr(ss, "use_llm", False):
+        return Requirement.NOT_USED
+    if cfg.resolve_llm("scanners.skill").is_local_provider():
+        return Requirement.NOT_USED
+    r = cfg.resolve_llm("scanners.skill")
+    if not r.api_key_env or r.api_key_env == "DEFENSECLAW_LLM_KEY":
+        return Requirement.NOT_USED
+    return Requirement.REQUIRED
+
+
+# --- effective env-name overrides ---
+#
+# These mirror the predicates and answer "what env var did the operator
+# actually configure?". Return "" to keep the canonical name.
+
+def _judge_env(cfg: Config) -> str:
+    # Prefer the resolved per-component env var so operators see the
+    # env var they actually wired up (not the canonical default when no
+    # override is set — that case is reported by the top-level
+    # DEFENSECLAW_LLM_KEY entry, so we return the canonical name here).
+    return cfg.resolve_llm("guardrail.judge").api_key_env
+
+
+def _cisco_env(cfg: Config) -> str:
+    cad = getattr(cfg, "cisco_ai_defense", None)
+    return cad.api_key_env if cad is not None else ""
+
+
+def _cisco_endpoint(cfg: Config) -> str:
+    """Return the configured AI Defense region endpoint.
+
+    The single biggest source of "valid key looks invalid" reports is
+    a key issued for one regional deployment (us / eu / preview)
+    pasted into a config pointed at another. All three regions reply
+    with the same opaque ``401 invalid api key`` body, so the caller
+    can't tell auth from regional mismatch by status alone — the
+    only durable signal is "here's the URL we're sending it to".
+    """
+    cad = getattr(cfg, "cisco_ai_defense", None)
+    return getattr(cad, "endpoint", "") if cad is not None else ""
+
+
+def _virustotal_env(cfg: Config) -> str:
+    sc = getattr(cfg, "scanners", None)
+    if sc is None:
+        return ""
+    ss = getattr(sc, "skill_scanner", None)
+    return getattr(ss, "virustotal_api_key_env", "") or ""
+
+
+def _splunk_env(cfg: Config) -> str:
+    refs = _v8_refs_for_feature(cfg, "observability.splunk")
+    if refs is not None:
+        return refs[0].env_name if refs else ""
+    sp = getattr(cfg, "splunk", None)
+    return getattr(sp, "hec_token_env", "") if sp is not None else ""
+
+
+def _galileo_env(cfg: Config) -> str:
+    refs = _v8_refs_for_feature(cfg, "observability.galileo")
+    if refs is not None:
+        return refs[0].env_name if refs else ""
+    return ""
+
+
+def _inspect_llm_env(cfg: Config) -> str:
+    return cfg.resolve_llm("scanners.skill").api_key_env
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+# Registry ordering matters: DEFENSECLAW_LLM_KEY comes first so the
+# `defenseclaw keys list` / `quickstart` UX shows the single knob
+# operators most often need to set. The JUDGE_API_KEY / SKILL_SCANNER_LLM
+# entries below fire only when the operator has configured a *custom*
+# per-component env-var override (via ``llm.api_key_env`` in
+# ``guardrail.judge`` / ``scanners.skill_scanner``). Provider-specific
+# keys (``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / etc.) are NOT
+# tracked here: DefenseClaw routes all LLM traffic through Bifrost
+# (gateway) and LiteLLM (scanners), both of which derive the provider-
+# specific env var from the unified ``DEFENSECLAW_LLM_KEY`` + model
+# prefix. See ``cli/defenseclaw/scanner/_llm_env.py`` for the mapping.
+CREDENTIALS: tuple[CredentialSpec, ...] = (
+    CredentialSpec(
+        env_name="DEFENSECLAW_LLM_KEY",
+        feature="llm.default",
+        description=(
+            "Canonical LLM API key used by the guardrail upstream, LLM "
+            "judge, MCP/skill/plugin scanners. Override per-component "
+            "with a component-specific llm.api_key_env."
+        ),
+        required=_defenseclaw_llm_key,
+    ),
+    CredentialSpec(
+        env_name="OPENCLAW_GATEWAY_TOKEN",
+        feature="gateway",
+        description="Auth token for the OpenClaw gateway; auto-detected from ~/.openclaw/openclaw.json",
+        required=_openclaw_gateway_token,
+        auto_detected=True,
+    ),
+    CredentialSpec(
+        env_name="JUDGE_API_KEY",
+        feature="guardrail.judge",
+        description=(
+            "Custom LLM Judge key — only tracked when "
+            "guardrail.judge.llm.api_key_env overrides DEFENSECLAW_LLM_KEY."
+        ),
+        required=_judge_api_key,
+        effective_env_name=_judge_env,
+    ),
+    CredentialSpec(
+        env_name="CISCO_AI_DEFENSE_API_KEY",
+        feature="guardrail.remote",
+        description="API key for Cisco AI Defense remote scanner (scanner_mode=remote|both)",
+        required=_cisco_ai_defense_key,
+        effective_env_name=_cisco_env,
+        bound_endpoint=_cisco_endpoint,
+    ),
+    CredentialSpec(
+        env_name="VIRUSTOTAL_API_KEY",
+        feature="skill-scanner.virustotal",
+        description="VirusTotal API key (skill-scanner --use-virustotal)",
+        required=_virustotal_key,
+        effective_env_name=_virustotal_env,
+    ),
+    CredentialSpec(
+        env_name="SPLUNK_ACCESS_TOKEN",
+        feature="observability.splunk",
+        description="Token referenced by an enabled canonical Splunk destination",
+        required=_splunk_token,
+        effective_env_name=_splunk_env,
+    ),
+    CredentialSpec(
+        env_name="GALILEO_API_KEY",
+        feature="observability.galileo",
+        description="Galileo API key for OTLP trace export",
+        required=_galileo_key,
+        effective_env_name=_galileo_env,
+        bound_endpoint=_galileo_endpoint,
+    ),
+    CredentialSpec(
+        env_name="DEFENSECLAW_SKILL_SCANNER_LLM_KEY",
+        feature="skill-scanner.llm",
+        description=(
+            "Custom skill-scanner LLM key — only tracked when "
+            "scanners.skill_scanner.llm.api_key_env overrides DEFENSECLAW_LLM_KEY."
+        ),
+        required=_inspect_llm_key,
+        effective_env_name=_inspect_llm_env,
+    ),
+)
+
+
+# Map for fast lookup by env name — used by ``keys set`` and doctor.
+_BY_NAME: dict[str, CredentialSpec] = {spec.env_name: spec for spec in CREDENTIALS}
+
+
+def lookup(env_name: str) -> CredentialSpec | None:
+    """Return the registered spec for *env_name*, or None if unknown."""
+    return _BY_NAME.get(env_name)
+
+
+# ---------------------------------------------------------------------------
+# Canonical-v8 observability credential discovery
+# ---------------------------------------------------------------------------
+
+
+def _observability_ref_predicate(
+    feature: str,
+    env_name: str,
+) -> Callable[[Config], Requirement]:
+    def _check(cfg: Config) -> Requirement:
+        refs = _v8_refs_for_feature(cfg, feature)
+        if refs is None:
+            return Requirement.NOT_USED
+        return (
+            Requirement.REQUIRED
+            if any(ref.env_name == env_name for ref in refs)
+            else Requirement.NOT_USED
+        )
+
+    return _check
+
+
+def _observability_ref_endpoint(
+    feature: str,
+    env_name: str,
+) -> Callable[[Config], str]:
+    def _resolve(cfg: Config) -> str:
+        refs = _v8_refs_for_feature(cfg, feature)
+        if refs is None:
+            return ""
+        for ref in refs:
+            if ref.env_name == env_name:
+                return ref.endpoint
+        return ""
+
+    return _resolve
+
+
+def discover_observability_credentials(cfg: Config) -> list[CredentialSpec]:
+    """Return runtime specs for every enabled v8 Splunk/Galileo env ref.
+
+    The first ref for each feature is represented by the stable static entry
+    above. Additional independently named destinations may use different
+    environment references, so append ad-hoc specs and let :func:`classify`
+    de-duplicate the first one by its resolved environment name.
+    """
+
+    refs = _v8_observability_credential_refs(cfg)
+    if refs is None:
+        return []
+    descriptions = {
+        "observability.splunk": "Token referenced by an enabled canonical Splunk destination",
+        "observability.galileo": "Galileo API key referenced by an enabled canonical OTLP destination",
+    }
+    return [
+        CredentialSpec(
+            env_name=ref.env_name,
+            feature=ref.feature,
+            description=descriptions[ref.feature],
+            required=_observability_ref_predicate(ref.feature, ref.env_name),
+            bound_endpoint=_observability_ref_endpoint(ref.feature, ref.env_name),
+        )
+        for ref in refs
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Custom-provider overlay env discovery
+# ---------------------------------------------------------------------------
+#
+# ``~/.defenseclaw/custom-providers.json`` lets operators declare an
+# arbitrary number of internal/self-hosted LLM endpoints, each with its
+# own ``env_keys`` list (e.g. ``ACME_INTERNAL_LLM_KEY``). Surfacing these
+# alongside the static CREDENTIALS table means ``defenseclaw keys list``
+# and ``doctor`` can pester the operator about them the same way they
+# pester about ``DEFENSECLAW_LLM_KEY`` — without us hard-coding every
+# custom env var.
+#
+# The check is best-effort: a missing overlay returns ``[]`` and a
+# malformed JSON file is silently ignored (the ``setup provider`` write
+# path raises hard on parse errors, so a corrupt overlay would have
+# been caught earlier).
+
+
+def _custom_provider_overlay_path(cfg: Config) -> str:
+    data_dir = getattr(cfg, "data_dir", "") or ""
+    if not data_dir:
+        return ""
+    return os.path.join(data_dir, "custom-providers.json")
+
+
+def _custom_provider_env_keys(cfg: Config) -> dict[str, str]:
+    """Return ``{ENV_VAR: provider_name}`` for every env_key declared in
+    the overlay. Order follows file order; provider names later in the
+    file win on duplicate env_key, which matches the merge semantics on
+    the Go side (last entry wins).
+    """
+    path = _custom_provider_overlay_path(cfg)
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        import json  # noqa: PLC0415
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, str] = {}
+    if not isinstance(data, dict):
+        return {}
+    providers = data.get("providers") or []
+    if not isinstance(providers, list):
+        return {}
+    for entry in providers:
+        if not isinstance(entry, dict):
+            continue
+        pname = str(entry.get("name") or "").strip()
+        keys = entry.get("env_keys") or []
+        if not isinstance(keys, list):
+            continue
+        for k in keys:
+            key = str(k or "").strip()
+            if not key:
+                continue
+            out[key] = pname
+    return out
+
+
+def _custom_provider_predicate(env_key: str) -> Callable[[Config], Requirement]:
+    """Build a predicate that marks *env_key* REQUIRED when the overlay
+    still references it AND some component resolves to a non-local
+    provider that would benefit from a key.
+
+    Conservative classification: we surface the env var as REQUIRED
+    only when the operator has wired the same env var into a resolved
+    ``llm.api_key_env`` somewhere. Otherwise it's OPTIONAL — the
+    overlay declared it, but no live config currently consumes it.
+    """
+
+    def _check(cfg: Config) -> Requirement:
+        overlay = _custom_provider_env_keys(cfg)
+        if env_key not in overlay:
+            return Requirement.NOT_USED
+        # Walk every resolve_llm-recognised role so an operator who
+        # pinned the overlay env_key at any layer (top-level llm,
+        # guardrail role, judge role, or per-scanner override) gets
+        # the env classified as REQUIRED. "openclaw" was previously
+        # included here but is not a real resolve_llm path — keeping
+        # it would have spammed `defenseclaw doctor` with a warning
+        # per invocation. The empty string targets cfg.llm verbatim.
+        for path in (
+            "",
+            "guardrail",
+            "guardrail.judge",
+            "scanners.skill",
+            "scanners.mcp",
+            "scanners.plugin",
+        ):
+            try:
+                r = cfg.resolve_llm(path)
+            except Exception:
+                continue
+            if (getattr(r, "api_key_env", "") or "").strip() == env_key:
+                return Requirement.REQUIRED
+        return Requirement.OPTIONAL
+
+    return _check
+
+
+def discover_custom_provider_credentials(cfg: Config) -> list[CredentialSpec]:
+    """Return ad-hoc :class:`CredentialSpec` entries for every env_key
+    declared in ``custom-providers.json``.
+
+    These are *runtime* specs — not part of the static ``CREDENTIALS``
+    tuple — because they depend on operator overlay state. ``classify``
+    composes them with the static registry; ``lookup`` will not return
+    them.
+
+    Skips env_keys already present in :data:`_BY_NAME` so the canonical
+    ``DEFENSECLAW_LLM_KEY`` entry continues to drive the predicate
+    logic (and we don't end up with two specs for the same name).
+    """
+    overlay = _custom_provider_env_keys(cfg)
+    if not overlay:
+        return []
+    out: list[CredentialSpec] = []
+    for env_key, provider_name in overlay.items():
+        if env_key in _BY_NAME:
+            continue
+        feature = f"llm.custom.{provider_name}" if provider_name else "llm.custom"
+        description = (
+            f"Custom-provider key declared in custom-providers.json "
+            f"({provider_name or 'unnamed'} → {env_key})."
+        )
+        out.append(
+            CredentialSpec(
+                env_name=env_key,
+                feature=feature,
+                description=description,
+                required=_custom_provider_predicate(env_key),
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Resolution helpers
+# ---------------------------------------------------------------------------
+#
+# We prefer to read the credential value without importing Click or
+# touching cmd_setup's private helpers — keeping this module leaf-level
+# makes it safe to import from anywhere. Implementation note: we peek
+# at ``~/.defenseclaw/.env`` in addition to ``os.environ`` because the
+# CLI process only ``_load_dotenv_into_os()``s after config load, so a
+# fresh ``keys list`` run prior to load won't see the .env-only keys
+# otherwise.
+
+
+def _parse_dotenv(path: str) -> dict[str, str]:
+    """Tiny, leaf-level .env reader with the same semantics as
+    ``cmd_setup._load_dotenv``. Duplicated on purpose so importing
+    ``credentials`` doesn't drag in the whole setup module.
+    """
+    result: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key, value = key.strip(), value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                if key:
+                    result[key] = value
+    except (FileNotFoundError, PermissionError):
+        pass
+    return result
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """Answer "is this credential set, and where did it come from?"."""
+
+    env_name: str
+    value: str
+    source: str  # "env" | "dotenv" | "unset"
+
+    @property
+    def is_set(self) -> bool:
+        return bool(self.value)
+
+
+def resolve(env_name: str, data_dir: str) -> Resolution:
+    """Resolve a credential value for display/use.
+
+    Precedence: OS environment → ``~/.defenseclaw/.env`` → unset. We
+    never return the secret back to the caller unmasked except to the
+    ``keys set``/``quickstart`` flows that need to write it forward.
+    """
+    value = os.environ.get(env_name, "")
+    if value:
+        source = (
+            "dotenv"
+            if credential_provenance.was_injected_from_dotenv(data_dir, env_name, value)
+            else "env"
+        )
+        return Resolution(env_name=env_name, value=value, source=source)
+    dotenv_val = _parse_dotenv(os.path.join(data_dir, ".env")).get(env_name, "")
+    if dotenv_val:
+        return Resolution(env_name=env_name, value=dotenv_val, source="dotenv")
+    return Resolution(env_name=env_name, value="", source="unset")
+
+
+def mask(secret: str) -> str:
+    """Reveal only 4 chars on each side; short secrets are fully masked."""
+    if len(secret) <= 8:
+        return "****" if secret else ""
+    return f"{secret[:4]}…{secret[-4:]}"
+
+
+# ---------------------------------------------------------------------------
+# High-level classification
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CredentialStatus:
+    """What `defenseclaw keys list` / doctor need to know per entry."""
+
+    spec: CredentialSpec
+    requirement: Requirement
+    resolution: Resolution
+
+    @property
+    def missing(self) -> bool:
+        """True when the credential is required and unset."""
+        return self.requirement is Requirement.REQUIRED and not self.resolution.is_set
+
+
+def classify(cfg: Config) -> list[CredentialStatus]:
+    """Classify every registered credential against the current config.
+
+    The order follows ``CREDENTIALS`` so the UX is stable across runs.
+    Additional canonical-v8 observability references and custom-provider env
+    keys discovered in
+    ``~/.defenseclaw/custom-providers.json`` are appended after the
+    static registry so they show up in ``defenseclaw keys list`` /
+    ``doctor`` without polluting the canonical ordering.
+
+    We resolve ``effective_env_name`` so when the operator has
+    configured a custom env var (e.g. ``judge.api_key_env``), we show
+    the name they actually wired up — not the canonical default.
+    """
+    token = _OBSERVABILITY_REF_CACHE.set({})
+    try:
+        return _classify_once(cfg)
+    finally:
+        _OBSERVABILITY_REF_CACHE.reset(token)
+
+
+def _classify_once(cfg: Config) -> list[CredentialStatus]:
+    """Classify credentials within an initialized per-call cache scope."""
+
+    data_dir = getattr(cfg, "data_dir", "") or ""
+    statuses: list[CredentialStatus] = []
+    seen: set[str] = set()
+    for spec in CREDENTIALS:
+        env_name = spec.resolve_env_name(cfg)
+        seen.add(env_name)
+        statuses.append(
+            CredentialStatus(
+                spec=spec,
+                requirement=spec.required(cfg),
+                resolution=resolve(env_name, data_dir),
+            )
+        )
+    discovered = (
+        *discover_observability_credentials(cfg),
+        *discover_custom_provider_credentials(cfg),
+    )
+    for spec in discovered:
+        if spec.env_name in seen:
+            continue
+        seen.add(spec.env_name)
+        statuses.append(
+            CredentialStatus(
+                spec=spec,
+                requirement=spec.required(cfg),
+                resolution=resolve(spec.env_name, data_dir),
+            )
+        )
+    return statuses
+
+
+def missing_required(cfg: Config) -> list[CredentialStatus]:
+    """Convenience: only REQUIRED credentials that are currently unset."""
+    return [s for s in classify(cfg) if s.missing]

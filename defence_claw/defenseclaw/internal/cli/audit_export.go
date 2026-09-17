@@ -1,0 +1,594 @@
+// Copyright 2026 Cisco Systems, Inc. and its affiliates
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite" // SQLite driver for export (same as audit.Store)
+
+	"github.com/spf13/cobra"
+
+	"github.com/defenseclaw/defenseclaw/internal/audit"
+	"github.com/defenseclaw/defenseclaw/internal/version"
+)
+
+var (
+	auditExportOut             string
+	auditExportIncludeActivity bool
+	auditExportLimit           int
+	auditExportConnector       string
+)
+
+var auditCmd = &cobra.Command{
+	Use:   "audit",
+	Short: "Inspect and export the local audit database",
+}
+
+var auditExportCmd = &cobra.Command{
+	Use:   "export",
+	Short: "Export audit_events as JSONL (v7 schema)",
+	Long: `Write one JSON object per line. Each audit row is validated against
+schemas/audit-event.json before it is written. With --include-activity,
+append rows from activity_events validated against activity-event.json.`,
+	RunE: runAuditExport,
+}
+
+func init() {
+	auditExportCmd.Flags().StringVarP(&auditExportOut, "output", "o", "-", "Output file path, or '-' for stdout")
+	auditExportCmd.Flags().BoolVar(&auditExportIncludeActivity, "include-activity", false, "Append activity_events payloads (activity-event.json) after audit lines")
+	auditExportCmd.Flags().IntVar(&auditExportLimit, "limit", 0, "Max audit rows (0 = unlimited)")
+	auditExportCmd.Flags().StringVar(&auditExportConnector, "connector", "", "Only export rows attributed to this connector (matches the authoritative connector column, then structured.connector, then the details connector= field). Activity rows are omitted when set.")
+
+	auditCmd.AddCommand(auditExportCmd)
+	rootCmd.AddCommand(auditCmd)
+}
+
+// isKnownAuditAction reports whether s is a registered action recognized by
+// the v7 schema. It delegates to internal/audit (the canonical registry) so
+// this exporter never drifts from the source of truth again — every action
+// added to internal/audit/actions.go is automatically accepted here without a
+// second list to maintain.
+//
+// Historically a hand-maintained `auditActionEnum` map lived here and silently
+// fell behind whenever a new action (e.g. connector-hook,
+// connector-hook-synthetic, codex.notify.*) was registered. That caused
+// `defenseclaw audit export` to remap perfectly valid hook rows to
+// `action: "action"` with the original value tucked into
+// `legacy_action=…` inside the details blob, breaking SIEM dashboards that
+// keyed on the actual action. Routing through audit.IsKnownAction +
+// audit.IsKnownActionPrefix permanently closes that drift gap.
+func isKnownAuditAction(s string) bool {
+	if audit.IsKnownAction(s) {
+		return true
+	}
+	if audit.IsKnownActionPrefix(s) {
+		return true
+	}
+	return false
+}
+
+func runAuditExport(_ *cobra.Command, _ []string) error {
+	if cfg == nil {
+		return fmt.Errorf("audit export: config not loaded")
+	}
+	version.SetBinaryVersion(appVersion)
+	prov := version.Current()
+
+	db, err := sql.Open("sqlite", cfg.AuditDB)
+	if err != nil {
+		return fmt.Errorf("audit export: open db: %w", err)
+	}
+	defer db.Close()
+
+	out := io.Writer(os.Stdout)
+	if auditExportOut != "" && auditExportOut != "-" {
+		// ("Audit export output file is created with
+		// default-readable permissions before chmod"): os.Create uses
+		// O_CREATE|O_TRUNC with mode 0666 masked by the process umask,
+		// so on a 022 umask host the file briefly exists as 0644
+		// before the os.Chmod tightens it. A local attacker watching
+		// a shared directory (or holding an FD opened during that
+		// window) could read sensitive audit content written
+		// afterwards. Open with O_CREATE|O_EXCL|0o600 so the file is
+		// 0600 from creation and we refuse to clobber an existing
+		// file (which could be an attacker-pre-created decoy).
+		f, err := os.OpenFile(
+			auditExportOut,
+			os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_TRUNC,
+			0o600,
+		)
+		if err != nil {
+			return fmt.Errorf("audit export: create output: %w", err)
+		}
+		defer f.Close()
+		out = f
+	}
+
+	connFilter := strings.ToLower(strings.TrimSpace(auditExportConnector))
+
+	q := `SELECT id, timestamp, action, target, actor, details, structured_json, severity, run_id,
+session_id, trace_id, agent_id, agent_name, agent_instance_id, sidecar_instance_id,
+schema_version, content_hash, generation, binary_version,
+destination_app, tool_name, tool_id, policy_id, connector
+FROM audit_events ORDER BY timestamp ASC`
+	args := []any{}
+	// When a connector filter is active the cap must apply to *matching*
+	// rows, so we filter in Go and bound the count there. Without a filter
+	// we push LIMIT into SQL (cheaper, unchanged behavior).
+	if auditExportLimit > 0 && connFilter == "" {
+		q += ` LIMIT ?`
+		args = append(args, auditExportLimit)
+	}
+
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		// Older DBs may miss v7 columns — fall back to minimal projection.
+		if err := exportAuditEventsFallback(db, out, prov, connFilter); err != nil {
+			return err
+		}
+		// Activity rows are operator config mutations, not connector-scoped,
+		// so they are omitted whenever a connector filter is requested.
+		if auditExportIncludeActivity && connFilter == "" {
+			return exportActivityLines(db, out, prov)
+		}
+		return nil
+	}
+	defer rows.Close()
+
+	emitted := 0
+	for rows.Next() {
+		var (
+			id, ts, action, actor                           string
+			target, details, structuredRaw, severity, runID sql.NullString
+			sessionID, traceID                              sql.NullString
+			agentID, agentName, agentInst, sidecarInst      sql.NullString
+			schemaVer                                       sql.NullInt64
+			contentHash, binVer                             sql.NullString
+			gen                                             sql.NullInt64
+			destApp, toolName, toolID, policyID             sql.NullString
+			connectorCol                                    sql.NullString
+		)
+		if err := rows.Scan(
+			&id, &ts, &action, &target, &actor, &details, &structuredRaw, &severity, &runID,
+			&sessionID, &traceID,
+			&agentID, &agentName, &agentInst, &sidecarInst,
+			&schemaVer, &contentHash, &gen, &binVer,
+			&destApp, &toolName, &toolID, &policyID, &connectorCol,
+		); err != nil {
+			return fmt.Errorf("audit export: scan: %w", err)
+		}
+
+		connector := resolveAuditEventConnector(ns(connectorCol), ns(details), ns(structuredRaw))
+		if connFilter != "" {
+			if connector != connFilter {
+				continue
+			}
+		}
+
+		line, err := buildAuditEventLine(id, ts, action,
+			ns(target), ns(details), ns(severity), ns(runID),
+			ns(structuredRaw),
+			ns(sessionID), ns(traceID),
+			actor,
+			ns(agentID), ns(agentName), ns(agentInst), ns(sidecarInst),
+			schemaVer, ns(contentHash), gen, ns(binVer),
+			ns(destApp), ns(toolName), ns(toolID), ns(policyID),
+			connector,
+			prov,
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(out, string(line)); err != nil {
+			return err
+		}
+		emitted++
+		if auditExportLimit > 0 && emitted >= auditExportLimit {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Activity rows are operator config mutations, not connector-scoped, so
+	// they are omitted whenever a connector filter is requested.
+	if auditExportIncludeActivity && connFilter == "" {
+		if err := exportActivityLines(db, out, prov); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveAuditEventConnector returns the lowercased connector an audit row
+// is attributed to, or "" if none. The dedicated `connector` column
+// (migration 16) is authoritative; when it is blank (older rows, non-hook
+// writers that only set the structured payload) it falls back to the
+// structured `connector` field and finally the `connector=<name>` details
+// token — mirroring the attribution the TUI and `alerts --connector` use.
+func resolveAuditEventConnector(connectorCol, details, structuredRaw string) string {
+	if c := strings.ToLower(strings.TrimSpace(connectorCol)); c != "" {
+		return c
+	}
+	return auditEventConnector(details, structuredRaw)
+}
+
+// auditEventConnector returns the lowercased connector an audit row is
+// attributed to, or "" if none. It mirrors the attribution the TUI and
+// `alerts --connector` use: the structured payload's "connector" field is
+// authoritative; otherwise it falls back to a `connector=<name>` token in
+// the free-form details string.
+func auditEventConnector(details, structuredRaw string) string {
+	if s := strings.TrimSpace(structuredRaw); s != "" {
+		var m map[string]any
+		if json.Unmarshal([]byte(s), &m) == nil {
+			if c, ok := m["connector"].(string); ok {
+				if c = strings.TrimSpace(c); c != "" {
+					return strings.ToLower(c)
+				}
+			}
+		}
+	}
+	return strings.ToLower(auditDetailsKV(details, "connector"))
+}
+
+// auditDetailsKV extracts a single `key=value` token from a space-separated
+// details string. Connector names are single tokens (no spaces), so a simple
+// field split is sufficient for best-effort filtering.
+func auditDetailsKV(details, key string) string {
+	for _, tok := range strings.Fields(details) {
+		if eq := strings.IndexByte(tok, '='); eq > 0 && tok[:eq] == key {
+			return strings.TrimSpace(tok[eq+1:])
+		}
+	}
+	return ""
+}
+
+func exportAuditEventsFallback(db *sql.DB, out io.Writer, prov version.Provenance, connFilter string) error {
+	rows, err := db.Query(`SELECT id, timestamp, action, target, actor, details, severity, run_id FROM audit_events ORDER BY timestamp ASC`)
+	if err != nil {
+		return fmt.Errorf("audit export: %w", err)
+	}
+	defer rows.Close()
+	emitted := 0
+	for rows.Next() {
+		var id, ts, action, actor string
+		var target, details, severity, runID sql.NullString
+		if err := rows.Scan(&id, &ts, &action, &target, &actor, &details, &severity, &runID); err != nil {
+			return fmt.Errorf("audit export: scan: %w", err)
+		}
+		// Legacy projection has no structured_json column; attribution is
+		// best-effort from the details connector= token only.
+		conn := auditEventConnector(ns(details), "")
+		if connFilter != "" && conn != connFilter {
+			continue
+		}
+		line, err := buildAuditEventLine(id, ts, action,
+			ns(target), ns(details), ns(severity), ns(runID),
+			"",
+			"", "",
+			actor,
+			"", "", "", "",
+			sql.NullInt64{}, "", sql.NullInt64{}, "",
+			"", "", "", "",
+			conn,
+			prov,
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(out, string(line)); err != nil {
+			return err
+		}
+		emitted++
+		if auditExportLimit > 0 && emitted >= auditExportLimit {
+			break
+		}
+	}
+	return rows.Err()
+}
+
+func ns(s sql.NullString) string {
+	if !s.Valid {
+		return ""
+	}
+	return s.String
+}
+
+func buildAuditEventLine(
+	id, ts, action, target, details, severity, runID string,
+	structuredRaw string,
+	sessionID, traceID string,
+	actor string,
+	agentID, agentName, agentInst, sidecarInst string,
+	schemaVer sql.NullInt64, contentHash string, gen sql.NullInt64, binVer string,
+	destApp, toolName, toolID, policyID string,
+	connector string,
+	prov version.Provenance,
+) ([]byte, error) {
+	actionOut, detailsOut := normalizeAuditAction(action, details)
+	sev := normalizeSeverity(severity)
+	act := strings.TrimSpace(actor)
+	if act == "" {
+		act = "system:defenseclaw"
+	}
+	sv := int(version.SchemaVersion)
+	if schemaVer.Valid && schemaVer.Int64 >= 7 {
+		sv = int(schemaVer.Int64)
+	}
+	ch := strings.TrimSpace(contentHash)
+	if ch == "" {
+		ch = prov.ContentHash
+	}
+	g := prov.Generation
+	if gen.Valid && gen.Int64 >= 0 {
+		g = uint64(gen.Int64)
+	}
+	bver := binVer
+	if strings.TrimSpace(bver) == "" {
+		bver = prov.BinaryVersion
+	}
+	structured, err := parseStructuredPayload(structuredRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	ev := map[string]any{
+		"id":                  id,
+		"timestamp":           normalizeTimestamp(ts),
+		"action":              actionOut,
+		"actor":               act,
+		"schema_version":      sv,
+		"severity":            sev,
+		"content_hash":        nilIfEmptyStr(ch),
+		"generation":          g,
+		"binary_version":      nilIfEmptyStr(bver),
+		"run_id":              strPtr(runID),
+		"session_id":          strPtr(sessionID),
+		"trace_id":            strPtr(traceID),
+		"span_id":             nil,
+		"target":              strPtr(target),
+		"details":             strPtr(detailsOut),
+		"structured":          structured,
+		"agent_id":            strPtr(agentID),
+		"agent_name":          strPtr(agentName),
+		"agent_instance_id":   strPtr(agentInst),
+		"sidecar_instance_id": strPtr(sidecarInst),
+		"destination_app":     strPtr(destApp),
+		"tool_name":           strPtr(toolName),
+		"tool_id":             strPtr(toolID),
+		"policy_id":           strPtr(policyID),
+		"connector":           strPtr(connector),
+	}
+	if err := validateAuditEventMap(ev); err != nil {
+		return nil, fmt.Errorf("audit export: %w", err)
+	}
+	return json.Marshal(ev)
+}
+
+func parseStructuredPayload(raw string) (any, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, fmt.Errorf("invalid structured_json: %w", err)
+	}
+	return payload, nil
+}
+
+func nilIfEmptyStr(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
+}
+
+func strPtr(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
+}
+
+func normalizeTimestamp(ts string) string {
+	// SQLite may store ISO strings without timezone — ensure RFC3339-like.
+	ts = strings.TrimSpace(ts)
+	if ts == "" {
+		return time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t.UTC().Format(time.RFC3339Nano)
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", ts); err == nil {
+		return t.UTC().Format(time.RFC3339Nano)
+	}
+	return ts
+}
+
+func normalizeSeverity(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "INFO"
+	}
+	if s == "ERROR" {
+		return "WARN"
+	}
+	if s == "ACK" {
+		return "INFO"
+	}
+	// schema: CRITICAL, HIGH, MEDIUM, LOW, INFO, WARN
+	switch s {
+	case "CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "WARN":
+		return s
+	default:
+		return "INFO"
+	}
+}
+
+func normalizeAuditAction(action, details string) (string, string) {
+	a := strings.TrimSpace(action)
+	if isKnownAuditAction(a) {
+		return a, details
+	}
+	prefix := "legacy_action=" + a
+	if strings.TrimSpace(details) == "" {
+		return "action", prefix
+	}
+	return "action", prefix + " | " + details
+}
+
+var auditSeverityEnum = map[string]struct{}{
+	"CRITICAL": {}, "HIGH": {}, "MEDIUM": {}, "LOW": {}, "INFO": {}, "WARN": {},
+}
+
+func validateAuditEventMap(ev map[string]any) error {
+	if _, ok := ev["id"]; !ok {
+		return fmt.Errorf("invalid audit event: missing id")
+	}
+	if _, ok := ev["timestamp"]; !ok {
+		return fmt.Errorf("invalid audit event: missing timestamp")
+	}
+	act, _ := ev["action"].(string)
+	if !isKnownAuditAction(act) {
+		return fmt.Errorf("invalid audit event: unknown action %q", act)
+	}
+	sev, _ := ev["severity"].(string)
+	if _, ok := auditSeverityEnum[sev]; !ok {
+		return fmt.Errorf("invalid audit event: severity %q", sev)
+	}
+	sv, ok := ev["schema_version"].(int)
+	if !ok || sv < 7 {
+		return fmt.Errorf("invalid audit event: schema_version")
+	}
+	return nil
+}
+
+func exportActivityLines(db *sql.DB, out io.Writer, prov version.Provenance) error {
+	exists, err := tableExists(db, "activity_events")
+	if err != nil || !exists {
+		return nil
+	}
+	rows, err := db.Query(`
+SELECT actor, action, target_type, target_id, reason,
+       before_json, after_json, diff_json, version_from, version_to
+FROM activity_events ORDER BY timestamp ASC`)
+	if err != nil {
+		return fmt.Errorf("audit export: activity query: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var actor, action, tt, tid string
+		var reason sql.NullString
+		var beforeJ, afterJ, diffJ sql.NullString
+		var vf, vt sql.NullString
+		if err := rows.Scan(&actor, &action, &tt, &tid, &reason, &beforeJ, &afterJ, &diffJ, &vf, &vt); err != nil {
+			return fmt.Errorf("audit export: activity scan: %w", err)
+		}
+		payload, err := buildActivityPayload(actor, action, tt, tid, reason, beforeJ, afterJ, diffJ, vf, vt, prov)
+		if err != nil {
+			return err
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if err := validateActivityPayloadMap(payload); err != nil {
+			return fmt.Errorf("audit export: activity: %w", err)
+		}
+		if _, err := fmt.Fprintln(out, string(b)); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func tableExists(db *sql.DB, name string) (bool, error) {
+	var n int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name,
+	).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func buildActivityPayload(
+	actor, action, targetType, targetID string,
+	reason sql.NullString,
+	beforeJ, afterJ, diffJ sql.NullString,
+	vf, vt sql.NullString,
+	prov version.Provenance,
+) (map[string]any, error) {
+	_ = prov // reserved for future envelope fields
+	act := normalizeActivityAction(action)
+	m := map[string]any{
+		"actor":        actor,
+		"action":       act,
+		"target_type":  targetType,
+		"target_id":    targetID,
+		"reason":       strPtr(ns(reason)),
+		"version_from": strPtr(ns(vf)),
+		"version_to":   strPtr(ns(vt)),
+	}
+	m["before"] = jsonRawToAny(ns(beforeJ))
+	m["after"] = jsonRawToAny(ns(afterJ))
+	if diffJ.Valid && strings.TrimSpace(diffJ.String) != "" {
+		var diff any
+		if err := json.Unmarshal([]byte(diffJ.String), &diff); err == nil {
+			m["diff"] = diff
+		}
+	}
+	return m, nil
+}
+
+func normalizeActivityAction(a string) string {
+	a = strings.TrimSpace(a)
+	if _, ok := activityActionEnum[a]; ok {
+		return a
+	}
+	return "action"
+}
+
+func jsonRawToAny(s string) any {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return nil
+	}
+	return v
+}
+
+// activityActionEnum is the action subset from schemas/activity-event.json.
+var activityActionEnum = map[string]struct{}{
+	"config-update": {}, "policy-update": {}, "policy-reload": {},
+	"block": {}, "allow": {}, "quarantine": {}, "restore": {}, "disable": {}, "enable": {},
+	"action": {}, "acknowledge-alerts": {}, "dismiss-alerts": {}, "deploy": {}, "stop": {},
+}
+
+func validateActivityPayloadMap(m map[string]any) error {
+	for _, k := range []string{"actor", "action", "target_type", "target_id"} {
+		if v, ok := m[k].(string); !ok || strings.TrimSpace(v) == "" {
+			return fmt.Errorf("invalid activity payload: %q", k)
+		}
+	}
+	act := m["action"].(string)
+	if _, ok := activityActionEnum[act]; !ok {
+		return fmt.Errorf("invalid activity action %q", act)
+	}
+	return nil
+}

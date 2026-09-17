@@ -1,0 +1,3702 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Dynamic drill-down for every automatically observed DefenseClaw agent. Durable relationship evidence defines lineage, logical-event identity prevents exact hook/native mirrors from inflating summaries, and raw Loki observations and Tempo traces remain independently inspectable.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Agent Directory",
+      "type": "link",
+      "url": "/d/defenseclaw-agent-identity/defenseclaw-agent-identity"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Activity",
+      "type": "link",
+      "url": "/d/defenseclaw-activity/defenseclaw-agent-activity-live"
+    }
+  ],
+  "liveNow": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Agent360",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "# Agent360 \u00b7 `$agent`\nStable identity \u2192 evidence-backed lineage \u2192 logical work \u2192 raw observations \u2192 Tempo trace. **Scope** chooses only this agent or its full descendant tree. Summary counts use durable logical-event identity when exact hook/native mirrors exist; raw records remain visible below. Unknown tokens/cost remain absent rather than being rendered as zero."
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Agent Directory \u2014 click an Agent ID to drill down",
+      "description": "Canonical logs retain exact agent and lineage identities while metrics stay aggregate-only. This table groups observations by the reported identity fields and links to Agent360.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (connector, gen_ai_agent_id, gen_ai_agent_name, gen_ai_agent_type, defenseclaw_agent_root_id, defenseclaw_agent_parent_id) (count_over_time({service_name=\"defenseclaw\"} | json | __error__=\"\" | connector=~\"$connector\" | body_gen_ai_agent_id!=\"\" | label_format gen_ai_agent_id=\"{{.body_gen_ai_agent_id}}\", gen_ai_agent_name=\"{{if .body_gen_ai_agent_name}}{{.body_gen_ai_agent_name}}{{else}}unreported{{end}}\", gen_ai_agent_type=\"{{if .body_defenseclaw_agent_type}}{{.body_defenseclaw_agent_type}}{{else}}unreported{{end}}\", defenseclaw_agent_root_id=\"{{.body_defenseclaw_agent_root_id}}\", defenseclaw_agent_parent_id=\"{{.body_defenseclaw_agent_parent_id}}\" [$__range]))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "defenseclaw_agent_execution_id": true,
+              "defenseclaw_agent_lifecycle_event": true,
+              "defenseclaw_agent_lifecycle_id": true,
+              "defenseclaw_agent_lifecycle_state": true,
+              "defenseclaw_agent_depth": true,
+              "gen_ai_provider_name": true,
+              "gen_ai_request_model": true,
+              "defenseclaw_claw_mode": true,
+              "defenseclaw_device_id": true,
+              "defenseclaw_gateway_host": true,
+              "defenseclaw_gateway_port": true,
+              "defenseclaw_instance_id": true,
+              "defenseclaw_session_root_id": true,
+              "deployment_environment": true,
+              "host_arch": true,
+              "host_name": true,
+              "instance": true,
+              "job": true,
+              "os_type": true,
+              "service": true,
+              "service_name": true,
+              "service_namespace": true,
+              "service_version": true,
+              "exported_job": true
+            },
+            "renameByName": {
+              "Value": "Observations",
+              "connector": "Connector",
+              "gen_ai_agent_id": "Agent ID",
+              "gen_ai_agent_name": "Name",
+              "gen_ai_agent_type": "Type",
+              "defenseclaw_agent_root_id": "Root Agent",
+              "defenseclaw_agent_parent_id": "Parent Agent"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Agent ID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "${__value.text}",
+                    "url": "/d/defenseclaw-agent-360/agent360?var-connector=${__data.fields.Connector}&var-agent=${__value.raw}&var-scope_label=gen_ai_agent_id&from=${__from}&to=${__to}",
+                    "targetBlank": false
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "data-links"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Root Agent"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "${__value.text}",
+                    "url": "/d/defenseclaw-agent-360/agent360?var-connector=${__data.fields.Connector}&var-agent=${__value.raw}&var-scope_label=defenseclaw_agent_root_id&from=${__from}&to=${__to}",
+                    "targetBlank": false
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "data-links"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Observations",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Observations in range",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 11,
+        "w": 3,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" [$__range])) or vector(0)",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "description": "Raw canonical log observations for the selected exact agent or root tree."
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Turns",
+      "description": "Distinct logical completed turns from the durable lifecycle event stream. Exact hook/native mirrors sharing one logical-event ID count once; every raw observation remains in the raw stream. An observation without a logical-event ID falls back to its semantic-event ID, then record ID, so unresolved evidence is counted separately instead of dropped.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 3,
+        "y": 11,
+        "w": 2,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "count(sum by (logical_event_id) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=\"turn_end\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" [$__range]))) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Model calls",
+      "description": "Distinct logical model responses from the durable LLM event stream. Exact connector/native mirrors count once while intermediate responses that are genuinely different occurrences remain separate. Missing logical identity falls back to semantic-event ID, then record ID, so unresolved responses remain visible as separate observations.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 5,
+        "y": 11,
+        "w": 2,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "count(sum by (logical_event_id) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=\"model.response\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" [$__range]))) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Tool calls",
+      "description": "Distinct logical completed tool results from the durable tool event stream. Exact mirrors count once; post-only connector events remain separate logical occurrences when no exact join evidence exists. Missing logical identity falls back to semantic-event ID, then record ID, so unresolved results remain visible as separate observations.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 7,
+        "y": 11,
+        "w": 2,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "count(sum by (logical_event_id) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=\"tool.invocation.completed\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" [$__range]))) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Descendants in selected root tree",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 9,
+        "y": 11,
+        "w": 2,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "count(sum by (agent_id) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_defenseclaw_agent_root_id=~\"$agent\" | body_defenseclaw_agent_parent_id!=\"\" | body_gen_ai_agent_id!=\"$agent\" | label_format agent_id=\"{{.body_gen_ai_agent_id}}\" | agent_id!=\"\" [$__range]))) or vector(0)",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Input tokens",
+      "description": "Connector-reported tokens from canonical model.response logs, deduplicated by the correlation logical event ID. Missing usage is absent, not guessed.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 11,
+        "y": 11,
+        "w": 3,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(max by (logical_event_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | event_name=\"model.response\" | body_defenseclaw_telemetry_tokens_reported=\"true\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" | unwrap body_gen_ai_usage_input_tokens [$__range])))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Not reported"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Output tokens",
+      "description": "Connector-reported tokens from canonical model.response logs, deduplicated by the correlation logical event ID. Missing usage is absent, not guessed.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 11,
+        "w": 3,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(max by (logical_event_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | event_name=\"model.response\" | body_defenseclaw_telemetry_tokens_reported=\"true\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" | unwrap body_gen_ai_usage_output_tokens [$__range])))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Not reported"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Reported cost",
+      "description": "Latest cumulative USD cost from canonical logs, grouped by exact agent and lifecycle identity. Missing cost is Not reported; DefenseClaw never infers prices.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 17,
+        "y": 11,
+        "w": 3,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(max by (agent_id, lifecycle_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_reported_cost_present=\"true\" | label_format agent_id=\"{{.body_gen_ai_agent_id}}\", lifecycle_id=\"{{.body_defenseclaw_agent_lifecycle_id}}\" | unwrap body_defenseclaw_agent_reported_cost_usd [$__range])))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "noValue": "Not reported"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 10,
+      "type": "gauge",
+      "title": "Terminal event success rate",
+      "description": "Completed terminal lifecycle events divided by completed, failed, and interrupted terminal events in Loki. Active-only ranges correctly remain without a terminal outcome.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 11,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "100 * (sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=~\"session_end|subagent_stop|turn_end\" | body_defenseclaw_agent_lifecycle_state=\"completed\" [$__range])) or vector(0)) / sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=~\"session_end|subagent_stop|turn_end\" | body_defenseclaw_agent_lifecycle_state=~\"completed|failed|interrupted\" [$__range]))",
+          "instant": true,
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No terminal outcome",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 80
+              },
+              {
+                "color": "green",
+                "value": 95
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Lifecycle, throughput, latency, and tokens",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 12,
+      "type": "state-timeline",
+      "title": "Execution phase timeline",
+      "description": "Per-execution state reconstructed from canonical lifecycle/work logs. Exact execution identity stays on logs instead of becoming a Prometheus label.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max by (gen_ai_agent_name, defenseclaw_agent_execution_id) (last_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | body_defenseclaw_agent_phase_code!=\"\" | label_format gen_ai_agent_name=\"{{if .body_gen_ai_agent_name}}{{.body_gen_ai_agent_name}}{{else}}unreported{{end}}\", defenseclaw_agent_execution_id=\"{{.body_defenseclaw_agent_execution_id}}\" | unwrap body_defenseclaw_agent_phase_code [$__interval]))",
+          "queryType": "range",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "legendFormat": "{{gen_ai_agent_name}} • {{defenseclaw_agent_execution_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Unknown",
+                  "color": "gray"
+                },
+                "1": {
+                  "text": "Session",
+                  "color": "blue"
+                },
+                "2": {
+                  "text": "Planning",
+                  "color": "purple"
+                },
+                "3": {
+                  "text": "Model",
+                  "color": "yellow"
+                },
+                "4": {
+                  "text": "Tool",
+                  "color": "orange"
+                },
+                "5": {
+                  "text": "Approval",
+                  "color": "dark-orange"
+                },
+                "6": {
+                  "text": "Waiting",
+                  "color": "light-blue"
+                },
+                "7": {
+                  "text": "Responding",
+                  "color": "green"
+                },
+                "8": {
+                  "text": "Maintenance",
+                  "color": "dark-blue"
+                },
+                "9": {
+                  "text": "Completed",
+                  "color": "semi-dark-green"
+                },
+                "10": {
+                  "text": "Failed",
+                  "color": "red"
+                },
+                "11": {
+                  "text": "Interrupted",
+                  "color": "dark-red"
+                },
+                "12": {
+                  "text": "Observed",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "alignValue": "left",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "showValue": "auto",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Connector span throughput",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (span_name) (rate(defenseclaw_agent_span_calls_total{connector=~\"(${connector:regex}|^$)\"}[$__rate_interval]))",
+          "legendFormat": "{{span_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Bounded connector-wide span throughput. Exact agent filtering is available in logs and traces below."
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Connector span p95 latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 16,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, span_name) (rate(defenseclaw_agent_span_duration_milliseconds_bucket{connector=~\"(${connector:regex}|^$)\"}[$__rate_interval])))",
+          "legendFormat": "{{span_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Bounded connector-wide span latency. Exact agent filtering is available in logs and traces below."
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Input/output tokens over time",
+      "description": "Connector-reported input/output tokens from canonical model.response logs, deduplicated per logical event.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(max by (logical_event_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | event_name=\"model.response\" | body_defenseclaw_telemetry_tokens_reported=\"true\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" | unwrap body_gen_ai_usage_input_tokens [$__interval])))",
+          "queryType": "range",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "legendFormat": "input"
+        },
+        {
+          "expr": "sum(max by (logical_event_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | event_name=\"model.response\" | body_defenseclaw_telemetry_tokens_reported=\"true\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" | unwrap body_gen_ai_usage_output_tokens [$__interval])))",
+          "queryType": "range",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "B",
+          "legendFormat": "output"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 35
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Executions and observations",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (connector, gen_ai_agent_id, defenseclaw_agent_lifecycle_id, defenseclaw_agent_execution_id) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | label_format gen_ai_agent_id=\"{{.body_gen_ai_agent_id}}\", defenseclaw_agent_lifecycle_id=\"{{.body_defenseclaw_agent_lifecycle_id}}\", defenseclaw_agent_execution_id=\"{{.body_defenseclaw_agent_execution_id}}\" | defenseclaw_agent_lifecycle_id!=\"\" | defenseclaw_agent_execution_id!=\"\" [$__range]))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "renameByName": {
+              "Value": "Observations",
+              "connector": "Connector",
+              "gen_ai_agent_id": "Agent",
+              "defenseclaw_agent_lifecycle_id": "Lifecycle",
+              "defenseclaw_agent_execution_id": "Execution"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Execution"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Drill into ${__value.text}",
+                    "url": "/d/defenseclaw-agent-360/agent360?orgId=1&${connector:queryparam}&${agent:queryparam}&${scope_label:queryparam}&var-lifecycle=${__data.fields.Lifecycle}&var-execution=${__value.raw}&from=${__from}&to=${__to}",
+                    "targetBlank": false
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "data-links"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "description": "Canonical log observation counts grouped by exact agent, lifecycle, and execution identity."
+    },
+    {
+      "id": 27,
+      "type": "row",
+      "title": "Model, tool, cost, lifecycle, and reliability analytics",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 28,
+      "type": "bargauge",
+      "title": "Model calls by provider and model",
+      "description": "Durable LLM response events grouped by the provider/model actually reported by the connector. Missing model identity is shown as unreported rather than guessed.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (provider, model) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=\"model.response\" | label_format provider=\"{{if .body_gen_ai_provider_name}}{{.body_gen_ai_provider_name}}{{else}}unreported{{end}}\", model=\"{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else if .body_gen_ai_request_model}}{{.body_gen_ai_request_model}}{{else}}unreported{{end}}\" [$__range]))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "legendFormat": "{{provider}} / {{model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 29,
+      "type": "bargauge",
+      "title": "Connector-wide model p95 (selected range)",
+      "description": "Bounded connector-wide model latency grouped only by provider and model.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 33,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_provider_name, gen_ai_request_model) (increase(defenseclaw_agent_span_duration_milliseconds_bucket{connector=~\"(${connector:regex}|^$)\",gen_ai_request_model!=\"\",gen_ai_operation_name=~\"chat|generate_content|text_completion\"}[$__range])))",
+          "instant": true,
+          "legendFormat": "{{gen_ai_provider_name}} / {{gen_ai_request_model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 30,
+      "type": "bargauge",
+      "title": "Top tools by calls",
+      "description": "Exact result-event counts in the selected time range; duplicate counter state from older executions is excluded.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 33,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (tool_name) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=\"tool.invocation.completed\" | label_format tool_name=\"{{.body_gen_ai_tool_name}}\" | tool_name!=\"\" [$__range])))",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "{{tool_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 31,
+      "type": "bargauge",
+      "title": "Connector-wide tool p95 (selected range)",
+      "description": "Bounded connector-wide tool latency grouped only by tool name.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, gen_ai_tool_name) (increase(defenseclaw_agent_span_duration_milliseconds_bucket{connector=~\"(${connector:regex}|^$)\",gen_ai_tool_name!=\"\"}[$__range]))))",
+          "instant": true,
+          "legendFormat": "{{gen_ai_tool_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 32,
+      "type": "bargauge",
+      "title": "Top websites and destinations",
+      "description": "Destination applications inferred from tool and network spans; raw host detail remains in Loki.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (destination) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=~\"tool[.]invocation[.](completed|failed|blocked)|egress[.](allowed|blocked|completed|failed)\" | label_format destination=\"{{if .body_defenseclaw_destination_app}}{{.body_defenseclaw_destination_app}}{{else}}{{.body_defenseclaw_network_target_ref}}{{end}}\" | destination!=\"\" [$__range])))",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "{{destination}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 39,
+      "type": "bargauge",
+      "title": "Reported tokens by model",
+      "description": "Only connector-reported token usage from canonical logs, deduplicated by logical event and grouped by model.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (provider, model, kind) (max by (provider, model, kind, logical_event_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | event_name=\"model.response\" | body_defenseclaw_telemetry_tokens_reported=\"true\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\", provider=\"{{if .body_gen_ai_provider_name}}{{.body_gen_ai_provider_name}}{{else}}unreported{{end}}\", model=\"{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else if .body_gen_ai_request_model}}{{.body_gen_ai_request_model}}{{else}}unreported{{end}}\", kind=\"input\" | unwrap body_gen_ai_usage_input_tokens [$__range])))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "{{provider}} / {{model}} / input"
+        },
+        {
+          "expr": "sum by (provider, model, kind) (max by (provider, model, kind, logical_event_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | event_name=\"model.response\" | body_defenseclaw_telemetry_tokens_reported=\"true\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\", provider=\"{{if .body_gen_ai_provider_name}}{{.body_gen_ai_provider_name}}{{else}}unreported{{end}}\", model=\"{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else if .body_gen_ai_request_model}}{{.body_gen_ai_request_model}}{{else}}unreported{{end}}\", kind=\"output\" | unwrap body_gen_ai_usage_output_tokens [$__range])))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "B",
+          "instant": true,
+          "legendFormat": "{{provider}} / {{model}} / output"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Reported cost over time",
+      "description": "Latest cumulative connector-reported USD per lifecycle from canonical logs. Missing cost is not inferred.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(max by (agent_id, lifecycle_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_reported_cost_present=\"true\" | label_format agent_id=\"{{.body_gen_ai_agent_id}}\", lifecycle_id=\"{{.body_defenseclaw_agent_lifecycle_id}}\" | unwrap body_defenseclaw_agent_reported_cost_usd [$__interval])))",
+          "queryType": "range",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "legendFormat": "reported USD"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "noValue": "Not reported",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "bargauge",
+      "title": "Reported cost by model",
+      "description": "Cumulative connector-reported cost from canonical logs, deduplicated per agent lifecycle and grouped by model. DefenseClaw never infers prices.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (provider, model) (max by (provider, model, agent_id, lifecycle_id) (max_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_reported_cost_present=\"true\" | label_format provider=\"{{if .body_gen_ai_provider_name}}{{.body_gen_ai_provider_name}}{{else}}unreported{{end}}\", model=\"{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else if .body_gen_ai_request_model}}{{.body_gen_ai_request_model}}{{else}}unreported{{end}}\", agent_id=\"{{.body_gen_ai_agent_id}}\", lifecycle_id=\"{{.body_defenseclaw_agent_lifecycle_id}}\" | unwrap body_defenseclaw_agent_reported_cost_usd [$__range])))",
+          "queryType": "instant",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "{{provider}} / {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "noValue": "Not reported"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 35,
+      "type": "table",
+      "title": "Lifecycle event totals",
+      "description": "Exact lifecycle event totals from Loki. This remains accurate across collector restarts and includes sparse pre/post hook transitions.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (defenseclaw_agent_lifecycle_event) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=~\"session_(start|end)|subagent_(start|stop)|turn_(start|end)|compact_(start|end)\" | label_format defenseclaw_agent_lifecycle_event=\"{{.body_defenseclaw_agent_lifecycle_event}}\" [$__range]))",
+          "instant": true,
+          "format": "table",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "Events",
+              "Value #A": "Events",
+              "defenseclaw_agent_lifecycle_event": "Lifecycle event"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": "",
+            "sort": [
+              {
+                "field": "Events",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Connector span error rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "100 * (sum(rate(defenseclaw_agent_span_calls_total{connector=~\"(${connector:regex}|^$)\",status_code=\"STATUS_CODE_ERROR\"}[$__rate_interval])) or vector(0)) / clamp_min((sum(rate(defenseclaw_agent_span_calls_total{connector=~\"(${connector:regex}|^$)\"}[$__rate_interval])) or vector(0)), 0.000000001)",
+          "legendFormat": "error rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "description": "Bounded connector-wide error rate. Use correlated logs/traces for exact agent attribution."
+    },
+    {
+      "id": 37,
+      "type": "heatmap",
+      "title": "Connector span latency heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 57,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(defenseclaw_agent_span_duration_milliseconds_bucket{connector=~\"(${connector:regex}|^$)\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral"
+        },
+        "legend": {
+          "show": true
+        },
+        "tooltip": {
+          "show": true,
+          "yHistogram": true
+        },
+        "yAxis": {
+          "axisPlacement": "left",
+          "unit": "ms"
+        }
+      },
+      "description": "Bounded connector-wide span latency distribution."
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Active agents over time",
+      "description": "Distinct exact agent IDs observed in canonical logs during each interval; identity remains off metric labels.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 57,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "count(sum by (connector, gen_ai_agent_id) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | label_format gen_ai_agent_id=\"{{.body_gen_ai_agent_id}}\" | gen_ai_agent_id!=\"\" [$__interval])))",
+          "queryType": "range",
+          "datasource": {
+            "type": "loki",
+            "uid": "defenseclaw-loki"
+          },
+          "refId": "A",
+          "legendFormat": "active agents"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 35
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "Models, tools, websites, and security decisions",
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 18,
+      "type": "logs",
+      "title": "LLM turns \u2014 prompts, responses, model, usage",
+      "description": "Full connector-supplied model input and output are rendered exactly as present after DefenseClaw's central OTEL projection. This panel applies no additional truncation or hiding; expand a row for every exported field.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=~\"model[.](request|response|call[.]failed|stream[.]completed)\" | json body_gen_ai_input_messages=\"body[\\\"gen_ai.input.messages\\\"]\", body_gen_ai_output_messages=\"body[\\\"gen_ai.output.messages\\\"]\" | line_format \"{{.event_name}} \u00b7 provider={{.body_gen_ai_provider_name}} request_model={{.body_gen_ai_request_model}} response_model={{.body_gen_ai_response_model}} \u00b7 request_id={{.body_defenseclaw_model_request_id}} response_id={{.body_defenseclaw_model_response_id}} \u00b7 input={{.body_gen_ai_input_messages}} \u00b7 output={{.body_gen_ai_output_messages}} \u00b7 tokens={{.body_gen_ai_usage_input_tokens}}/{{.body_gen_ai_usage_output_tokens}} \u00b7 outcome={{.outcome}} \u00b7 trace_id={{.correlation_trace_id}} span_id={{.correlation_span_id}}\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "id": 19,
+      "type": "logs",
+      "title": "Tools and website/network interactions",
+      "description": "Tool name, destination app, arguments/result, and network egress metadata remain trace-correlated.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 66,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=~\"tool[.]invocation[.](requested|started|completed|failed|blocked)|egress[.](requested|allowed|blocked|completed|failed)\" | line_format \"{{.event_name}} \u00b7 tool={{.body_gen_ai_tool_name}} type={{.body_gen_ai_tool_type}} provider={{.body_defenseclaw_tool_provider}} call_id={{.body_gen_ai_tool_call_id}} status={{.body_defenseclaw_tool_status}} exit={{.body_defenseclaw_tool_exit_code}} destination={{.body_defenseclaw_destination_app}} target={{.body_defenseclaw_network_target_ref}} \u00b7 arguments={{.body_gen_ai_tool_call_arguments}} \u00b7 result={{.body_gen_ai_tool_call_result}} \u00b7 outcome={{.outcome}} \u00b7 trace_id={{.correlation_trace_id}} span_id={{.correlation_span_id}}\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "id": 20,
+      "type": "logs",
+      "title": "Errors, blocks, approvals, and guardrail decisions",
+      "description": "Canonical approval requests/resolutions, errors, scanner verdicts, judges, findings, and final connector-facing hook decisions. Approval rows retain the approval ID and terminal result; a hook decision says whether the block was enforced or only would have blocked.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 77,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | event_name=~\"approval[.](requested|resolved)|hook_decision|guardrail[.](evaluation[.](completed|failed)|judge[.]completed)|finding[.](observed|correlated)|enforcement[.].*|.*failed\" | line_format \"{{.event_name}} \u00b7 severity={{if .severity}}{{.severity}}{{else}}{{.body_defenseclaw_security_severity}}{{end}} \u00b7 approval={{.body_defenseclaw_approval_id}} result={{.body_defenseclaw_approval_result}} actor={{.body_defenseclaw_approval_actor_type}} command={{.body_defenseclaw_approval_command}} dangerous={{.body_defenseclaw_approval_dangerous}} \u00b7 hook={{.body_defenseclaw_hook_event}} action={{.body_defenseclaw_guardrail_effective_action}} raw={{.body_defenseclaw_guardrail_raw_action}} enforced={{.body_defenseclaw_guardrail_enforced}} would_block={{.body_defenseclaw_guardrail_would_block}} \u00b7 reason={{.body_defenseclaw_guardrail_reason}} \u00b7 finding={{.body_defenseclaw_finding_description}} \u00b7 outcome={{.outcome}} \u00b7 trace_id={{.correlation_trace_id}} span_id={{.correlation_span_id}}\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "id": 45,
+      "type": "row",
+      "title": "Hook enforcement and recovery paths",
+      "gridPos": {
+        "x": 0,
+        "y": 87,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 46,
+      "type": "stat",
+      "title": "Enforced hook blocks",
+      "description": "Final hook decisions actually returned as block to the connector. This is distinct from a scanner verdict that was downgraded by observe mode or an unsupported hook surface.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 88,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | event_name=\"hook_decision\" | connector=~\"$connector\" | body_defenseclaw_guardrail_enforced=\"true\" [$__range])) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 47,
+      "type": "stat",
+      "title": "Observe-mode would-blocks",
+      "description": "Guardrail decisions that would have blocked but were returned as an allowed/advisory outcome because the connector is in observe mode or the hook surface cannot enforce.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 88,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | event_name=\"hook_decision\" | connector=~\"$connector\" | body_defenseclaw_guardrail_would_block=\"true\" [$__range])) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 48,
+      "type": "timeseries",
+      "title": "Hook action outcomes over time",
+      "description": "Decision time-series for the selected agent execution. Hook decisions show enforcement and advisory outcomes; canonical approval resolutions are counted separately by their terminal result.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 88,
+        "w": 16,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | event_name=\"hook_decision\" | connector=~\"$connector\" | body_defenseclaw_guardrail_enforced=\"true\" [$__interval])) or vector(0)",
+          "legendFormat": "enforced block",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | event_name=\"hook_decision\" | connector=~\"$connector\" | body_defenseclaw_guardrail_would_block=\"true\" [$__interval])) or vector(0)",
+          "legendFormat": "would block",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | event_name=\"hook_decision\" | connector=~\"$connector\" | body_defenseclaw_guardrail_effective_action=~\"alert|confirm\" [$__interval])) or vector(0)",
+          "legendFormat": "alert or confirmation decision",
+          "refId": "C"
+        },
+        {
+          "expr": "sum by (approval_result) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | event_name=\"approval.resolved\" | connector=~\"$connector\" | label_format approval_result=\"{{.body_defenseclaw_approval_result}}\" | approval_result!=\"\" [$__interval])) or on() vector(0)",
+          "legendFormat": "approval {{approval_result}}",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 45,
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 49,
+      "type": "logs",
+      "title": "Decision \u2192 recovery path",
+      "description": "Ascending, execution-scoped chronology. Find a hook_decision, then read the next rows: a later tool call/result, model prompt/response, lifecycle completion, or another hook decision is the observed recovery path. A missing later row means DefenseClaw did not observe a subsequent hook event in this execution.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 96,
+        "w": 24,
+        "h": 11
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | event_name=~\"approval[.](requested|resolved)|hook_decision|tool[.]invocation[.].*|model[.].*|session_(start|end)|subagent_(start|stop)|turn_(start|end)|guardrail[.].*|.*failed\" | connector=~\"$connector\" | line_format \"#{{.body_defenseclaw_agent_sequence}} \u00b7 {{.event_name}} \u00b7 phase={{.body_defenseclaw_agent_phase}} \u00b7 approval={{.body_defenseclaw_approval_id}} result={{.body_defenseclaw_approval_result}} \u00b7 hook={{.body_defenseclaw_hook_event}} action={{.body_defenseclaw_guardrail_effective_action}} raw={{.body_defenseclaw_guardrail_raw_action}} enforced={{.body_defenseclaw_guardrail_enforced}} would_block={{.body_defenseclaw_guardrail_would_block}} \u00b7 tool={{.body_gen_ai_tool_name}} \u00b7 model={{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else}}{{.body_gen_ai_request_model}}{{end}} \u00b7 trace_id={{.correlation_trace_id}}\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Ascending"
+      }
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "Tempo execution drill-down and topology",
+      "gridPos": {
+        "x": 0,
+        "y": 107,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "Operation and enforcement traces \u2014 click a Trace ID",
+      "description": "Shows agent creation and transition spans, model/tool/session operations, workflow runs, approvals, and enforcement attempts across the selected lifecycle. Clicking Trace ID carries the selected connector, agent, scope, lifecycle, and execution into the waterfall without forwarding an empty trace variable.",
+      "datasource": {
+        "type": "tempo",
+        "uid": "defenseclaw-tempo"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 9,
+        "h": 12
+      },
+      "targets": [
+        {
+          "queryType": "traceql",
+          "query": "{ span.defenseclaw.connector.source =~ \"${connector:regex}\" && span.defenseclaw.agent.lifecycle.id =~ \"$lifecycle\" && span.defenseclaw.agent.execution.id =~ \"$execution\" && ((\"$scope_label\" = \"gen_ai_agent_id\" && span.gen_ai.agent.id = \"$agent\") || (\"$scope_label\" = \"defenseclaw_agent_root_id\" && span.defenseclaw.agent.root.id = \"$agent\")) && (span.defenseclaw.span.family =~ \"span.agent.invoke|span.agent.transition|span.workflow.run|span.model.chat|span.tool.execute|span.approval.resolve\" || span.gen_ai.operation.name =~ \"invoke_agent|execute_tool|chat|generate_content|text_completion\" || span.defenseclaw.agent.lifecycle.event =~ \"session_start|session_end|subagent_start|subagent_stop|turn_start|turn_end|tool_start|tool_end|compact_start|compact_end|event\" || name = \"exec.approval\" || span.defenseclaw.guardrail.raw_action =~ \"block|confirm|alert\" || span.defenseclaw.guardrail.effective_action =~ \"block|confirm|alert\" || span.defenseclaw.guardrail.decision =~ \"block|deny\") } with (most_recent=true)",
+          "limit": 100,
+          "tableType": "traces",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Trace ID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "${__value.text}",
+                    "url": "/d/defenseclaw-agent-360/agent360?orgId=1&${connector:queryparam}&${agent:queryparam}&${scope_label:queryparam}&${lifecycle:queryparam}&${execution:queryparam}&var-trace=${__value.raw}&from=${__from}&to=${__to}",
+                    "targetBlank": false
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "data-links"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 23,
+      "type": "traces",
+      "title": "Selected trace waterfall \u2014 selection required",
+      "description": "Expected initial state: this panel has no data until you click a Trace ID in the table on the left. After selection, the selected lifecycle, work, approval, or enforcement trace renders as an ordered parent/child waterfall.",
+      "datasource": {
+        "type": "tempo",
+        "uid": "defenseclaw-tempo"
+      },
+      "gridPos": {
+        "x": 9,
+        "y": 108,
+        "w": 15,
+        "h": 12
+      },
+      "targets": [
+        {
+          "queryType": "traceql",
+          "query": "$trace",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "spanBar": {
+          "type": "None"
+        }
+      }
+    },
+    {
+      "id": 40,
+      "type": "logs",
+      "title": "Ordered lifecycle and work sequence \u2014 root to terminal",
+      "description": "Ascending raw-observation chronology for the selected root tree or agent. Every retained v8 event is included; semantic and logical IDs show which records are one source occurrence or exact mirrors without changing Loki time order, and expanded rows retain every exported field.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 120,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | connector=~\"$connector\" | line_format \"#{{.body_defenseclaw_agent_sequence}} \u00b7 {{.event_name}} \u00b7 semantic={{.correlation_semantic_event_id}} logical={{.correlation_logical_event_id}} connector_instance={{.correlation_connector_instance_id}} \u00b7 agent={{.body_gen_ai_agent_id}}/{{.body_gen_ai_agent_name}} type={{.body_defenseclaw_agent_type}} instance={{.body_defenseclaw_agent_instance_id}} root={{.body_defenseclaw_agent_root_id}} parent={{.body_defenseclaw_agent_parent_id}} depth={{.body_defenseclaw_agent_depth}} lineage={{.body_defenseclaw_agent_lineage_provenance}} \u00b7 session={{.body_gen_ai_conversation_id}} root_session={{.body_defenseclaw_session_root_id}} parent_session={{.body_defenseclaw_session_parent_id}} source={{.body_defenseclaw_session_source}} resumed={{.body_defenseclaw_session_resumed}} \u00b7 lifecycle={{.body_defenseclaw_agent_lifecycle_id}}/{{.body_defenseclaw_agent_lifecycle_event}}/{{.body_defenseclaw_agent_lifecycle_state}} execution={{.body_defenseclaw_agent_execution_id}} phase={{.body_defenseclaw_agent_phase_previous}}\u2192{{.body_defenseclaw_agent_phase}} \u00b7 request={{.body_defenseclaw_request_id}} turn={{.body_defenseclaw_turn_id}} run={{.body_defenseclaw_run_id}} operation={{.body_defenseclaw_operation_id}} \u00b7 model={{.body_gen_ai_provider_name}}/{{.body_gen_ai_request_model}}\u2192{{.body_gen_ai_response_model}} model_request={{.body_defenseclaw_model_request_id}} model_response={{.body_defenseclaw_model_response_id}} \u00b7 tool={{.body_gen_ai_tool_name}} type={{.body_gen_ai_tool_type}} call={{.body_gen_ai_tool_call_id}} provider={{.body_defenseclaw_tool_provider}} skill={{.body_defenseclaw_tool_skill_key}} status={{.body_defenseclaw_tool_status}} exit={{.body_defenseclaw_tool_exit_code}} destination={{.body_defenseclaw_destination_app}} \u00b7 approval={{.body_defenseclaw_approval_id}} result={{.body_defenseclaw_approval_result}} actor={{.body_defenseclaw_approval_actor_type}} dangerous={{.body_defenseclaw_approval_dangerous}} \u00b7 outcome={{.outcome}} \u00b7 trace_id={{.correlation_trace_id}} span_id={{.correlation_span_id}}\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": false,
+        "prettifyLogMessage": false,
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Ascending"
+      }
+    },
+    {
+      "id": 41,
+      "type": "bargauge",
+      "title": "Connector average observed phase duration",
+      "description": "Connector-wide completed span duration grouped by the bounded canonical phase.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 130,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (defenseclaw_agent_phase) (increase(defenseclaw_agent_span_duration_milliseconds_sum{connector=~\"(${connector:regex}|^$)\",defenseclaw_agent_phase!=\"\"}[$__range])) / clamp_min(sum by (defenseclaw_agent_phase) (increase(defenseclaw_agent_span_duration_milliseconds_count{connector=~\"(${connector:regex}|^$)\",defenseclaw_agent_phase!=\"\"}[$__range])), 1)",
+          "instant": true,
+          "legendFormat": "{{defenseclaw_agent_phase}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 42,
+      "type": "bargauge",
+      "title": "Connector slowest operation classes (p95)",
+      "description": "Connector-wide span classes split by the bounded canonical phase.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 130,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, span_name, defenseclaw_agent_phase) (increase(defenseclaw_agent_span_duration_milliseconds_bucket{connector=~\"(${connector:regex}|^$)\"}[$__range]))))",
+          "instant": true,
+          "legendFormat": "{{defenseclaw_agent_phase}} \u00b7 {{span_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 43,
+      "type": "nodeGraph",
+      "title": "Connector phase network",
+      "description": "Directed source \u2192 target phase transitions aggregated across the selected connectors and range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 138,
+        "w": 16,
+        "h": 14
+      },
+      "targets": [
+        {
+          "expr": "label_join(label_replace(label_replace(sum by (defenseclaw_agent_phase_from, defenseclaw_agent_phase_to) (increase(defenseclaw_agent_phase_transitions_total{connector=~\"$connector\"}[$__range])), \"source\", \"$1\", \"defenseclaw_agent_phase_from\", \"(.+)\"), \"target\", \"$1\", \"defenseclaw_agent_phase_to\", \"(.+)\"), \"id\", \" \u2192 \", \"defenseclaw_agent_phase_from\", \"defenseclaw_agent_phase_to\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "phase transitions",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "defenseclaw_agent_phase_from": true,
+              "defenseclaw_agent_phase_to": true
+            },
+            "renameByName": {
+              "Value": "mainstat"
+            }
+          }
+        }
+      ],
+      "options": {
+        "nodes": {
+          "mainStatUnit": "short"
+        },
+        "edges": {
+          "mainStatUnit": "short"
+        }
+      }
+    },
+    {
+      "id": 44,
+      "type": "table",
+      "title": "Connector directed phase edges (source \u2192 target)",
+      "description": "Explicit direction and aggregate count for each bounded phase edge in the selected connector range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "defenseclaw-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 138,
+        "w": 8,
+        "h": 14
+      },
+      "targets": [
+        {
+          "expr": "label_join(sum by (defenseclaw_agent_phase_from, defenseclaw_agent_phase_to) (increase(defenseclaw_agent_phase_transitions_total{connector=~\"$connector\"}[$__range])), \"direction\", \" \u2192 \", \"defenseclaw_agent_phase_from\", \"defenseclaw_agent_phase_to\")",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "renameByName": {
+              "Value": "Transitions",
+              "defenseclaw_agent_phase_from": "From",
+              "defenseclaw_agent_phase_to": "To",
+              "direction": "Direction"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Transitions"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Transitions",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "id": 24,
+      "type": "nodeGraph",
+      "title": "Lifecycle DAG \u2014 prompt \u2192 agents \u2192 work \u2192 outcomes",
+      "description": "Canonical Loki event DAG for the selected root or agent, not a total event timeline. Session-start and durable lineage anchors are recovered from the last 24 hours; a recovered agent edge is retained only when its child has graph-eligible activity in the selected range. Agent edges come only from active typed agent-to-agent parent_of relationships or the contract-defined inverse of delegated_by; raw subagent parent fields and trace parentage never create graph lineage. Each recovered relationship endpoint suppresses itself whenever that exact agent ID has graph-eligible activity in the selected range, keeping boundary edges renderable without duplicating the visual node. For graph-active agents, canonical 24-hour session_start or subagent_start display metadata wins regardless of later event volume; durable relationship records alone establish parentage; only agents without a canonical start use a one-row-per-ID selected-range fallback. Stable agent IDs therefore define one node per agent, while optional session details remain in the linked raw views so totals are not split across duplicate node IDs. A Session start anchor is deliberately not presented as prompt content. A grouped Prompt inputs node counts canonical depth-zero prompt submissions in the selected range, including the initial request and later follow-ups, without adding one node per message. Codex uses connector-source UserPromptSubmit facts and excludes native OTLP model.request mirrors from the summary; other connectors use recognized prompt-submission hooks with model.request as a fallback so hook-only and model-only connectors remain visible. Prompt counts are distinct by turn ID, model request ID, request ID, operation ID, then occurrence ID inside each observation family/source, after which the largest source count is shown. Native and connector records remain unchanged in the linked raw and ordered drilldowns. The dashboard applies no redaction: it displays or links every field present in canonical OTEL, with DefenseClaw's central redaction and projection boundary upstream. Model, tool, and approval groups use request records so work remains visible without a terminal counterpart; totals are request counts, not assertions that work is still pending. Terminal records remain available in the linked lifecycle, raw, decision, and trace views. Repeated model calls collapse per owning agent, provider, and model. Model-call totals first sum within each observation source and then use the largest source total, preventing connector and OTLP-receiver mirrors from double-counting the same calls while retaining source-only observations. Repeated tool calls collapse per owning agent into normalized families: Skills, MCP, Bash, File edits, Collaboration, Web / browser, Visual, and Task control; an unrecognized tool keeps its reported name. Exact collaboration send_message requests are excluded from the generic tool-family groups so they are not represented twice. Canonical send_message requests to /root or /root/* collapse per sender into one Messages to root node whose target resolves to the exported root agent ID; exact root task paths and calls remain in the raw and ordered drilldowns, while non-root targets remain explicitly grouped as reported. Turn outcomes group completed, failed, and interrupted turns per owning agent; session and subagent outcomes remain execution-specific. Click a grouped node or edge for Total in range, count meaning, ownership, lineage provenance, and drill-down links to exact calls, operations, exit codes, and traces. Approval edges are dashed and agent/execution-scoped because approval events do not export an exact tool-call ID. The graph is directed acyclic and uses Grafana's layered layout.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 152,
+        "w": 24,
+        "h": 22
+      },
+      "targets": [
+        {
+          "expr": "sum by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__lifecycle_id, detail__execution_id, detail__operation_id, detail__outcome, detail__trace_id, detail__connector) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=`session_start` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"session_start\" | body_defenseclaw_session_resumed!=\"true\" | label_format id=`edge:session:{{.body_gen_ai_agent_id}}`, source=`session:{{.body_gen_ai_agent_id}}`, target=`agent:{{.body_gen_ai_agent_id}}`, mainstat=`session start`, secondarystat=`root`, color=`#B877D9`, detail__edge_kind=`session_starts_root`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__lifecycle_id=`{{.body_defenseclaw_agent_lifecycle_id}}`, detail__execution_id=`{{.body_defenseclaw_agent_execution_id}}`, detail__operation_id=`{{.body_defenseclaw_operation_id}}`, detail__outcome=`{{.outcome}}`, detail__trace_id=`{{.correlation_trace_id}}`, detail__connector=`{{.connector}}` [24h]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesSessionStart"
+        },
+        {
+          "expr": "(max by (id, source, target, mainstat, secondarystat, color, connector, graph_child_id, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__lineage_provenance, detail__connector, detail__trace_id, detail__count_meaning, detail__correlation_note) (sum by (id, source, target, mainstat, secondarystat, color, connector, graph_child_id, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__lineage_provenance, detail__connector, detail__trace_id, detail__count_meaning, detail__correlation_note, lineage_orientation) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=`correlation.relationship.changed` | json | __error__=\"\" | connector=~\"${connector:regex}\" | event_name=\"correlation.relationship.changed\" | body_defenseclaw_correlation_relationship_status=\"active\" | body_defenseclaw_correlation_relationship_source_kind=\"agent\" | body_defenseclaw_correlation_relationship_target_kind=\"agent\" | body_defenseclaw_correlation_relationship_type=~\"parent_of|delegated_by\" | label_format lineage_orientation=`{{.body_defenseclaw_correlation_relationship_type}}`, graph_parent_id=`{{if eq .body_defenseclaw_correlation_relationship_type \"parent_of\"}}{{.body_defenseclaw_correlation_relationship_source_id}}{{else}}{{.body_defenseclaw_correlation_relationship_target_id}}{{end}}`, graph_child_id=`{{if eq .body_defenseclaw_correlation_relationship_type \"parent_of\"}}{{.body_defenseclaw_correlation_relationship_target_id}}{{else}}{{.body_defenseclaw_correlation_relationship_source_id}}{{end}}` | label_format id=`edge:spawn:{{.graph_parent_id}}:{{.graph_child_id}}`, source=`agent:{{.graph_parent_id}}`, target=`agent:{{.graph_child_id}}`, mainstat=`spawns`, secondarystat=`durable lineage`, color=`#5794F2`, detail__edge_kind=`parent_agent_to_subagent`, detail__agent_id=`{{.graph_child_id}}`, detail__root_agent_id=``, detail__parent_agent_id=`{{.graph_parent_id}}`, detail__lineage_provenance=`durable parent_of/delegated_by relationship`, detail__connector=`{{.connector}}`, detail__trace_id=`{{.correlation_trace_id}}`, detail__count_meaning=`Active typed agent-lineage relationship observations recovered from the last 24 hours; paired inverse orientations count once.`, detail__correlation_note=`parent_of is used directly; delegated_by is its contract-defined inverse fallback. Trace parentage and raw subagent parent fields never create this edge.` [24h])))) and on (connector, graph_child_id) (sum by (connector, graph_child_id) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` | label_format graph_child_id=`{{.body_gen_ai_agent_id}}` [$__range])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesSpawn"
+        },
+        {
+          "expr": "max by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__event_name, detail__count_meaning, detail__correlation_note) (count by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__event_name, detail__count_meaning, detail__correlation_note, prompt_observation) (count by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__event_name, detail__count_meaning, detail__correlation_note, prompt_observation, prompt_key) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`hook_decision|model.request` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | ((event_name=\"hook_decision\" and source=\"connector\" and body_defenseclaw_hook_event=~\"(?i)^(userpromptsubmit|beforesubmitprompt|pre_user_prompt|userpromptsubmitted|user_prompt_submit|prompt)$\") or (connector!=\"codex\" and event_name=\"model.request\")) | body_defenseclaw_agent_depth=\"0\" | label_format prompt_observation=`{{if eq .event_name \"hook_decision\"}}hook_submission{{else if .source}}{{.source}}{{else}}unreported{{end}}`, prompt_key=`{{if .body_defenseclaw_turn_id}}{{.body_defenseclaw_turn_id}}{{else if .body_defenseclaw_model_request_id}}{{.body_defenseclaw_model_request_id}}{{else if .body_defenseclaw_request_id}}{{.body_defenseclaw_request_id}}{{else if .body_defenseclaw_operation_id}}{{.body_defenseclaw_operation_id}}{{else}}{{.record_id}}{{end}}` | label_format id=`edge:prompts:{{.body_gen_ai_agent_id}}`, source=`prompts:{{.body_gen_ai_agent_id}}`, target=`agent:{{.body_gen_ai_agent_id}}`, mainstat=`prompts`, secondarystat=`first + follow-ups`, color=`#B877D9`, detail__edge_kind=`prompt_submissions_to_root`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__event_name=`prompt submission`, detail__count_meaning=`Canonical depth-zero prompt submissions: connector-source prompt hooks are preferred; non-Codex model.request observations are a fallback.`, detail__correlation_note=`Counts are distinct by stable prompt key inside each observation family/source, then the largest source count is shown. Codex native OTLP model.request mirrors remain available only in the raw and ordered drilldowns.` [$__range]))))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesConversationPrompts"
+        },
+        {
+          "expr": "max by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__model, detail__provider, detail__count_meaning, detail__correlation_note) (sum by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__model, detail__provider, detail__count_meaning, detail__correlation_note, observation_source) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`model\\.(request|response|call\\.failed)` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"model.request\" | label_format observation_source=`{{if .source}}{{.source}}{{else}}unreported{{end}}` | label_format id=`edge:model:{{.body_gen_ai_agent_id}}:{{.body_gen_ai_provider_name}}:{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else}}{{.body_gen_ai_request_model}}{{end}}`, source=`agent:{{.body_gen_ai_agent_id}}`, target=`model:{{.body_gen_ai_agent_id}}:{{.body_gen_ai_provider_name}}:{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else}}{{.body_gen_ai_request_model}}{{end}}`, mainstat=`invokes`, secondarystat=`model group`, color=`#B877D9`, detail__edge_kind=`agent_model_summary`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__model=`{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else}}{{.body_gen_ai_request_model}}{{end}}`, detail__provider=`{{.body_gen_ai_provider_name}}`, detail__count_meaning=`Source-deduplicated model requests on this relationship in the selected range.`, detail__correlation_note=`Counts first sum within each observation source, then use the largest source total so connector and OTLP-receiver mirrors do not double-count the same calls. Raw request and terminal records remain unchanged in the linked drilldowns.` [$__range])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesModelSummary"
+        },
+        {
+          "expr": "sum by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__tool, detail__tool_family, detail__count_meaning, detail__correlation_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`tool\\.invocation\\.(requested|completed|failed|blocked)` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"tool.invocation.requested\" | body_gen_ai_tool_name!~\"(?i)collaboration[._]*send[._]*message\" | label_format tool_family=`{{if contains \"skill\" (lower .body_gen_ai_tool_name)}}Skills{{else if hasPrefix \"mcp\" (lower .body_gen_ai_tool_name)}}MCP{{else if or (eq (lower .body_gen_ai_tool_name) \"bash\") (eq (lower .body_gen_ai_tool_name) \"shell\") (eq (lower .body_gen_ai_tool_name) \"exec_command\") (eq (lower .body_gen_ai_tool_name) \"run_shell_command\") (contains \"shell\" (lower .body_gen_ai_tool_name)) (contains \"terminal\" (lower .body_gen_ai_tool_name))}}Bash{{else if eq (lower .body_gen_ai_tool_name) \"apply_patch\"}}File edits{{else if hasPrefix \"collaboration\" (lower .body_gen_ai_tool_name)}}Collaboration{{else if or (hasPrefix \"web\" (lower .body_gen_ai_tool_name)) (contains \"browser\" (lower .body_gen_ai_tool_name))}}Web / browser{{else if or (contains \"image\" (lower .body_gen_ai_tool_name)) (contains \"visual\" (lower .body_gen_ai_tool_name))}}Visual{{else if or (eq (lower .body_gen_ai_tool_name) \"update_plan\") (eq (lower .body_gen_ai_tool_name) \"get_goal\") (eq (lower .body_gen_ai_tool_name) \"update_goal\")}}Task control{{else}}{{.body_gen_ai_tool_name}}{{end}}` | label_format id=`edge:tool:{{.body_gen_ai_agent_id}}:{{.tool_family}}`, source=`agent:{{.body_gen_ai_agent_id}}`, target=`tool:{{.body_gen_ai_agent_id}}:{{.tool_family}}`, mainstat=`invokes`, secondarystat=`tool family`, color=`#FF9830`, detail__edge_kind=`agent_tool_summary`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__tool=`{{.tool_family}}`, detail__tool_family=`{{.tool_family}}`, detail__count_meaning=`Tool requests on this relationship in the selected range, excluding send_message requests represented by message nodes.`, detail__correlation_note=`Request records remain visible without a terminal counterpart; the total is a request count, not pending status. Exact send_message requests are represented only by message groups. Use the linked Activity, lifecycle, and raw views for terminal status, call IDs, arguments/results, exit codes, and traces.` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesToolSummary"
+        },
+        {
+          "expr": "sum by (id, source, target, mainstat, secondarystat, color, strokeDasharray, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__lifecycle_id, detail__execution_id, detail__operation_id, detail__outcome, detail__trace_id, detail__connector, detail__approval_id, detail__correlation_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`approval\\.(requested|resolved)` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"approval.requested\" | label_format id=`edge:approval:{{.body_gen_ai_agent_id}}:{{.body_defenseclaw_approval_id}}`, source=`agent:{{.body_gen_ai_agent_id}}`, target=`approval:{{.body_gen_ai_agent_id}}:{{.body_defenseclaw_approval_id}}`, mainstat=`approval`, secondarystat=`request`, color=`#F2CC0C`, strokeDasharray=`4 3`, detail__edge_kind=`agent_approval`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__lifecycle_id=`{{.body_defenseclaw_agent_lifecycle_id}}`, detail__execution_id=`{{.body_defenseclaw_agent_execution_id}}`, detail__operation_id=`{{.body_defenseclaw_operation_id}}`, detail__outcome=`{{.outcome}}`, detail__trace_id=`{{.correlation_trace_id}}`, detail__connector=`{{.connector}}`, detail__approval_id=`{{.body_defenseclaw_approval_id}}`, detail__correlation_note=`Canonical approval request scoped to the owning agent and execution; use the linked decision and raw views for its eventual result.` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesApproval"
+        },
+        {
+          "expr": "sum by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__target_task, detail__target_agent_id, detail__delivery_status, detail__connector, detail__trace_id, detail__count_meaning, detail__correlation_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=`tool.invocation.requested` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"tool.invocation.requested\" | body_gen_ai_tool_name=~\"(?i)collaboration[._]*send[._]*message\" | body_gen_ai_tool_call_arguments_target!=\"\" | label_format message_target_group=`{{if or (eq .body_gen_ai_tool_call_arguments_target \"/root\") (hasPrefix \"/root/\" .body_gen_ai_tool_call_arguments_target)}}/root{{else}}{{.body_gen_ai_tool_call_arguments_target}}{{end}}` | label_format id=`edge:message:{{.body_gen_ai_agent_id}}:{{.message_target_group}}`, source=`agent:{{.body_gen_ai_agent_id}}`, target=`message:{{.body_gen_ai_agent_id}}:{{.message_target_group}}`, mainstat=`sends`, secondarystat=`{{if eq .message_target_group \"/root\"}}Messages to root{{else}}{{.message_target_group}}{{end}}`, color=`#8AB8FF`, detail__edge_kind=`agent_sends_message`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__target_task=`{{if eq .message_target_group \"/root\"}}/root and /root/* (grouped){{else}}{{.message_target_group}}{{end}}`, detail__target_agent_id=`{{if eq .message_target_group \"/root\"}}{{.body_defenseclaw_agent_root_id}}{{else}}{{end}}`, detail__delivery_status=`attempted`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__count_meaning=`Grouped send_message request count for this sender in the selected range; /root and /root/* share one group while non-root targets remain exact.`, detail__correlation_note=`The root group resolves to the exported root agent ID. Exact root task paths, call IDs, and terminal delivery status remain in the raw and ordered drilldowns; non-root task paths remain explicit without an invented target-agent mapping.` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesMessages"
+        },
+        {
+          "expr": "sum by (id, source, target, mainstat, secondarystat, color, detail__edge_kind, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__lifecycle_id, detail__execution_id, detail__lifecycle_event, detail__state, detail__outcome, detail__connector, detail__trace_id, detail__count_meaning, detail__correlation_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_end|subagent_stop|turn_end` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_end|subagent_stop|turn_end` | label_format id=`edge:outcome:{{.body_gen_ai_agent_id}}:{{if eq .event_name \"turn_end\"}}turns:{{.body_defenseclaw_agent_lifecycle_state}}:{{.outcome}}{{else}}{{.body_defenseclaw_agent_execution_id}}{{end}}`, source=`agent:{{.body_gen_ai_agent_id}}`, target=`outcome:{{.body_gen_ai_agent_id}}:{{if eq .event_name \"turn_end\"}}turns:{{.body_defenseclaw_agent_lifecycle_state}}:{{.outcome}}{{else}}{{.body_defenseclaw_agent_execution_id}}{{end}}`, mainstat=`outcomes`, secondarystat=`{{.body_defenseclaw_agent_lifecycle_event}} / {{.body_defenseclaw_agent_lifecycle_state}}`, color=`#73BF69`, detail__edge_kind=`agent_outcomes`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__lifecycle_id=`{{.body_defenseclaw_agent_lifecycle_id}}`, detail__execution_id=`{{if eq .event_name \"turn_end\"}}grouped{{else}}{{.body_defenseclaw_agent_execution_id}}{{end}}`, detail__lifecycle_event=`{{.body_defenseclaw_agent_lifecycle_event}}`, detail__state=`{{.body_defenseclaw_agent_lifecycle_state}}`, detail__outcome=`{{.outcome}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__count_meaning=`Session/subagent terminal observation for an execution, or grouped turn_end observations for one agent/state/outcome.`, detail__correlation_note=`Turn outcomes are grouped to keep the DAG compact; use the ordered or raw view for exact turn, execution, operation, and trace IDs.` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "directed edges",
+          "refId": "edgesOutcome"
+        },
+        {
+          "expr": "sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__session_id, detail__root_session_id, detail__parent_session_id, detail__lifecycle_id, detail__execution_id, detail__sequence, detail__operation_id, detail__lifecycle_event, detail__state, detail__outcome, detail__trace_id, detail__span_id, detail__turn_id, detail__connector, detail__session_source, detail__session_resumed, detail__content_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=`session_start` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"session_start\" | body_defenseclaw_session_resumed!=\"true\" | label_format id=`session:{{.body_gen_ai_agent_id}}`, title=`Session start`, subtitle=`non-resumed root`, mainstat=`session`, secondarystat=`start`, color=`#B877D9`, detail__node_type=`session_start`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__session_id=`{{.body_gen_ai_conversation_id}}`, detail__root_session_id=`{{.body_defenseclaw_session_root_id}}`, detail__parent_session_id=`{{.body_defenseclaw_session_parent_id}}`, detail__lifecycle_id=`{{.body_defenseclaw_agent_lifecycle_id}}`, detail__execution_id=`{{.body_defenseclaw_agent_execution_id}}`, detail__sequence=`{{.body_defenseclaw_agent_sequence}}`, detail__operation_id=`{{.body_defenseclaw_operation_id}}`, detail__lifecycle_event=`{{.body_defenseclaw_agent_lifecycle_event}}`, detail__state=`{{.body_defenseclaw_agent_lifecycle_state}}`, detail__outcome=`{{.outcome}}`, detail__trace_id=`{{.correlation_trace_id}}`, detail__span_id=`{{.correlation_span_id}}`, detail__turn_id=`{{.body_defenseclaw_turn_id}}`, detail__connector=`{{.connector}}`, detail__session_source=`{{.body_defenseclaw_session_source}}`, detail__session_resumed=`{{.body_defenseclaw_session_resumed}}`, detail__content_note=`session_start is a lifecycle anchor, not prompt content. Prompt inputs are represented separately and raw canonical OTEL remains linked without dashboard-side truncation.` [24h]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesSessionStart"
+        },
+        {
+          "expr": "(sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__count_meaning) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=`session_start` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"session_start\" | body_defenseclaw_session_resumed!=\"true\" | label_format id=`agent:{{.body_gen_ai_agent_id}}`, title=`{{.body_gen_ai_agent_name}}`, subtitle=`{{.body_defenseclaw_agent_type}} • depth {{.body_defenseclaw_agent_depth}}`, mainstat=`{{.body_defenseclaw_agent_type}}`, secondarystat=`depth {{.body_defenseclaw_agent_depth}}`, color=`#5794F2`, detail__node_type=`root_agent_anchor`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__count_meaning=`Root-agent endpoint recovered with the matching 24-hour session anchor only when that exact agent has no graph-eligible activity in the selected range, so every session edge remains renderable at selected-range boundaries without a duplicate node ID.` [24h]))) unless on (id) (sum by (id) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` | label_format id=`agent:{{.body_gen_ai_agent_id}}` [$__range])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesRootAnchor"
+        },
+        {
+          "expr": "((max by (id, title, subtitle, mainstat, secondarystat, color, connector, graph_child_id, detail__node_type, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__count_meaning) (sum by (id, title, subtitle, mainstat, secondarystat, color, connector, graph_child_id, detail__node_type, detail__agent_id, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__count_meaning, lineage_orientation) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=`correlation.relationship.changed` | json | __error__=\"\" | connector=~\"${connector:regex}\" | event_name=\"correlation.relationship.changed\" | body_defenseclaw_correlation_relationship_status=\"active\" | body_defenseclaw_correlation_relationship_source_kind=\"agent\" | body_defenseclaw_correlation_relationship_target_kind=\"agent\" | body_defenseclaw_correlation_relationship_type=~\"parent_of|delegated_by\" | label_format lineage_orientation=`{{.body_defenseclaw_correlation_relationship_type}}`, graph_parent_id=`{{if eq .body_defenseclaw_correlation_relationship_type \"parent_of\"}}{{.body_defenseclaw_correlation_relationship_source_id}}{{else}}{{.body_defenseclaw_correlation_relationship_target_id}}{{end}}`, graph_child_id=`{{if eq .body_defenseclaw_correlation_relationship_type \"parent_of\"}}{{.body_defenseclaw_correlation_relationship_target_id}}{{else}}{{.body_defenseclaw_correlation_relationship_source_id}}{{end}}` | label_format id=`agent:{{.graph_parent_id}}`, title=`{{.graph_parent_id}}`, subtitle=`durable lineage parent`, mainstat=`agent`, secondarystat=`spawn parent`, color=`#5794F2`, detail__node_type=`spawn_parent_anchor`, detail__agent_id=`{{.graph_parent_id}}`, detail__root_agent_id=``, detail__parent_agent_id=``, detail__connector=`{{.connector}}`, detail__count_meaning=`Parent endpoint recovered from typed parent_of or inverse delegated_by relationship evidence for children active in the selected range, only when that exact parent has no graph-eligible activity in range.` [24h])))) and on (connector, graph_child_id) (sum by (connector, graph_child_id) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` | label_format graph_child_id=`{{.body_gen_ai_agent_id}}` [$__range])))) unless on (connector, id) (sum by (connector, id) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` | label_format id=`agent:{{.body_gen_ai_agent_id}}` [$__range])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesSpawnParent"
+        },
+        {
+          "expr": "((topk by (id) (1, sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__count_meaning) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start` | ((event_name=\"subagent_start\") or (event_name=\"session_start\" and body_defenseclaw_session_resumed!=\"true\")) | label_format id=`agent:{{.body_gen_ai_agent_id}}`, title=`{{.body_gen_ai_agent_name}}`, subtitle=`{{.body_defenseclaw_agent_type}} • depth {{.body_defenseclaw_agent_depth}}`, mainstat=`{{.body_defenseclaw_agent_type}}`, secondarystat=`depth {{.body_defenseclaw_agent_depth}}`, color=`#5794F2`, detail__node_type=`agent`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__count_meaning=`Canonical 24-hour session_start or subagent_start identity selected for this graph-active agent; conflicting later title or depth labels cannot create another node row.` [24h])))) and on (id) (sum by (id) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` | label_format id=`agent:{{.body_gen_ai_agent_id}}` [$__range])))) or ((topk by (id) (1, sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__count_meaning) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start|turn_end|model\\.(request|response|call\\.failed)|tool\\.invocation\\.(requested|completed|failed|blocked)|approval\\.(requested|resolved)|hook_decision|session_end|subagent_stop` | label_format id=`agent:{{.body_gen_ai_agent_id}}`, title=`{{.body_gen_ai_agent_name}}`, subtitle=`{{.body_defenseclaw_agent_type}} • depth {{.body_defenseclaw_agent_depth}}`, mainstat=`{{.body_defenseclaw_agent_type}}`, secondarystat=`depth {{.body_defenseclaw_agent_depth}}`, color=`#5794F2`, detail__node_type=`agent`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__count_meaning=`Graph-eligible selected-range identity fallback used only when this exact agent has no canonical session_start or subagent_start in the last 24 hours.` [$__range])))) unless on (id) (sum by (id) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_start|subagent_start` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_start|subagent_start` | ((event_name=\"subagent_start\") or (event_name=\"session_start\" and body_defenseclaw_session_resumed!=\"true\")) | label_format id=`agent:{{.body_gen_ai_agent_id}}` [24h]))))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesAgent"
+        },
+        {
+          "expr": "max by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__event_name, detail__count_meaning, detail__correlation_note) (count by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__event_name, detail__count_meaning, detail__correlation_note, prompt_observation) (count by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__event_name, detail__count_meaning, detail__correlation_note, prompt_observation, prompt_key) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`hook_decision|model.request` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | ((event_name=\"hook_decision\" and source=\"connector\" and body_defenseclaw_hook_event=~\"(?i)^(userpromptsubmit|beforesubmitprompt|pre_user_prompt|userpromptsubmitted|user_prompt_submit|prompt)$\") or (connector!=\"codex\" and event_name=\"model.request\")) | body_defenseclaw_agent_depth=\"0\" | label_format prompt_observation=`{{if eq .event_name \"hook_decision\"}}hook_submission{{else if .source}}{{.source}}{{else}}unreported{{end}}`, prompt_key=`{{if .body_defenseclaw_turn_id}}{{.body_defenseclaw_turn_id}}{{else if .body_defenseclaw_model_request_id}}{{.body_defenseclaw_model_request_id}}{{else if .body_defenseclaw_request_id}}{{.body_defenseclaw_request_id}}{{else if .body_defenseclaw_operation_id}}{{.body_defenseclaw_operation_id}}{{else}}{{.record_id}}{{end}}` | label_format id=`prompts:{{.body_gen_ai_agent_id}}`, title=`Prompt inputs`, subtitle=`prompt submissions • depth 0`, mainstat=`prompt requests`, secondarystat=`first + follow-ups`, color=`#B877D9`, detail__node_type=`prompt_summary`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__event_name=`prompt submission`, detail__count_meaning=`Canonical depth-zero prompt submissions: connector-source prompt hooks are preferred; non-Codex model.request observations are a fallback.`, detail__correlation_note=`Counts are distinct by stable prompt key inside each observation family/source, then the largest source count is shown. Codex native OTLP model.request mirrors remain available only in the raw and ordered drilldowns.` [$__range]))))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesConversationPrompts"
+        },
+        {
+          "expr": "max by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__model, detail__provider, detail__count_meaning, detail__correlation_note) (sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__connector, detail__trace_id, detail__model, detail__provider, detail__count_meaning, detail__correlation_note, observation_source) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`model\\.(request|response|call\\.failed)` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"model.request\" | label_format observation_source=`{{if .source}}{{.source}}{{else}}unreported{{end}}` | label_format id=`model:{{.body_gen_ai_agent_id}}:{{.body_gen_ai_provider_name}}:{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else}}{{.body_gen_ai_request_model}}{{end}}`, title=`{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else}}{{.body_gen_ai_request_model}}{{end}}`, subtitle=`{{.body_gen_ai_provider_name}}`, mainstat=`model requests`, secondarystat=`source-deduped`, color=`#B877D9`, detail__node_type=`model_summary`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__model=`{{if .body_gen_ai_response_model}}{{.body_gen_ai_response_model}}{{else}}{{.body_gen_ai_request_model}}{{end}}`, detail__provider=`{{.body_gen_ai_provider_name}}`, detail__count_meaning=`Source-deduplicated model requests for this agent, provider, and model in the selected range.`, detail__correlation_note=`Counts first sum within each observation source, then use the largest source total so connector and OTLP-receiver mirrors do not double-count the same calls. Raw request and terminal records remain unchanged in the linked drilldowns.` [$__range])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesModelSummary"
+        },
+        {
+          "expr": "sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__root_agent_id, detail__connector, detail__trace_id, detail__tool, detail__tool_family, detail__count_meaning, detail__correlation_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`tool\\.invocation\\.(requested|completed|failed|blocked)` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"tool.invocation.requested\" | body_gen_ai_tool_name!~\"(?i)collaboration[._]*send[._]*message\" | label_format tool_family=`{{if contains \"skill\" (lower .body_gen_ai_tool_name)}}Skills{{else if hasPrefix \"mcp\" (lower .body_gen_ai_tool_name)}}MCP{{else if or (eq (lower .body_gen_ai_tool_name) \"bash\") (eq (lower .body_gen_ai_tool_name) \"shell\") (eq (lower .body_gen_ai_tool_name) \"exec_command\") (eq (lower .body_gen_ai_tool_name) \"run_shell_command\") (contains \"shell\" (lower .body_gen_ai_tool_name)) (contains \"terminal\" (lower .body_gen_ai_tool_name))}}Bash{{else if eq (lower .body_gen_ai_tool_name) \"apply_patch\"}}File edits{{else if hasPrefix \"collaboration\" (lower .body_gen_ai_tool_name)}}Collaboration{{else if or (hasPrefix \"web\" (lower .body_gen_ai_tool_name)) (contains \"browser\" (lower .body_gen_ai_tool_name))}}Web / browser{{else if or (contains \"image\" (lower .body_gen_ai_tool_name)) (contains \"visual\" (lower .body_gen_ai_tool_name))}}Visual{{else if or (eq (lower .body_gen_ai_tool_name) \"update_plan\") (eq (lower .body_gen_ai_tool_name) \"get_goal\") (eq (lower .body_gen_ai_tool_name) \"update_goal\")}}Task control{{else}}{{.body_gen_ai_tool_name}}{{end}}` | label_format id=`tool:{{.body_gen_ai_agent_id}}:{{.tool_family}}`, title=`{{.tool_family}}`, subtitle=`tool family`, mainstat=`tool requests`, secondarystat=`grouped`, color=`#FF9830`, detail__node_type=`tool_summary`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__tool=`{{.tool_family}}`, detail__tool_family=`{{.tool_family}}`, detail__count_meaning=`Tool requests in this family for this owning agent in the selected range, excluding send_message requests represented by message nodes.`, detail__correlation_note=`Request records remain visible without a terminal counterpart; the total is a request count, not pending status. Exact send_message requests are represented only by message groups. Use the linked Activity, lifecycle, and raw views for terminal status, call IDs, arguments/results, exit codes, and traces.` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesToolSummary"
+        },
+        {
+          "expr": "sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__session_id, detail__root_session_id, detail__parent_session_id, detail__lifecycle_id, detail__execution_id, detail__sequence, detail__operation_id, detail__lifecycle_event, detail__state, detail__outcome, detail__trace_id, detail__span_id, detail__turn_id, detail__connector, detail__approval_id, detail__approval_result, detail__approval_actor, detail__command_name, detail__dangerous) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`approval\\.(requested|resolved)` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"approval.requested\" | label_format id=`approval:{{.body_gen_ai_agent_id}}:{{.body_defenseclaw_approval_id}}`, title=`Approval request`, subtitle=`pending or resolved`, mainstat=`requested`, secondarystat=`approval`, color=`#F2CC0C`, detail__node_type=`approval_request`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__session_id=`{{.body_gen_ai_conversation_id}}`, detail__root_session_id=`{{.body_defenseclaw_session_root_id}}`, detail__parent_session_id=`{{.body_defenseclaw_session_parent_id}}`, detail__lifecycle_id=`{{.body_defenseclaw_agent_lifecycle_id}}`, detail__execution_id=`{{.body_defenseclaw_agent_execution_id}}`, detail__sequence=`{{.body_defenseclaw_agent_sequence}}`, detail__operation_id=`{{.body_defenseclaw_operation_id}}`, detail__lifecycle_event=`{{.body_defenseclaw_agent_lifecycle_event}}`, detail__state=`{{.body_defenseclaw_agent_lifecycle_state}}`, detail__outcome=`{{.outcome}}`, detail__trace_id=`{{.correlation_trace_id}}`, detail__span_id=`{{.correlation_span_id}}`, detail__turn_id=`{{.body_defenseclaw_turn_id}}`, detail__connector=`{{.connector}}`, detail__approval_id=`{{.body_defenseclaw_approval_id}}`, detail__approval_result=`{{.body_defenseclaw_approval_result}}`, detail__approval_actor=`{{.body_defenseclaw_approval_actor_type}}`, detail__command_name=`{{.body_defenseclaw_approval_command_name}}`, detail__dangerous=`{{.body_defenseclaw_approval_dangerous}}` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesApproval"
+        },
+        {
+          "expr": "sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__target_task, detail__target_agent_id, detail__delivery_status, detail__connector, detail__trace_id, detail__count_meaning, detail__correlation_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=`tool.invocation.requested` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=\"tool.invocation.requested\" | body_gen_ai_tool_name=~\"(?i)collaboration[._]*send[._]*message\" | body_gen_ai_tool_call_arguments_target!=\"\" | label_format message_target_group=`{{if or (eq .body_gen_ai_tool_call_arguments_target \"/root\") (hasPrefix \"/root/\" .body_gen_ai_tool_call_arguments_target)}}/root{{else}}{{.body_gen_ai_tool_call_arguments_target}}{{end}}` | label_format id=`message:{{.body_gen_ai_agent_id}}:{{.message_target_group}}`, title=`{{if eq .message_target_group \"/root\"}}Messages to root{{else}}Agent messages{{end}}`, subtitle=`{{if eq .message_target_group \"/root\"}}all /root task paths{{else}}to {{.message_target_group}}{{end}}`, mainstat=`send_message requests`, secondarystat=`grouped`, color=`#8AB8FF`, detail__node_type=`agent_messages`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__target_task=`{{if eq .message_target_group \"/root\"}}/root and /root/* (grouped){{else}}{{.message_target_group}}{{end}}`, detail__target_agent_id=`{{if eq .message_target_group \"/root\"}}{{.body_defenseclaw_agent_root_id}}{{else}}{{end}}`, detail__delivery_status=`attempted`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__count_meaning=`Grouped send_message request count for this sender in the selected range; /root and /root/* share one group while non-root targets remain exact.`, detail__correlation_note=`The root group resolves to the exported root agent ID. Exact root task paths, call IDs, and terminal delivery status remain in the raw and ordered drilldowns; non-root task paths remain explicit without an invented target-agent mapping.` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesMessages"
+        },
+        {
+          "expr": "sum by (id, title, subtitle, mainstat, secondarystat, color, detail__node_type, detail__agent_id, detail__agent_name, detail__agent_type, detail__agent_depth, detail__root_agent_id, detail__parent_agent_id, detail__lifecycle_id, detail__execution_id, detail__lifecycle_event, detail__state, detail__outcome, detail__connector, detail__trace_id, detail__count_meaning, detail__correlation_note) (count_over_time({service_name=\"defenseclaw\"} | defenseclaw_event_name=~`session_end|subagent_stop|turn_end` |= \"$agent\" | json | __error__=\"\" | connector=~\"${connector:regex}\" | body_$scope_label=~\"$agent\" | event_name=~`session_end|subagent_stop|turn_end` | label_format id=`outcome:{{.body_gen_ai_agent_id}}:{{if eq .event_name \"turn_end\"}}turns:{{.body_defenseclaw_agent_lifecycle_state}}:{{.outcome}}{{else}}{{.body_defenseclaw_agent_execution_id}}{{end}}`, title=`{{if eq .event_name \"turn_end\"}}Turn outcomes{{else}}Terminal outcome{{end}}`, subtitle=`{{.body_defenseclaw_agent_lifecycle_event}}`, mainstat=`{{.body_defenseclaw_agent_lifecycle_state}}`, secondarystat=`{{.outcome}}`, color=`#73BF69`, detail__node_type=`{{if eq .event_name \"turn_end\"}}turn_outcomes{{else}}terminal_outcome{{end}}`, detail__agent_id=`{{.body_gen_ai_agent_id}}`, detail__agent_name=`{{.body_gen_ai_agent_name}}`, detail__agent_type=`{{.body_defenseclaw_agent_type}}`, detail__agent_depth=`{{.body_defenseclaw_agent_depth}}`, detail__root_agent_id=`{{.body_defenseclaw_agent_root_id}}`, detail__parent_agent_id=`{{.body_defenseclaw_agent_parent_id}}`, detail__lifecycle_id=`{{.body_defenseclaw_agent_lifecycle_id}}`, detail__execution_id=`{{if eq .event_name \"turn_end\"}}grouped{{else}}{{.body_defenseclaw_agent_execution_id}}{{end}}`, detail__lifecycle_event=`{{.body_defenseclaw_agent_lifecycle_event}}`, detail__state=`{{.body_defenseclaw_agent_lifecycle_state}}`, detail__outcome=`{{.outcome}}`, detail__connector=`{{.connector}}`, detail__trace_id=``, detail__count_meaning=`Session/subagent terminal observation for an execution, or grouped turn_end observations for one agent/state/outcome.`, detail__correlation_note=`Turn outcomes are grouped to keep the DAG compact; use the ordered or raw view for exact turn, execution, operation, and trace IDs.` [$__range]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "typed nodes",
+          "refId": "nodesOutcome"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "filter": {
+            "id": "byRefId",
+            "options": "/^nodes/"
+          },
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesSessionStart"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesSessionStart",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesRootAnchor"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesRootAnchor",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesSpawnParent"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesSpawnParent",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesAgent"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesAgent",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesConversationPrompts"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesConversationPrompts",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesModelSummary"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesModelSummary",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesToolSummary"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesToolSummary",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesApproval"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesApproval",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesMessages"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesMessages",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "nodesOutcome"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #nodesOutcome",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "merge",
+          "filter": {
+            "id": "byRefId",
+            "options": "/^nodes/"
+          },
+          "options": {}
+        },
+        {
+          "id": "labelsToFields",
+          "filter": {
+            "id": "byRefId",
+            "options": "/^edges/"
+          },
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesSessionStart"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesSessionStart",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesSpawn"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesSpawn",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesConversationPrompts"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesConversationPrompts",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesModelSummary"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesModelSummary",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesToolSummary"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesToolSummary",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesApproval"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesApproval",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesMessages"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesMessages",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "calculateField",
+          "filter": {
+            "id": "byRefId",
+            "options": "edgesOutcome"
+          },
+          "options": {
+            "alias": "detail__total",
+            "mode": "unary",
+            "replaceFields": false,
+            "timeSeries": false,
+            "unary": {
+              "fieldName": "Value #edgesOutcome",
+              "operator": "abs"
+            }
+          }
+        },
+        {
+          "id": "merge",
+          "filter": {
+            "id": "byRefId",
+            "options": "/^edges/"
+          },
+          "options": {}
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "id"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open this agent in Agent360",
+                    "url": "/d/defenseclaw-agent-360/agent360?orgId=1&var-connector=${__data.fields[\"detail__connector\"]}&var-agent=${__data.fields[\"detail__agent_id\"]}&var-scope_label=gen_ai_agent_id&from=${__from}&to=${__to}",
+                    "targetBlank": false
+                  },
+                  {
+                    "title": "Open prompt and model detail",
+                    "url": "/d/defenseclaw-agent-360/agent360?orgId=1&var-connector=${__data.fields[\"detail__connector\"]}&var-agent=${__data.fields[\"detail__agent_id\"]}&var-scope_label=gen_ai_agent_id&from=${__from}&to=${__to}&viewPanel=panel-18",
+                    "targetBlank": false
+                  },
+                  {
+                    "title": "Open ordered lifecycle sequence",
+                    "url": "/d/defenseclaw-agent-360/agent360?orgId=1&var-connector=${__data.fields[\"detail__connector\"]}&var-agent=${__data.fields[\"detail__agent_id\"]}&var-scope_label=gen_ai_agent_id&from=${__from}&to=${__to}&viewPanel=panel-40",
+                    "targetBlank": false
+                  },
+                  {
+                    "title": "Open raw canonical OTEL events",
+                    "url": "/d/defenseclaw-agent-360/agent360?orgId=1&var-connector=${__data.fields[\"detail__connector\"]}&var-agent=${__data.fields[\"detail__agent_id\"]}&var-scope_label=gen_ai_agent_id&from=${__from}&to=${__to}&viewPanel=panel-25",
+                    "targetBlank": false
+                  },
+                  {
+                    "title": "Find related Tempo traces",
+                    "url": "/d/defenseclaw-agent-360/agent360?orgId=1&var-connector=${__data.fields[\"detail__connector\"]}&var-agent=${__data.fields[\"detail__agent_id\"]}&var-scope_label=gen_ai_agent_id&from=${__from}&to=${__to}&viewPanel=panel-22",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__node_type"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Node type"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__hook_event"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Prompt hook"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__edge_kind"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Relationship"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__connector"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Connector"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__agent_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Agent ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__agent_name"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Agent name"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__agent_type"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Agent type"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__agent_depth"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Depth"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__root_agent_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Root agent ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__parent_agent_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Parent agent ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__session_root_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Root session ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__lifecycle_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Lifecycle ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__execution_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Execution ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__state"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Lifecycle state"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__outcome"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Outcome"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__lifecycle_event"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Lifecycle event"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__model"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Model"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__provider"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Provider"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__tool"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Tool"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__tool_family"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Tool family"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__total"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Total in range"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__count_meaning"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Count meaning"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__phase"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Phase"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__last_seen"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Time coverage"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__observations"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Observed value meaning"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__correlation_note"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Correlation precision"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__session_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Session ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__root_session_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Root session ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__parent_session_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Parent session ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__sequence"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Sequence"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__operation_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Operation ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__tool_call_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Tool call ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__trace_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Trace ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__span_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Span ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__turn_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Turn ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__session_source"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Session source"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__session_resumed"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Session resumed"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__content_note"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Prompt content"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__model_request_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Model request ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__model_response_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Model response ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__finish_reasons"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Finish reasons"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__tool_status"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Tool status"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__exit_code"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Exit code"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__destination_app"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Destination app"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__args_length"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Argument bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__output_length"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Output bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__approval_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Approval ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__approval_result"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Approval result"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__approval_actor"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Approval actor"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__command_name"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Command name"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__dangerous"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Dangerous"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__target_task"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Target task"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__target_agent_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Resolved target agent ID"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__delivery_status"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Delivery observation"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail__lineage_provenance"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Lineage provenance"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "nodes": {
+          "arcs": [],
+          "mainStatUnit": "short",
+          "secondaryStatUnit": "short"
+        },
+        "edges": {
+          "mainStatUnit": "short",
+          "secondaryStatUnit": "short"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "type": "logs",
+      "title": "Raw correlated event stream",
+      "description": "Unformatted canonical OTEL JSON after DefenseClaw's central redaction boundary. The dashboard applies no additional hiding or field projection and no raw observation is collapsed: expand a row to inspect its semantic-event, logical-event, connector-instance, and trace/span identities, and pivot any reported trace ID to Tempo.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 174,
+        "w": 24,
+        "h": 12
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id=~\"$execution\" | connector=~\"$connector\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "id": 50,
+      "type": "row",
+      "title": "Correlation identity and relationship evidence",
+      "description": "Logical summaries and immutable raw observations are shown side by side. Relationship changes mirror the durable correlation graph exposed by the authenticated graph, explain, timeline, and conflicts APIs.",
+      "gridPos": {
+        "x": 0,
+        "y": 186,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 51,
+      "type": "stat",
+      "title": "Logical events",
+      "description": "Distinct durable logical-event IDs in scope. Exact hook, proxy, and native-OTLP mirrors count once; unresolved observations remain separate logical events. Missing logical identity falls back to semantic-event ID, then record ID; no canonical observation is omitted from this summary.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 187,
+        "w": 8,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "count(sum by (logical_event_id) (count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" | label_format logical_event_id=\"{{if .correlation_logical_event_id}}logical:{{.correlation_logical_event_id}}{{else if .correlation_semantic_event_id}}semantic:{{.correlation_semantic_event_id}}{{else}}record:{{.record_id}}{{end}}\" [$__range]))) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 52,
+      "type": "stat",
+      "title": "Raw observations",
+      "description": "Every canonical Loki record in scope before logical grouping. Compare with Logical events to see exact mirrors without hiding any source observation.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 187,
+        "w": 8,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | body_$scope_label=~\"$agent\" | connector=~\"$connector\" [$__range])) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 53,
+      "type": "stat",
+      "title": "Relationship warnings observed",
+      "description": "Unresolved, conflicted, or rejected relationship-change records mentioning the selected agent. This is a transition count; the authenticated conflicts API is the source for current durable conflict state.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 187,
+        "w": 8,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | event_name=\"correlation.relationship.changed\" | body_defenseclaw_correlation_relationship_status=~\"unresolved|conflicted|rejected\" [$__range])) or vector(0)",
+          "instant": true,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 54,
+      "type": "logs",
+      "title": "Relationship evidence and conflict chronology",
+      "description": "Content-free relationship changes exported from the durable correlation ledger. Method identifies reported, trace-exact, derived, or inferred evidence; status exposes active, unresolved, conflicted, superseded, and rejected edges. Stable rule ID and version plus the cumulative durable evidence count let remote consumers reconstruct the same edge state. This chronological Loki view never substitutes trace parentage for agent lineage.",
+      "datasource": {
+        "type": "loki",
+        "uid": "defenseclaw-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 192,
+        "w": 24,
+        "h": 12
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | event_name=\"correlation.relationship.changed\" | line_format \"{{.body_defenseclaw_correlation_relationship_status}} \u00b7 {{.body_defenseclaw_correlation_relationship_type}} \u00b7 source={{.body_defenseclaw_correlation_relationship_source_kind}}:{{.body_defenseclaw_correlation_relationship_source_id}} target={{.body_defenseclaw_correlation_relationship_target_kind}}:{{.body_defenseclaw_correlation_relationship_target_id}} \u00b7 method={{.body_defenseclaw_correlation_relationship_method}} confidence={{.body_defenseclaw_correlation_relationship_confidence}} rule={{.body_defenseclaw_correlation_relationship_rule_id}}@{{.body_defenseclaw_correlation_relationship_rule_version}} evidence={{.body_defenseclaw_correlation_relationship_evidence_count}}/{{.body_defenseclaw_correlation_relationship_evidence_record_id}} \u00b7 semantic={{.correlation_semantic_event_id}} logical={{.correlation_logical_event_id}} connector_instance={{.correlation_connector_instance_id}} \u00b7 trace_id={{.correlation_trace_id}} span_id={{.correlation_span_id}}\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": false,
+        "prettifyLogMessage": false,
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Ascending"
+      }
+    }
+  ],
+  "preload": false,
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": [
+    "defenseclaw",
+    "agent360",
+    "agents",
+    "lifecycle",
+    "tempo",
+    "loki",
+    "prometheus"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "connector",
+        "label": "Connector",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "defenseclaw-prometheus"
+        },
+        "definition": "label_values(defenseclaw_agent_last_seen_seconds, connector)",
+        "query": {
+          "query": "label_values(defenseclaw_agent_last_seen_seconds, connector)",
+          "refId": "connector-var"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        }
+      },
+      {
+        "name": "scope_label",
+        "label": "Scope",
+        "type": "custom",
+        "query": "This agent : gen_ai_agent_id,Agent tree : defenseclaw_agent_root_id",
+        "current": {
+          "text": "Agent tree",
+          "value": "defenseclaw_agent_root_id",
+          "selected": true
+        },
+        "options": [
+          {
+            "text": "This agent",
+            "value": "gen_ai_agent_id",
+            "selected": false
+          },
+          {
+            "text": "Agent tree",
+            "value": "defenseclaw_agent_root_id",
+            "selected": true
+          }
+        ]
+      },
+      {
+        "name": "agent",
+        "label": "Agent or root",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "defenseclaw-loki"
+        },
+        "definition": "label_values({service_name=\"defenseclaw\"} | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label!=\"\", body_$scope_label)",
+        "query": {
+          "query": "label_values({service_name=\"defenseclaw\"} | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label!=\"\", body_$scope_label)",
+          "refId": "agent-var"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "lifecycle",
+        "label": "Lifecycle (drilldown)",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "defenseclaw-loki"
+        },
+        "definition": "label_values({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id!=\"\", body_defenseclaw_agent_lifecycle_id)",
+        "query": {
+          "query": "label_values({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id!=\"\", body_defenseclaw_agent_lifecycle_id)",
+          "refId": "lifecycle-var"
+        },
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        }
+      },
+      {
+        "name": "execution",
+        "label": "Execution (drilldown)",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "defenseclaw-loki"
+        },
+        "definition": "label_values({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id!=\"\", body_defenseclaw_agent_execution_id)",
+        "query": {
+          "query": "label_values({service_name=\"defenseclaw\"} |= \"$agent\" | json | __error__=\"\" | connector=~\"$connector\" | body_$scope_label=~\"$agent\" | body_defenseclaw_agent_lifecycle_id=~\"$lifecycle\" | body_defenseclaw_agent_execution_id!=\"\", body_defenseclaw_agent_execution_id)",
+          "refId": "execution-var"
+        },
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        }
+      },
+      {
+        "name": "trace",
+        "label": "Trace ID",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "DefenseClaw \u2014 Agent360",
+  "uid": "defenseclaw-agent-360",
+  "version": 3,
+  "weekStart": ""
+}
