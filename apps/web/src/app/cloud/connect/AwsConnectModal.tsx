@@ -215,27 +215,6 @@ export function AwsConnectModal({
           </button>
         </div>
 
-        {/* Security Notice */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "flex-start",
-            gap: "10px",
-            padding: "12px 14px",
-            background: "#f4f3ef",
-            border: "1px solid var(--warm-gray-border)",
-            borderRadius: "var(--radius-sm)"
-          }}
-        >
-          <div style={{ color: "var(--muted-gray)", marginTop: "1px" }}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-            </svg>
-          </div>
-          <div style={{ fontSize: "12px", color: "var(--near-black-ink)", lineHeight: 1.45 }}>
-            Credentials are used strictly in-memory by the backend to establish a temporary STS session and are never stored in your browser or local storage.
-          </div>
-        </div>
 
         {/* Success State View */}
         {status === "CONNECTED" && connectedResult && (

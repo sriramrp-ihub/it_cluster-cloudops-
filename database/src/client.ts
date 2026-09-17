@@ -15,7 +15,11 @@ let dbInstance: Kysely<DatabaseSchema> | null = null;
 let pgPoolInstance: pg.Pool | null = null;
 
 export function getDatabaseConfig(): DatabaseConfig {
-  const connectionString = process.env["DATABASE_URL"] || "postgres://localhost:5432/cloudops";
+  let connectionString = process.env["DATABASE_URL"] || "postgres://postgres@localhost:5432/cloudops";
+  // If connectionString lacks username (e.g. postgres://localhost:5432/cloudops), inject postgres@
+  if (/^postgres(ql)?:\/\/[^@]+:[0-9]+/i.test(connectionString)) {
+    connectionString = connectionString.replace(/^postgres(ql)?:\/\//i, "$1postgres@");
+  }
   const ssl = process.env["DATABASE_SSL"] === "true";
   const minPool = parseInt(process.env["DATABASE_POOL_MIN"] || "2", 10);
   const maxPool = parseInt(process.env["DATABASE_POOL_MAX"] || "10", 10);
@@ -30,12 +34,14 @@ export function getDatabaseConfig(): DatabaseConfig {
 
 export function createDatabasePool(config?: DatabaseConfig): pg.Pool {
   const cfg = config || getDatabaseConfig();
-  const pool = new Pool({
+  const poolConfig: pg.PoolConfig = {
     connectionString: cfg.connectionString,
+    user: process.env["PGUSER"] || "postgres",
     ssl: cfg.ssl ? { rejectUnauthorized: false } : false,
     min: cfg.minPool,
     max: cfg.maxPool
-  });
+  };
+  const pool = new Pool(poolConfig);
 
   if (process.env["NODE_ENV"] === "test" || process.env["VITEST"]) {
     pool.on("connect", (client) => {

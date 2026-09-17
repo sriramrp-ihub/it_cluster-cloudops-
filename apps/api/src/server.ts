@@ -84,7 +84,8 @@ export function buildApp(opts: BuildAppOptions = {}) {
   app.register(investigationRoutes, {
     incidentService: opts.incidentService,
     agentAdapter,
-    approvalService
+    approvalService,
+    cloudAccountService: opts.cloudAccountService
   });
 
   // Global Error Handler: safely formats all errors without leaking stack traces or secrets

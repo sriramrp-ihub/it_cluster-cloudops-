@@ -38,7 +38,7 @@ export function AgentChatProvider({ children }: { children: React.ReactNode }) {
   const [messages, setMessages] = useState<AgentChatMessage[]>([]);
   const [context, setContextState] = useState<AgentOperationalContext>({
     environment: "Production",
-    region: "eu-north-1"
+    region: "us-east-1"
   });
 
   const tenantId = session?.tenantId || "ten_default_tenant";

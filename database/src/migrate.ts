@@ -12,7 +12,15 @@ export interface MigrationResult {
 
 export async function runMigrations(): Promise<MigrationResult> {
   const pool = createDatabasePool(getDatabaseConfig());
-  const client = await pool.connect();
+  let client: any = null;
+  try {
+    client = await pool.connect();
+  } catch (connErr: any) {
+    console.warn(`[Migration] Database is not available or credentials unconfigured (${connErr?.message || connErr}). Skipping local database migration.`);
+    await pool.end().catch(() => {});
+    return { applied: [], skipped: [] };
+  }
+
   const applied: string[] = [];
   const skipped: string[] = [];
 
@@ -33,7 +41,7 @@ export async function runMigrations(): Promise<MigrationResult> {
 
     // Query already applied migrations
     const existing = await client.query("SELECT name FROM _migrations_meta");
-    const appliedSet = new Set(existing.rows.map(r => r.name));
+    const appliedSet = new Set(existing.rows.map((r: any) => r.name));
 
     for (const file of sqlFiles) {
       if (appliedSet.has(file)) {
@@ -61,8 +69,10 @@ export async function runMigrations(): Promise<MigrationResult> {
 
     return { applied, skipped };
   } finally {
-    client.release();
-    await pool.end();
+    if (client) {
+      client.release();
+    }
+    await pool.end().catch(() => {});
   }
 }
 

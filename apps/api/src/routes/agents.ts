@@ -87,6 +87,57 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
   );
 
   /**
+   * GET /v1/agents/runtime-endpoint
+   * Probes active agent runtime endpoint, health status, discovered model, and provider
+   */
+  fastify.get("/v1/agents/runtime-endpoint", { preHandler: [requireOperatorAuth] }, async (_request, reply) => {
+    const localAdapter = agentAdapter || new HermesAgentAdapter();
+    if (typeof (localAdapter as any).checkHermesHealth === "function") {
+      const health = await (localAdapter as any).checkHermesHealth();
+      return reply.status(200).send(health);
+    }
+    return reply.status(200).send({
+      connected: true,
+      endpoint: "builtin-runtime",
+      model: "autonomous-agent"
+    });
+  });
+
+  /**
+   * POST /v1/agents/runtime-endpoint
+   * Dynamically configures the active agent runtime daemon endpoint and session token in real time
+   */
+  fastify.post<{
+    Body: {
+      endpoint: string;
+      sessionToken?: string;
+    };
+  }>("/v1/agents/runtime-endpoint", { preHandler: [requireOperatorAuth] }, async (request, reply) => {
+    const { endpoint, sessionToken } = request.body || {};
+    if (!endpoint || typeof endpoint !== "string" || endpoint.trim().length === 0) {
+      return reply.status(400).send({
+        error: { code: "VALIDATION_ERROR", message: "endpoint URL is required" }
+      });
+    }
+
+    const localAdapter = agentAdapter || new HermesAgentAdapter();
+    if (typeof (localAdapter as any).setEndpoint === "function") {
+      (localAdapter as any).setEndpoint(endpoint, sessionToken);
+    }
+
+    let healthInfo = { connected: false, endpoint };
+    if (typeof (localAdapter as any).checkHermesHealth === "function") {
+      healthInfo = await (localAdapter as any).checkHermesHealth();
+    }
+
+    return reply.status(200).send({
+      success: true,
+      message: "Agent runtime endpoint updated dynamically",
+      runtime: healthInfo
+    });
+  });
+
+  /**
    * POST /v1/agent/chat
    * Operator sends an operational or architectural query directly to the live Hermes AI agent.
    * Prompts are analyzed by DefenseClaw before reaching the model.
@@ -95,6 +146,8 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
     Body: {
       prompt: string;
       agentId?: string;
+      endpoint?: string;
+      sessionToken?: string;
       context?: {
         environment?: string;
         service?: string;
@@ -104,7 +157,7 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
     };
   }>("/v1/agent/chat", { preHandler: [requireOperatorAuth] }, async (request, reply) => {
     const operator = request.operator!;
-    const { prompt, agentId, context } = request.body || {};
+    const { prompt, agentId, endpoint, sessionToken, context } = request.body || {};
 
     if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
       return reply.status(400).send({
@@ -153,6 +206,9 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
     }
 
     const localAdapter = agentAdapter || new HermesAgentAdapter();
+    if (endpoint && typeof (localAdapter as any).setEndpoint === "function") {
+      (localAdapter as any).setEndpoint(endpoint, sessionToken);
+    }
     let discoveredModel = "agent-runtime";
     let discoveredProvider = "local-daemon";
     if (typeof (localAdapter as any).checkHermesHealth === "function") {

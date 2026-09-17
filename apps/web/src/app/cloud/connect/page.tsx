@@ -335,32 +335,6 @@ export default function ConnectCloudPage() {
         </div>
       )}
 
-      {/* Security Architecture Guarantee Note */}
-      <div
-        style={{
-          padding: "16px 20px",
-          background: "#f4f3ef",
-          border: "1px solid var(--warm-gray-border)",
-          borderRadius: "var(--radius-sm)",
-          display: "flex",
-          gap: "14px",
-          alignItems: "flex-start"
-        }}
-      >
-        <div style={{ marginTop: "2px", color: "var(--muted-gray)" }}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-          </svg>
-        </div>
-        <div>
-          <div style={{ fontWeight: 600, color: "var(--near-black-ink)", fontSize: "14px", marginBottom: "4px" }}>
-            Zero Credential Persistence Security Boundary
-          </div>
-          <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", lineHeight: 1.5, margin: 0 }}>
-            CloudOps operates under a strict isolation model: Access Key IDs and Secret Access Keys are processed only in memory to validate identity with AWS STS. Only verified account metadata (Account ID, Region, Role ARN) is persisted to PostgreSQL. Secrets are never exposed to agents or stored in browser storage.
-          </p>
-        </div>
-      </div>
 
       {/* AWS Connection Modal */}
       <AwsConnectModal

@@ -474,10 +474,10 @@ export class CloudOpsAgentClient {
         sender: "agent",
         text: `CloudOps Security Posture & Authority Boundary Assessment:\n\n` +
           `• IAM Execution Separation (CO-005):\n` +
-          `  - Read-Only Role: "${process.env.NEXT_PUBLIC_AWS_READONLY_ROLE_ARN || "arn:aws:iam::<configured-account-id>:role/CloudOpsReadOnlyRole"}" (STS assumed for non-destructive inspection)\n` +
-          `  - Remediation Role: "${process.env.NEXT_PUBLIC_AWS_REMEDIATION_ROLE_ARN || "arn:aws:iam::<configured-account-id>:role/CloudOpsRemediationRole"}" (Strictly gated behind human approval)\n\n` +
+          `  - Read-Only Role: Dynamic STS session assumed per connected cloud account\n` +
+          `  - Remediation Role: Dynamic remediation role gated behind Ed25519 authorization\n\n` +
           `• Regional Policy Fencing:\n` +
-          `  - Active Operational Region: ${process.env.NEXT_PUBLIC_AWS_REGION || "eu-north-1"}\n` +
+          `  - Active Operational Region: Bound dynamically to connected cloud accounts\n` +
           `  - Region boundary enforcement: ACTIVE (Actions outside allowed regions are rejected)\n\n` +
           `• Cryptographic Ledger & Data Isolation:\n` +
           `  - Row-Level Tenant Isolation: Enforced on all tables with tenant_id foreign keys\n` +

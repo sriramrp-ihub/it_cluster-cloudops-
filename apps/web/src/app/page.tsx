@@ -29,7 +29,7 @@ export default async function HomePage() {
     pendingJoinCount = 0;
   }
 
-  let activeRegion = process.env.AWS_REGION || "eu-north-1";
+  let activeRegion = "Unconnected";
   try {
     const accounts = await fetchCloudAccounts();
     const connectedAccounts = accounts.filter((a) => a.status === "CONNECTED");

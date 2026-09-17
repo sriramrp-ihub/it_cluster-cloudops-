@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { IncidentService } from "@cloudops/adapters";
+import { IncidentService, CloudAccountService } from "@cloudops/adapters";
 import { HermesAgentAdapter, type AgentAdapter } from "@cloudops/runtime";
 import { ApprovalService } from "@cloudops/approvals";
 import { AgentService } from "@cloudops/identity";
@@ -12,6 +12,7 @@ export interface InvestigationRoutesOptions {
   agentAdapter?: AgentAdapter | undefined;
   approvalService?: ApprovalService | undefined;
   agentService?: AgentService | undefined;
+  cloudAccountService?: CloudAccountService | undefined;
 }
 
 export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions> = async (
@@ -22,7 +23,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
   const agentAdapter = opts.agentAdapter || new HermesAgentAdapter({ enableLiveInference: true });
   const approvalService = opts.approvalService || new ApprovalService();
   const agentService = opts.agentService || new AgentService();
-  const awsAccountId = process.env.AWS_ACCOUNT_ID || "265766933076";
+  const cloudAccountService = opts.cloudAccountService || new CloudAccountService();
 
   /**
    * Dynamically resolves the effective agent to dispatch for this investigation session
@@ -83,7 +84,8 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     effectiveAgentId: string,
     cluster: string,
     service: string,
-    region: string
+    region: string,
+    effectiveAccountId: string
   ) {
     return async (call: any) => {
       const toolDef = CANONICAL_TOOLS.find((t) => t.name === call.toolName);
@@ -106,7 +108,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
           operationType: "MUTATION",
           rawPayload: call.arguments as Record<string, unknown>,
           dryRunDiff: {
-            resource: `arn:aws:ecs:${region}:${awsAccountId}:service/${cluster}/${service}`,
+            resource: `arn:aws:ecs:${region}:${effectiveAccountId}:service/${cluster}/${service}`,
             action: call.toolName.toUpperCase(),
             parameters: call.arguments,
             riskLevel: toolDef?.riskLevel || "HIGH"
@@ -165,7 +167,12 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     const body = request.body || {};
     const serviceName = body.service || "starvision-motors";
     const clusterName = body.cluster || "cloudops-test";
-    const region = body.region || process.env.AWS_REGION || "eu-north-1";
+
+    // Dynamically resolve cloud account from connected accounts in database
+    const accounts = await cloudAccountService.listAccounts(tenantId);
+    const activeAccount = accounts.find((a) => a.status === "CONNECTED") || accounts[0];
+    const effectiveAccountId = body.accountId || activeAccount?.accountId || "unconnected";
+    const region = body.region || activeAccount?.region || "us-east-1";
     const severity = body.severity || "CRITICAL";
     const title = body.title || `ECS Incident on ${serviceName}: Tasks failing steady-state check`;
     const alertDescription =
@@ -176,10 +183,10 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     const createdIncident = await incidentService.createIncident(tenantId, {
       incidentId,
       provider: "AWS",
-      accountId: awsAccountId,
+      accountId: effectiveAccountId,
       region,
       service: `${clusterName}/${serviceName}`,
-      resourceId: `arn:aws:ecs:${region}:${awsAccountId}:service/${clusterName}/${serviceName}`,
+      resourceId: `arn:aws:ecs:${region}:${effectiveAccountId}:service/${clusterName}/${serviceName}`,
       severity,
       title,
       alertDescription,
@@ -209,7 +216,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     if (typeof (agentAdapter as any).onToolCall === "function") {
       agentAdapter.onToolCall(
         session.sessionId,
-        buildToolCallHandler(tenantId, effectiveAgentId, clusterName, serviceName, region)
+        buildToolCallHandler(tenantId, effectiveAgentId, clusterName, serviceName, region, effectiveAccountId)
       );
     }
 
@@ -324,6 +331,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       service = parts[1] || "starvision-motors";
     }
     const region = incDetails.incident.region || "us-east-1";
+    const accountId = incDetails.incident.accountId || "unconnected";
 
     const { investigation, session } = await incidentService.startInvestigation({
       tenantId,
@@ -336,7 +344,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     if (typeof (agentAdapter as any).onToolCall === "function") {
       agentAdapter.onToolCall(
         session.sessionId,
-        buildToolCallHandler(tenantId, effectiveAgentId, cluster, service, region)
+        buildToolCallHandler(tenantId, effectiveAgentId, cluster, service, region, accountId)
       );
     }
 

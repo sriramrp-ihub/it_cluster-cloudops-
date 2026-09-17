@@ -116,7 +116,7 @@ export class HermesAgentAdapter implements AgentAdapter {
     this.hermesBin =
       config.hermesBin ||
       process.env.HERMES_BIN ||
-      "/Users/user/Desktop/hermes/hermes-agent/hermes";
+      "hermes";
     this.enableLiveInference =
       config.enableLiveInference ?? (process.env.HERMES_LIVE_INFERENCE !== "false");
     this.agentName = config.agentName;
@@ -125,7 +125,27 @@ export class HermesAgentAdapter implements AgentAdapter {
   }
 
   /**
-   * Probes the live Hermes daemon for health and active model metadata dynamically
+   * Dynamically sets the runtime daemon endpoint and session token in real time
+   */
+  public setEndpoint(endpoint: string, sessionToken?: string): void {
+    if (endpoint && endpoint.trim().length > 0) {
+      this.endpoint = endpoint.trim();
+    }
+    if (sessionToken !== undefined) {
+      this.sessionToken = sessionToken.trim();
+    }
+  }
+
+  /**
+   * Returns current effective endpoint
+   */
+  public getEndpoint(): string {
+    return this.endpoint;
+  }
+
+  /**
+   * Probes the live Hermes daemon for health and active model metadata dynamically.
+   * If the current endpoint fails, dynamically tests alternative local and container bridge candidates.
    */
   async checkHermesHealth(): Promise<{
     connected: boolean;
@@ -134,44 +154,54 @@ export class HermesAgentAdapter implements AgentAdapter {
     provider?: string;
     error?: string;
   }> {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const candidates = Array.from(
+      new Set([
+        this.endpoint,
+        "http://127.0.0.1:8080",
+        "http://host.docker.internal:8080"
+      ].filter(Boolean))
+    );
 
-      const res = await fetch(`${this.endpoint}/api/model/auxiliary`, {
-        headers: {
-          "X-Hermes-Session-Token": this.sessionToken
-        },
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
+    let lastError = "Hermes daemon unreachable";
 
-      if (res.ok) {
-        const data = (await res.json()) as any;
-        const discoveredModel = data?.main?.model || this.activeModel || "agent-runtime";
-        const discoveredProvider = data?.main?.provider || this.activeProvider || "local-daemon";
-        this.activeModel = discoveredModel;
-        this.activeProvider = discoveredProvider;
-        return {
-          connected: true,
-          endpoint: this.endpoint,
-          model: discoveredModel,
-          provider: discoveredProvider
-        };
+    for (const candidate of candidates) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2500);
+
+        const res = await fetch(`${candidate}/api/model/auxiliary`, {
+          headers: {
+            "X-Hermes-Session-Token": this.sessionToken
+          },
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          const discoveredModel = data?.main?.model || this.activeModel || "agent-runtime";
+          const discoveredProvider = data?.main?.provider || this.activeProvider || "local-daemon";
+          this.activeModel = discoveredModel;
+          this.activeProvider = discoveredProvider;
+          this.endpoint = candidate; // Dynamically adopt working endpoint
+          return {
+            connected: true,
+            endpoint: this.endpoint,
+            model: discoveredModel,
+            provider: discoveredProvider
+          };
+        }
+        lastError = `Hermes daemon responded with HTTP ${res.status}`;
+      } catch (err: any) {
+        lastError = err?.message || "Hermes daemon unreachable";
       }
-
-      return {
-        connected: false,
-        endpoint: this.endpoint,
-        error: `Hermes daemon responded with HTTP ${res.status}`
-      };
-    } catch (err: any) {
-      return {
-        connected: false,
-        endpoint: this.endpoint,
-        error: err?.message || "Hermes daemon unreachable"
-      };
     }
+
+    return {
+      connected: false,
+      endpoint: this.endpoint,
+      error: lastError
+    };
   }
 
   /**
