@@ -1,3 +1,5 @@
+# Phase 0 groundwork: redis added for Phase 1.2 (gateway session registry) and 1.3 (STS credential cache).
+# No application code is wired to Redis yet.
 services:
   postgres:
     image: postgres:16-alpine
@@ -13,6 +15,19 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d cloudops"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: cloudops-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -43,6 +58,8 @@ services:
       postgres:
         condition: service_healthy
       defenseclaw:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "3000:3000"
