@@ -85,8 +85,10 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     cluster: string,
     service: string,
     region: string,
-    effectiveAccountId: string
+    effectiveAccountId: string,
+    awsAccountId?: string
   ) {
+    const rawAwsId = awsAccountId || effectiveAccountId;
     return async (call: any) => {
       const toolDef = CANONICAL_TOOLS.find((t) => t.name === call.toolName);
 
@@ -108,7 +110,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
           operationType: "MUTATION",
           rawPayload: call.arguments as Record<string, unknown>,
           dryRunDiff: {
-            resource: `arn:aws:ecs:${region}:${effectiveAccountId}:service/${cluster}/${service}`,
+            resource: `arn:aws:ecs:${region}:${rawAwsId}:service/${cluster}/${service}`,
             action: call.toolName.toUpperCase(),
             parameters: call.arguments,
             riskLevel: toolDef?.riskLevel || "HIGH"
@@ -172,8 +174,13 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     // Dynamically resolve cloud account from connected accounts in database
     const accounts = await cloudAccountService.listAccounts(tenantId);
     const activeAccount = accounts.find((a) => a.status === "CONNECTED") || accounts[0];
-    const effectiveAccountId = body.accountId || activeAccount?.accountId || "unconnected";
-    const region = body.region || activeAccount?.region || "us-east-1";
+    const matchedAccount = body.accountId
+      ? accounts.find((a) => (a.accountId === body.accountId || a.id === body.accountId) && a.status === "CONNECTED") ||
+        accounts.find((a) => a.accountId === body.accountId || a.id === body.accountId)
+      : activeAccount;
+    const effectiveAccountId = matchedAccount?.id || activeAccount?.id || body.accountId || "unconnected";
+    const awsAccountId = matchedAccount?.accountId || activeAccount?.accountId || "unconnected";
+    const region = body.region || matchedAccount?.region || activeAccount?.region || "us-east-1";
     const severity = body.severity || "CRITICAL";
     const title = body.title || `ECS Incident on ${serviceName}: Tasks failing steady-state check`;
     const alertDescription =
@@ -187,7 +194,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       accountId: effectiveAccountId,
       region,
       service: `${clusterName}/${serviceName}`,
-      resourceId: `arn:aws:ecs:${region}:${effectiveAccountId}:service/${clusterName}/${serviceName}`,
+      resourceId: `arn:aws:ecs:${region}:${awsAccountId}:service/${clusterName}/${serviceName}`,
       severity,
       title,
       alertDescription,
@@ -217,7 +224,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     if (typeof (agentAdapter as any).onToolCall === "function") {
       agentAdapter.onToolCall(
         session.sessionId,
-        buildToolCallHandler(tenantId, effectiveAgentId, clusterName, serviceName, region, effectiveAccountId)
+        buildToolCallHandler(tenantId, effectiveAgentId, clusterName, serviceName, region, effectiveAccountId, awsAccountId)
       );
     }
 
@@ -332,7 +339,13 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
       service = parts[1] || "starvision-motors";
     }
     const region = incDetails.incident.region || "us-east-1";
-    const accountId = incDetails.incident.accountId || "unconnected";
+
+    // Look up CloudOps Cloud Account ID (cld_...) from AWS Account ID for credential resolution
+    const accounts = await cloudAccountService.listAccounts(tenantId);
+    const cloudAccount = accounts.find((a) => (a.accountId === incDetails.incident.accountId || a.id === incDetails.incident.accountId) && a.status === "CONNECTED") ||
+      accounts.find((a) => a.accountId === incDetails.incident.accountId || a.id === incDetails.incident.accountId);
+    const accountId = cloudAccount?.id || incDetails.incident.accountId || "unconnected";
+    const awsAccountId = cloudAccount?.accountId || incDetails.incident.accountId || "unconnected";
 
     const { investigation, session } = await incidentService.startInvestigation({
       tenantId,
@@ -345,7 +358,7 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
     if (typeof (agentAdapter as any).onToolCall === "function") {
       agentAdapter.onToolCall(
         session.sessionId,
-        buildToolCallHandler(tenantId, effectiveAgentId, cluster, service, region, accountId)
+        buildToolCallHandler(tenantId, effectiveAgentId, cluster, service, region, accountId, awsAccountId)
       );
     }
 

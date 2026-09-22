@@ -61,7 +61,19 @@ export class AwsSessionManager {
   getSession(tenantId: string, cloudAccountId: string): AwsActiveSession | undefined {
     const key = this.buildKey(tenantId, cloudAccountId);
     const session = this.sessions.get(key);
-    if (!session) return undefined;
+    if (!session) {
+      // Fallback: Check if the identifier matches an AWS account ID or cloud account ID within the tenant
+      for (const sess of this.sessions.values()) {
+        if (sess.tenantId === tenantId && (sess.accountId === cloudAccountId || sess.cloudAccountId === cloudAccountId)) {
+          if (sess.credentials.expiration && sess.credentials.expiration.getTime() <= Date.now()) {
+            this.sessions.delete(this.buildKey(sess.tenantId, sess.cloudAccountId));
+            return undefined;
+          }
+          return sess;
+        }
+      }
+      return undefined;
+    }
 
     // Check expiration if applicable
     if (session.credentials.expiration && session.credentials.expiration.getTime() <= Date.now()) {
