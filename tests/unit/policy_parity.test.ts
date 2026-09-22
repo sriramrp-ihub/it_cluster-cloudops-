@@ -128,7 +128,7 @@ const SAMPLE_PAYLOADS: Array<{
     expectedVerdict: "BLOCK",
   },
   {
-    name: "Destructive action WITH approval (unrecognized tier) -> BLOCK",
+    name: "Destructive action WITH approval (unclassified tier) -> BLOCK",
     payload: {
       agent_id: "ag_parity_test",
       tenant_id: "ten_default_tenant",

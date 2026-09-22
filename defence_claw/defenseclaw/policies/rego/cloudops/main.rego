@@ -147,3 +147,19 @@ rule_id := "BUDGET_CAP_EXCEEDED" if {
 	tenant_isolated
 	budget_exceeded
 }
+
+# 6. Unclassified capability blocked
+reason := sprintf("Capability '%s' is not classified into an authorized tier", [input.capability]) if {
+	verdict == "BLOCK"
+	not destructive_blocked
+	input.capability in input.granted_capabilities
+	capability_tier(input.capability) == "unknown"
+}
+
+rule_id := "UNCLASSIFIED_CAPABILITY_BLOCKED" if {
+	verdict == "BLOCK"
+	not destructive_blocked
+	input.capability in input.granted_capabilities
+	capability_tier(input.capability) == "unknown"
+}
+

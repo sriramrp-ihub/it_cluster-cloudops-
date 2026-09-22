@@ -135,8 +135,12 @@ export async function evaluateInProcess(payload: CapabilityRequestPayload): Prom
   const reRes = policy.evaluate(input, "cloudops/authz/reason");
 
   const verdict = (vRes?.[0]?.result ?? "BLOCK") as PolicyVerdict["verdict"];
-  const rule_id = (rRes?.[0]?.result ?? "") as string;
-  const reason = (reRes?.[0]?.result ?? "Policy evaluation failed") as string;
+  let rule_id = (rRes?.[0]?.result ?? "") as string;
+  let reason = (reRes?.[0]?.result ?? "Policy evaluation failed") as string;
+
+  if (verdict === "BLOCK" && !rule_id) {
+    rule_id = "UNCLASSIFIED_CAPABILITY_BLOCKED";
+  }
 
   return {
     verdict,
@@ -186,6 +190,19 @@ export class DefenseClawGuardrailService {
       }
 
       violations.push(`Triggered guardrail: ${violationCode} (${policyResult.reason})`);
+
+      // If a capability is also outside granted scope, record boundary violation for callers inspecting scope
+      if (ctx.grantedCapabilities && ctx.grantedCapabilities.length > 0) {
+        const normalizedTool = ctx.toolName.replace(/[\._]/g, "");
+        const isGranted = ctx.grantedCapabilities.some(
+          (cap) => cap.replace(/[\._]/g, "") === normalizedTool
+        );
+        if (!isGranted && violationCode !== "CAPABILITY_BOUNDARY_VIOLATION") {
+          violations.push(
+            `Triggered guardrail: CAPABILITY_BOUNDARY_VIOLATION (${ctx.toolName} not in granted scope)`
+          );
+        }
+      }
     }
 
     const isBlocked = violations.length > 0;

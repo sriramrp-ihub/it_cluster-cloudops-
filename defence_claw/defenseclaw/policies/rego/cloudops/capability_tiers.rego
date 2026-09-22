@@ -40,6 +40,17 @@ read_tier := {
 capability_tier(cap) := "deploy" if cap in deploy_tier
 capability_tier(cap) := "mutate" if cap in mutate_tier
 capability_tier(cap) := "read" if cap in read_tier
+# Fail-Closed Tier Policy:
+# Any capability not explicitly listed in deploy_tier, mutate_tier, or read_tier
+# defaults to tier "unknown".
+# In main.rego, capabilities with tier "unknown" are BLOCKED (verdict: BLOCK,
+# rule_id: UNCLASSIFIED_CAPABILITY_BLOCKED) even if approval_granted is true.
+#
+# This fail-closed design guarantees that destructive actions (e.g.
+# aws_ec2_terminate_instances, aws_rds_delete_db_instance, aws_s3_delete_bucket,
+# aws_ecs_delete_service, aws_ecs_delete_cluster, aws_ecs_deregister_task_definition)
+# cannot be executed merely by passing an approval flag unless they have also been
+# explicitly onboarded and classified into an authorized tier.
 default capability_tier(_) := "unknown"
 
 # Granted tiers for agent

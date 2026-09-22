@@ -140,6 +140,10 @@ func (c *CloudOpsConnector) EvaluateCapability(ctx context.Context, req Capabili
 		}
 	}
 
+	if ruleID == "" && verdict == "BLOCK" {
+		ruleID = "UNCLASSIFIED_CAPABILITY_BLOCKED"
+	}
+
 	// Build v7 audit envelope
 	auditEvent := schemas.GatewayEventEnvelope{
 		TS:            time.Now().UTC().Format(time.RFC3339),
