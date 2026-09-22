@@ -24,6 +24,7 @@ export interface DefenseClawEvalResponse {
 export interface DefenseClawClientConfig {
   endpoint?: string | undefined;
   timeoutMs?: number | undefined;
+  token?: string | undefined;
 }
 
 export function generateTraceparent(): string {
@@ -40,22 +41,31 @@ export function isValidTraceparent(tp?: string): boolean {
 export class DefenseClawClient {
   private readonly endpoint: string;
   private readonly timeoutMs: number;
+  private readonly token?: string | undefined;
 
   constructor(config: DefenseClawClientConfig = {}) {
     this.endpoint = config.endpoint || process.env.DEFENSECLAW_ENDPOINT || "http://localhost:8080/v1/evaluate";
     this.timeoutMs = config.timeoutMs ?? 5000;
+    this.token = config.token || process.env.DEFENSECLAW_GATEWAY_TOKEN || process.env.DEFENSECLAW_TOKEN;
   }
 
   async evaluate(req: DefenseClawEvalRequest): Promise<DefenseClawEvalResponse> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "traceparent": req.traceparent || "",
+        "X-DefenseClaw-Client": "cloudops",
+      };
+      if (this.token) {
+        headers["Authorization"] = `Bearer ${this.token}`;
+        headers["X-DefenseClaw-Token"] = this.token;
+      }
+
       const response = await fetch(this.endpoint, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "traceparent": req.traceparent || ""
-        },
+        headers,
         body: JSON.stringify({
           correlation_id: req.correlationId,
           agent_id: req.agentId,

@@ -19,12 +19,14 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -46,6 +48,7 @@ var (
 	serveConnectors    string
 	serveHost          string
 	servePort          int
+	serveToken         string
 )
 
 var serveCmd = &cobra.Command{
@@ -55,6 +58,20 @@ var serveCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		expectedToken := serveToken
+		if expectedToken == "" {
+			expectedToken = sidecarToken
+		}
+		if expectedToken == "" {
+			expectedToken = strings.TrimSpace(os.Getenv("DEFENSECLAW_GATEWAY_TOKEN"))
+		}
+		if expectedToken == "" {
+			expectedToken = strings.TrimSpace(os.Getenv("OPENCLAW_GATEWAY_TOKEN"))
+		}
+		if expectedToken == "" && cfg != nil {
+			expectedToken = cfg.Gateway.ResolvedToken()
+		}
+
 		mux := http.NewServeMux()
 
 		policyDir := servePolicyBundles
@@ -85,6 +102,11 @@ var serveCmd = &cobra.Command{
 			}
 			var req cloudops.CapabilityRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				var maxBytesError *http.MaxBytesError
+				if errors.As(err, &maxBytesError) {
+					http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -122,27 +144,32 @@ var serveCmd = &cobra.Command{
 					matched = append(matched, ev)
 				}
 			}
-			if len(matched) == 0 && traceID != "" {
-				matched = append(matched, schemas.GatewayEventEnvelope{
-					TS:            time.Now().UTC().Format(time.RFC3339),
-					EventType:     "hook_decision",
-					Severity:      "INFO",
-					SchemaVersion: 7,
-					TraceID:       traceID,
-				})
+			if matched == nil {
+				matched = []schemas.GatewayEventEnvelope{}
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(matched)
 		})
 
+		// Apply security middleware stack:
+		// 1. Body limit (1 MiB default for API mutations)
+		// 2. CSRF & origin protection (enforces X-DefenseClaw-Client, JSON Content-Type, Sec-Fetch-Site)
+		// 3. Rate limiting (20 rps, 40 burst per IP, loopback exempt)
+		// 4. Token authentication (Bearer / X-DefenseClaw-Token / X-DC-Auth, /health exempt)
+		var handler http.Handler = mux
+		handler = gateway.APIBodyLimitMiddleware(handler, 1<<20, 1<<20)
+		handler = gateway.APICSRFProtectMiddleware(handler)
+		handler = gateway.PerIPRateLimiter(20, 40)(handler)
+		handler = gateway.NewTokenAuthMiddleware(expectedToken)(handler)
+
 		addr := fmt.Sprintf("%s:%d", serveHost, servePort)
 		fmt.Printf("DefenseClaw Gateway listening on http://%s (policy bundles: %s, connectors: %s)\n", addr, servePolicyBundles, serveConnectors)
 		srv := &http.Server{
 			Addr:    addr,
-			Handler: mux,
+			Handler: handler,
 		}
 
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
 		go func() {
@@ -176,6 +203,7 @@ func init() {
 	serveCmd.Flags().StringVar(&serveConnectors, "connectors", "", "Comma-separated list of enabled connectors")
 	serveCmd.Flags().StringVar(&serveHost, "host", "127.0.0.1", "HTTP server host")
 	serveCmd.Flags().IntVar(&servePort, "port", 8080, "HTTP server port")
+	serveCmd.Flags().StringVar(&serveToken, "token", "", "Gateway auth token (default: from DEFENSECLAW_GATEWAY_TOKEN env)")
 	rootCmd.AddCommand(serveCmd)
 }
 

@@ -21,7 +21,6 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3109,18 +3108,7 @@ func (a *APIServer) tokenAuth(next http.Handler) http.Handler {
 		}
 		ctx := r.Context()
 
-		token := ""
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			token = strings.TrimPrefix(auth, "Bearer ")
-		}
-		if token == "" {
-			token = r.Header.Get("X-DefenseClaw-Token")
-		}
-		if token == "" {
-			if dcAuth := r.Header.Get("X-DC-Auth"); strings.HasPrefix(dcAuth, "Bearer ") {
-				token = strings.TrimPrefix(dcAuth, "Bearer ")
-			}
-		}
+		token := ExtractTokenFromRequest(r)
 
 		expected := ""
 		if a.scannerCfg != nil {
@@ -3258,9 +3246,7 @@ func (a *APIServer) tokenAuth(next http.Handler) http.Handler {
 // comparing for equality, not protecting against precomputation
 // of "what's the token?" — the digest never leaves this comparison.
 func constantTimeStringMatch(a, b string) bool {
-	ha := sha256.Sum256([]byte(a))
-	hb := sha256.Sum256([]byte(b))
-	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
+	return ConstantTimeStringMatch(a, b)
 }
 
 func (a *APIServer) emitHTTPAuthFailure(ctx context.Context, r *http.Request, _ string, _ gatewaylog.ErrorCode, metricReason string) {
