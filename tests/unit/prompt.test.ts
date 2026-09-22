@@ -35,7 +35,7 @@ describe("generateOnboardingPrompt", () => {
     expect(prompt).toContain("Step 2: Submit Declarative Join Request");
     expect(prompt).toContain("Step 3: Await Human Operator Approval");
     expect(prompt).toContain("Step 4: Claim One-Time Bootstrap Credential");
-    expect(prompt).toContain("Step 5: Connect to CloudOps Gateway");
+    expect(prompt).toContain("Step 5: Connect to CloudOps");
 
     // Operator instructions
     expect(prompt).toContain("Operate AWS ECS and CloudWatch infrastructure.");

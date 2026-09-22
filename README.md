@@ -84,6 +84,11 @@ This runs the LLM + investigation engine that the CloudOps connector bridges to 
 
 ## Getting Started
 
+### Prerequisites
+- Node.js >= 24.0.0
+- Docker & Docker Compose
+- **OPA CLI 1.15.2** (required for compiling Rego policies to WASM in `@cloudops/security`): [Install OPA](https://www.openpolicyagent.org/docs/latest/#running-opa)
+
 ### 1. Install Dependencies
 
 ```bash

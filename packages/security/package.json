@@ -6,10 +6,12 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
+    "prebuild": "bash ../../scripts/build-rego-wasm.sh",
+    "build": "tsc && (cp src/cloudops_policy.wasm dist/ 2>/dev/null || true)",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cloudops/shared": "*"
+    "@cloudops/shared": "*",
+    "@open-policy-agent/opa-wasm": "1.10.0"
   }
 }

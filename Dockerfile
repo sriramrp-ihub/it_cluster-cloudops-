@@ -3,10 +3,19 @@ FROM node:24-bookworm-slim AS builder
 
 WORKDIR /app
 
-# Install ca-certificates
+# Install ca-certificates and curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install pinned OPA CLI v1.15.2 for WASM compilation
+ARG OPA_VERSION=1.15.2
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then OPA_ARCH="arm64_static"; elif [ "$ARCH" = "amd64" ]; then OPA_ARCH="amd64_static"; else OPA_ARCH="${ARCH}"; fi && \
+    curl -sL "https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}/opa_linux_${OPA_ARCH}" -o /usr/local/bin/opa && \
+    chmod +x /usr/local/bin/opa && \
+    opa version
 
 # Copy package manifests for optimal layer caching
 COPY package.json package-lock.json ./
@@ -33,6 +42,9 @@ RUN npm ci
 
 # Copy all source files
 COPY . .
+
+# Compile OPA Rego policy to WebAssembly before building packages
+RUN ./scripts/build-rego-wasm.sh
 
 # Build all workspaces (TypeScript compiler + Next.js production build)
 ENV NEXT_TELEMETRY_DISABLED=1

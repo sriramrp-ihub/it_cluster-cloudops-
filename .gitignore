@@ -57,3 +57,6 @@ defence_claw/defenseclaw/__pycache__/
 defence_claw/defenseclaw/.gocache/
 defence_claw/defenseclaw/.gomodcache/
 
+# Compiled WebAssembly policies (generated at build time, do not commit)
+*.wasm
+packages/security/src/cloudops_policy.wasm
