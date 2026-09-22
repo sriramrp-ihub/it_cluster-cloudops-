@@ -1,22 +1,25 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { resolve } from "node:path";
 import { createServer } from "node:net";
+import { randomBytes } from "node:crypto";
 
 export interface DefenseClawGatewayInstance {
   port: number;
   baseUrl: string;
   evaluateUrl: string;
   auditEventsUrl: string;
+  token: string;
   stop: () => Promise<void>;
-  getAuditEvents: (traceId?: string) => Promise<any[]>;
+  getAuditEvents: (traceId?: string, requestToken?: string) => Promise<any[]>;
 }
 
 export interface StartDefenseClawOptions {
-  port?: number;
-  binaryPath?: string;
-  policyBundles?: string;
-  connectors?: string;
-  timeoutMs?: number;
+  port?: number | undefined;
+  token?: string | undefined;
+  binaryPath?: string | undefined;
+  policyBundles?: string | undefined;
+  connectors?: string | undefined;
+  timeoutMs?: number | undefined;
 }
 
 async function getAvailablePort(): Promise<number> {
@@ -37,6 +40,7 @@ export async function startDefenseClawGateway(
   options: StartDefenseClawOptions = {}
 ): Promise<DefenseClawGatewayInstance> {
   const port = options.port || (await getAvailablePort());
+  const token = options.token || process.env.DEFENSECLAW_GATEWAY_TOKEN || randomBytes(32).toString("hex");
   const binaryPath =
     options.binaryPath ||
     resolve(process.cwd(), "defence_claw/defenseclaw/defenseclaw-gateway");
@@ -55,12 +59,14 @@ export async function startDefenseClawGateway(
     "--policy-bundles",
     policyBundles,
     "--connectors",
-    connectors
+    connectors,
+    "--token",
+    token
   ];
 
   const proc: ChildProcess = spawn(binaryPath, args, {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env }
+    env: { ...process.env, DEFENSECLAW_GATEWAY_TOKEN: token }
   });
 
   proc.on("error", (err) => {
@@ -111,9 +117,17 @@ export async function startDefenseClawGateway(
     });
   };
 
-  const getAuditEvents = async (traceId?: string): Promise<any[]> => {
+  const getAuditEvents = async (traceId?: string, requestToken?: string): Promise<any[]> => {
     const url = traceId ? `${auditEventsUrl}?trace_id=${encodeURIComponent(traceId)}` : auditEventsUrl;
-    const res = await fetch(url);
+    const effectiveToken = requestToken !== undefined ? requestToken : token;
+    const headers: Record<string, string> = {
+      "X-DefenseClaw-Client": "cloudops"
+    };
+    if (effectiveToken) {
+      headers["Authorization"] = `Bearer ${effectiveToken}`;
+      headers["X-DefenseClaw-Token"] = effectiveToken;
+    }
+    const res = await fetch(url, { headers });
     if (!res.ok) {
       throw new Error(`Failed to fetch audit events: ${res.status} ${await res.text()}`);
     }
@@ -130,6 +144,7 @@ export async function startDefenseClawGateway(
     baseUrl,
     evaluateUrl,
     auditEventsUrl,
+    token,
     stop,
     getAuditEvents
   };

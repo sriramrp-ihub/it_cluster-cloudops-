@@ -49,6 +49,7 @@ describe("Phase 6: DefenseClaw Security Sidecar Integration", () => {
         heartbeatTimeoutMs: 5000,
         defenseClaw: new DefenseClawClient({
           endpoint: defenseClaw.evaluateUrl,
+          token: defenseClaw.token,
           timeoutMs: 5000
         })
       }
@@ -293,5 +294,71 @@ describe("Phase 6: DefenseClaw Security Sidecar Integration", () => {
     expect(evalResult.ruleId).toBe("DEFENSECLAW_UNAVAILABLE");
 
     await deadApp.close();
+  });
+
+  it("7. Enforces token authentication and rejects unauthenticated evaluate and audit requests", async () => {
+    // POST /v1/evaluate without token -> 401
+    const evalResNoAuth = await fetch(defenseClaw.evaluateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-DefenseClaw-Client": "cloudops"
+      },
+      body: JSON.stringify({
+        capability: "aws.ecs.describe_clusters",
+        arguments: {}
+      })
+    });
+    expect(evalResNoAuth.status).toBe(401);
+
+    // POST /v1/evaluate with invalid token -> 401
+    const evalResBadAuth = await fetch(defenseClaw.evaluateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-DefenseClaw-Client": "cloudops",
+        "Authorization": "Bearer invalid-token-12345"
+      },
+      body: JSON.stringify({
+        capability: "aws.ecs.describe_clusters",
+        arguments: {}
+      })
+    });
+    expect(evalResBadAuth.status).toBe(401);
+
+    // GET /v1/audit/events without token -> 401
+    const auditResNoAuth = await fetch(defenseClaw.auditEventsUrl);
+    expect(auditResNoAuth.status).toBe(401);
+
+    // GET /health should remain unauthenticated -> 200
+    const healthRes = await fetch(`${defenseClaw.baseUrl}/health`);
+    expect(healthRes.status).toBe(200);
+  });
+
+  it("8. Returns empty result set (not synthetic event) on unmatched trace_id", async () => {
+    const nonexistentTraceId = "000000000000000000000000deadbeef";
+    const events = await defenseClaw.getAuditEvents(nonexistentTraceId);
+    expect(Array.isArray(events)).toBe(true);
+    expect(events.length).toBe(0);
+    // Explicitly verify no synthetic event is fabricated
+    expect(events.some((e: any) => (e.event_id || "").startsWith("evt_synthetic"))).toBe(false);
+  });
+
+  it("9. Rejects oversized request body exceeding 1 MiB", async () => {
+    const hugePayload = "A".repeat(1024 * 1024 + 100);
+    const res = await fetch(defenseClaw.evaluateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-DefenseClaw-Client": "cloudops",
+        "Authorization": `Bearer ${defenseClaw.token}`,
+        "X-DefenseClaw-Token": defenseClaw.token
+      },
+      body: JSON.stringify({
+        capability: "aws.ecs.describe_clusters",
+        arguments: { padding: hugePayload }
+      })
+    });
+    expect(res.status).toBe(413);
   });
 });

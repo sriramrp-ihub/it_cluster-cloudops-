@@ -39,8 +39,10 @@ services:
     image: defenseclaw-sidecar:latest
     container_name: cloudops-defenseclaw
     restart: unless-stopped
+    environment:
+      - DEFENSECLAW_GATEWAY_TOKEN=${DEFENSECLAW_GATEWAY_TOKEN:?DEFENSECLAW_GATEWAY_TOKEN environment variable is required}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://127.0.0.1:8080/health || exit 1"]
       interval: 5s
@@ -72,6 +74,7 @@ services:
       - PORT=3001
       - DATABASE_URL=postgres://postgres@postgres:5432/cloudops
       - DEFENSECLAW_ENDPOINT=http://defenseclaw:8080/v1/evaluate
+      - DEFENSECLAW_GATEWAY_TOKEN=${DEFENSECLAW_GATEWAY_TOKEN:?DEFENSECLAW_GATEWAY_TOKEN environment variable is required}
       - HERMES_URL=http://host.docker.internal:8080
     extra_hosts:
       - "host.docker.internal:host-gateway"
