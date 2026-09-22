@@ -61,7 +61,8 @@ jobs:
             tests/unit/approval_lifecycle.test.ts \
             tests/unit/approval_idempotency.test.ts \
             tests/unit/approval_signatures.test.ts \
-            tests/unit/gateway_protocol.test.ts
+            tests/unit/gateway_protocol.test.ts \
+            tests/integration/incident_investigation_workflow.test.ts
 
   build-and-test:
     name: Monorepo Build & Unit Tests
