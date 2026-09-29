@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { buildApp } from "../../apps/api/src/server.js";
 import { runMigrations, closeDatabase, getDatabase } from "@cloudops/database";
@@ -254,6 +255,247 @@ describe("Phase 2 Onboarding Lifecycle & Validation Edge Cases", () => {
     });
   });
 
+  describe("ADR-0007 Phase C1b: agent orchestration role (approve-with-role + PATCH role)", () => {
+    /**
+     * `agent_claim_credentials.claim_token_hash` carries a GLOBAL UNIQUE
+     * constraint (database/migrations/001_initial_schema.sql), and
+     * approveJoinRequest() inserts a literal `"PENDING_CLAIM"` placeholder
+     * there — only replaced with a real unique hash once the bootstrap
+     * credential is actually claimed via the real `/v1/onboarding/claim`
+     * flow. That real flow also triggers `HermesProfileService
+     * .provisionProfile()` — genuine `hermes` CLI subprocess calls,
+     * including an MCP live-connectivity check that's slow (~15-20s) and,
+     * under Fastify's in-process `app.inject()` (no real listening port),
+     * always fails its own connectivity probe. Both facts are pre-existing
+     * and entirely orthogonal to this ADR's role work — calling the real
+     * claim endpoint here would only be testing Hermes provisioning
+     * incidentally, at real cost, not role assignment. Each test below
+     * instead does the ONE thing that actually matters for the
+     * global-uniqueness constraint: retires its own placeholder row with a
+     * fast, precisely-scoped DB update (to a per-test-unique value, never
+     * touching any other row) immediately after a successful approve.
+     */
+    async function retireClaimPlaceholder(joinRequestId: string) {
+      const db = getDatabase();
+      await db
+        .updateTable("agent_claim_credentials")
+        .set({ claim_token_hash: `test_retired_${joinRequestId}_${randomUUID()}` } as any)
+        .where("join_request_id", "=", joinRequestId)
+        .execute();
+    }
+
+    it("defaults a newly-approved agent to role 'generalist' when no role is supplied at approval time (default/unchanged onboarding behavior)", async () => {
+      const invRes = await app.inject({
+        method: "POST",
+        url: "/v1/agent-invites",
+        headers: operatorHeaders,
+        payload: { expiresInSeconds: 3600 }
+      });
+      const token = JSON.parse(invRes.body).inviteToken;
+
+      const joinRes = await app.inject({
+        method: "POST",
+        url: `/v1/onboarding/${token}/join`,
+        payload: {
+          agent: { name: "default-role-agent", type: "hermes" },
+          runtime: { name: "hermes-agent", version: "1.0.0" },
+          requestedCapabilities: []
+        }
+      });
+      const joinRequestId = JSON.parse(joinRes.body).joinRequestId;
+
+      // No `role` in the approve body at all — the vast majority of
+      // real-world approvals today.
+      const approveRes = await app.inject({
+        method: "POST",
+        url: `/v1/agent-join-requests/${joinRequestId}/approve`,
+        headers: operatorHeaders
+      });
+      expect(approveRes.statusCode).toBe(200);
+      const approveBody = JSON.parse(approveRes.body);
+      expect(approveBody.agent.role).toBe("generalist");
+      await retireClaimPlaceholder(joinRequestId);
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/v1/agents/${approveBody.agentId}`,
+        headers: operatorHeaders
+      });
+      expect(getRes.statusCode).toBe(200);
+      expect(JSON.parse(getRes.body).role).toBe("generalist");
+    });
+
+    it("approves a join request with an explicit orchestration role", async () => {
+      const invRes = await app.inject({
+        method: "POST",
+        url: "/v1/agent-invites",
+        headers: operatorHeaders,
+        payload: { expiresInSeconds: 3600 }
+      });
+      const token = JSON.parse(invRes.body).inviteToken;
+
+      const joinRes = await app.inject({
+        method: "POST",
+        url: `/v1/onboarding/${token}/join`,
+        payload: {
+          agent: { name: "investigator-agent", type: "hermes" },
+          runtime: { name: "hermes-agent", version: "1.0.0" },
+          requestedCapabilities: []
+        }
+      });
+      const joinRequestId = JSON.parse(joinRes.body).joinRequestId;
+
+      const approveRes = await app.inject({
+        method: "POST",
+        url: `/v1/agent-join-requests/${joinRequestId}/approve`,
+        headers: operatorHeaders,
+        payload: { role: "investigator" }
+      });
+      expect(approveRes.statusCode).toBe(200);
+      const approveBody = JSON.parse(approveRes.body);
+      expect(approveBody.agent.role).toBe("investigator");
+      await retireClaimPlaceholder(joinRequestId);
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/v1/agents/${approveBody.agentId}`,
+        headers: operatorHeaders
+      });
+      expect(JSON.parse(getRes.body).role).toBe("investigator");
+    });
+
+    it("rejects approval with an unsupported role value", async () => {
+      const invRes = await app.inject({
+        method: "POST",
+        url: "/v1/agent-invites",
+        headers: operatorHeaders,
+        payload: { expiresInSeconds: 3600 }
+      });
+      const token = JSON.parse(invRes.body).inviteToken;
+
+      const joinRes = await app.inject({
+        method: "POST",
+        url: `/v1/onboarding/${token}/join`,
+        payload: {
+          agent: { name: "bad-role-agent", type: "hermes" },
+          runtime: { name: "hermes-agent", version: "1.0.0" },
+          requestedCapabilities: []
+        }
+      });
+      const joinRequestId = JSON.parse(joinRes.body).joinRequestId;
+
+      const approveRes = await app.inject({
+        method: "POST",
+        url: `/v1/agent-join-requests/${joinRequestId}/approve`,
+        headers: operatorHeaders,
+        payload: { role: "supreme-overlord" }
+      });
+      expect(approveRes.statusCode).toBe(400);
+    });
+
+    it("PATCH /v1/agents/:id/role re-assigns an already-onboarded agent's role at any time", async () => {
+      const invRes = await app.inject({
+        method: "POST",
+        url: "/v1/agent-invites",
+        headers: operatorHeaders,
+        payload: { expiresInSeconds: 3600 }
+      });
+      const token = JSON.parse(invRes.body).inviteToken;
+
+      const joinRes = await app.inject({
+        method: "POST",
+        url: `/v1/onboarding/${token}/join`,
+        payload: {
+          agent: { name: "role-reassign-agent", type: "hermes" },
+          runtime: { name: "hermes-agent", version: "1.0.0" },
+          requestedCapabilities: []
+        }
+      });
+      const joinRequestId = JSON.parse(joinRes.body).joinRequestId;
+
+      const approveRes = await app.inject({
+        method: "POST",
+        url: `/v1/agent-join-requests/${joinRequestId}/approve`,
+        headers: operatorHeaders
+      });
+      const agentId = JSON.parse(approveRes.body).agentId;
+      await retireClaimPlaceholder(joinRequestId);
+
+      // Re-assign generalist -> verifier.
+      const patchRes = await app.inject({
+        method: "PATCH",
+        url: `/v1/agents/${agentId}/role`,
+        headers: operatorHeaders,
+        payload: { role: "verifier" }
+      });
+      expect(patchRes.statusCode).toBe(200);
+      expect(JSON.parse(patchRes.body).role).toBe("verifier");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/v1/agents/${agentId}`,
+        headers: operatorHeaders
+      });
+      expect(JSON.parse(getRes.body).role).toBe("verifier");
+
+      // Re-assign again -> synthesizer, proving it's mutable at any time
+      // (unlike declared_capabilities, which is write-once outside
+      // syncCapabilities).
+      const patchAgain = await app.inject({
+        method: "PATCH",
+        url: `/v1/agents/${agentId}/role`,
+        headers: operatorHeaders,
+        payload: { role: "synthesizer" }
+      });
+      expect(patchAgain.statusCode).toBe(200);
+      expect(JSON.parse(patchAgain.body).role).toBe("synthesizer");
+    });
+
+    it("PATCH /v1/agents/:id/role rejects an unsupported role value, leaving the agent's role unchanged", async () => {
+      const invRes = await app.inject({
+        method: "POST",
+        url: "/v1/agent-invites",
+        headers: operatorHeaders,
+        payload: { expiresInSeconds: 3600 }
+      });
+      const token = JSON.parse(invRes.body).inviteToken;
+
+      const joinRes = await app.inject({
+        method: "POST",
+        url: `/v1/onboarding/${token}/join`,
+        payload: {
+          agent: { name: "role-patch-invalid-agent", type: "hermes" },
+          runtime: { name: "hermes-agent", version: "1.0.0" },
+          requestedCapabilities: []
+        }
+      });
+      const joinRequestId = JSON.parse(joinRes.body).joinRequestId;
+
+      const approveRes = await app.inject({
+        method: "POST",
+        url: `/v1/agent-join-requests/${joinRequestId}/approve`,
+        headers: operatorHeaders
+      });
+      const agentId = JSON.parse(approveRes.body).agentId;
+      await retireClaimPlaceholder(joinRequestId);
+
+      const patchRes = await app.inject({
+        method: "PATCH",
+        url: `/v1/agents/${agentId}/role`,
+        headers: operatorHeaders,
+        payload: { role: "supreme-overlord" }
+      });
+      expect(patchRes.statusCode).toBe(400);
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/v1/agents/${agentId}`,
+        headers: operatorHeaders
+      });
+      expect(JSON.parse(getRes.body).role).toBe("generalist");
+    });
+  });
+
   describe("Operator Approval & State Transitions", () => {
     it("fails claim before operator approval with 409 ConflictError", async () => {
       const invRes = await app.inject({
@@ -340,4 +582,5 @@ describe("Phase 2 Onboarding Lifecycle & Validation Edge Cases", () => {
       expect(body.error.message).toContain("Cannot approve join request with status 'APPROVED'");
     });
   });
+
 });

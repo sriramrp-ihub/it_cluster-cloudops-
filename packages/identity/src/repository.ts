@@ -1,7 +1,7 @@
 import { Kysely, Transaction } from "kysely";
 import type { DatabaseSchema, AgentTable } from "@cloudops/database";
 import { getDatabase } from "@cloudops/database";
-import type { AgentId, AgentStatus, AgentGovernanceStatus } from "@cloudops/shared";
+import type { AgentId, AgentStatus, AgentGovernanceStatus, AgentRole } from "@cloudops/shared";
 
 export interface AgentRecord {
   id: AgentId;
@@ -19,6 +19,8 @@ export interface AgentRecord {
   governanceStatus: AgentGovernanceStatus;
   governanceVerifiedAt: Date | null;
   mcpRegistered: boolean;
+  /** ADR-0007 Phase C1b: orchestration/routing role — see @cloudops/shared's AgentRole. */
+  role: AgentRole;
 }
 
 /** Patch accepted by IAgentRepository.updateGovernance — see HermesProfileService. */
@@ -37,7 +39,11 @@ export interface CreateAgentDto {
   version: string;
   runtimeProtocol: string;
   status?: AgentStatus;
+  /** ADR-0007 Phase C1b: defaults to 'generalist' (matching the column default) when omitted. */
+  role?: AgentRole;
 }
+
+export const VALID_AGENT_ROLES: readonly AgentRole[] = ["generalist", "investigator", "verifier", "synthesizer"];
 
 function mapAgentRow(row: any): AgentRecord {
   return {
@@ -54,7 +60,11 @@ function mapAgentRow(row: any): AgentRecord {
     hermesProfileName: row.hermes_profile_name ?? null,
     governanceStatus: (row.governance_status as AgentGovernanceStatus) ?? "PENDING",
     governanceVerifiedAt: row.governance_verified_at ? new Date(row.governance_verified_at) : null,
-    mcpRegistered: Boolean(row.mcp_registered)
+    mcpRegistered: Boolean(row.mcp_registered),
+    // Fail-closed on an unrecognized value read back from the DB (should
+    // never happen given VALID_AGENT_ROLES gating on write) rather than
+    // trusting an arbitrary string into swarm eligibility resolution.
+    role: (VALID_AGENT_ROLES.includes(row.role) ? row.role : "generalist") as AgentRole
   };
 }
 
@@ -64,6 +74,7 @@ export interface IAgentRepository {
   updateStatus(tenantId: string, id: AgentId, status: AgentStatus, tx?: Transaction<DatabaseSchema>): Promise<void>;
   updateCloudAccount(tenantId: string, id: AgentId, cloudAccountId: string | null): Promise<void>;
   updateGovernance(tenantId: string, id: AgentId, patch: AgentGovernancePatch): Promise<void>;
+  updateRole(tenantId: string, id: AgentId, role: AgentRole): Promise<void>;
   list(tenantId: string): Promise<AgentRecord[]>;
   delete(tenantId: string, id: AgentId, tx?: Transaction<DatabaseSchema>): Promise<boolean>;
 }
@@ -73,6 +84,7 @@ export class AgentRepository implements IAgentRepository {
 
   async create(dto: CreateAgentDto, tx?: Transaction<DatabaseSchema>): Promise<AgentRecord> {
     const executor = tx || this.db;
+    const role = dto.role && VALID_AGENT_ROLES.includes(dto.role) ? dto.role : "generalist";
     const [row] = await executor
       .insertInto("agents")
       .values({
@@ -83,6 +95,7 @@ export class AgentRepository implements IAgentRepository {
         version: dto.version,
         runtime_protocol: dto.runtimeProtocol,
         status: dto.status || "APPROVED",
+        role,
         created_at: new Date(),
         updated_at: new Date()
       } as any)
@@ -153,6 +166,25 @@ export class AgentRepository implements IAgentRepository {
         governance_status: patch.governanceStatus,
         governance_verified_at: patch.governanceVerifiedAt,
         mcp_registered: patch.mcpRegistered,
+        updated_at: new Date()
+      } as any)
+      .where("tenant_id", "=", tenantId)
+      .where("id", "=", id)
+      .execute();
+  }
+
+  /**
+   * ADR-0007 Phase C1b: (re-)assigns an agent's orchestration/routing role.
+   * Validated here (application-layer, mirroring the rest of this file's
+   * plain-string-column convention) rather than left to a DB CHECK
+   * constraint — an invalid value is a ValidationError at the service layer,
+   * never silently written.
+   */
+  async updateRole(tenantId: string, id: AgentId, role: AgentRole): Promise<void> {
+    await this.db
+      .updateTable("agents")
+      .set({
+        role,
         updated_at: new Date()
       } as any)
       .where("tenant_id", "=", tenantId)

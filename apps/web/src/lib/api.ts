@@ -34,6 +34,8 @@ export interface AgentItem {
   governanceStatus?: "PENDING" | "LOCKED_DOWN" | "FAILED";
   governanceVerifiedAt?: string | null;
   mcpRegistered?: boolean;
+  /** ADR-0007 Phase C1b: orchestration/routing role for swarm eligibility — never a permission. */
+  role?: "generalist" | "investigator" | "verifier" | "synthesizer";
   createdAt: string;
   updatedAt: string;
 }
@@ -264,6 +266,33 @@ export async function assignAgentCloudAccount(
       ...getAuthHeaders(tenantId, operatorId)
     },
     body: JSON.stringify({ cloudAccountId })
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+/**
+ * ADR-0007 Phase C1b: (re-)assigns an agent's orchestration/routing role —
+ * purely scheduling metadata for swarm eligibility, never a permission grant.
+ */
+export async function updateAgentRole(
+  agentId: string,
+  role: "generalist" | "investigator" | "verifier" | "synthesizer",
+  tenantId?: string,
+  operatorId?: string
+): Promise<{ id: string; role: string }> {
+  const res = await fetch(`${API_BASE}/v1/agents/${agentId}/role`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(tenantId, operatorId)
+    },
+    body: JSON.stringify({ role })
   });
 
   if (!res.ok) {

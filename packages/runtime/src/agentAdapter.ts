@@ -40,6 +40,16 @@ export interface AgentToolCall {
   toolName: string;
   arguments: Record<string, unknown>;
   timestamp: Date;
+  /**
+   * Phase 3.5: why this specific call is being made right now — persisted
+   * verbatim into tool_executions.reasoning_snippet by the executing route,
+   * not reconstructed after the fact from the final investigation summary.
+   * Optional because not every AgentAdapter has a reasoning narrative to
+   * offer for every call (e.g. a raw MCP client-issued call has none).
+   */
+  reasoning?: string | undefined;
+  /** Evidence IDs already collected that informed this call, if any. */
+  evidenceRefs?: string[] | undefined;
 }
 
 export interface AgentToolResult {
@@ -47,6 +57,30 @@ export interface AgentToolResult {
   status: "SUCCESS" | "AWAITING_APPROVAL" | "ERROR";
   data?: unknown;
   error?: { code: string; message: string } | undefined;
+  approvalId?: string | undefined;
+}
+
+export interface InvestigationDriveContext {
+  cluster?: string | undefined;
+  service?: string | undefined;
+  region?: string | undefined;
+  alertDescription?: string | undefined;
+  liveInference?: boolean | undefined;
+  /**
+   * ADR-0007 Phase C1b: the caller's own outer `runs` row id (created via
+   * `RunService.createRun()` BEFORE `runInvestigation()` is invoked), if
+   * known — purely optional, additive metadata so a swarm investigation's
+   * per-worker/verifier/synthesizer sub-runs can be linked back to it via
+   * `runs.parent_run_id`. Every existing caller that never sets this keeps
+   * working exactly as before; swarm sub-runs simply get `parent_run_id:
+   * null` when it's absent.
+   */
+  runId?: string | undefined;
+}
+
+export interface InvestigationDriveResult {
+  status: string;
+  rootCause: Record<string, unknown>;
   approvalId?: string | undefined;
 }
 
@@ -67,4 +101,15 @@ export interface AgentAdapter {
   ): () => void;
   terminate(sessionId: string, reason: string): Promise<void>;
   getSession(sessionId: string): AgentSession | undefined;
+
+  /**
+   * Drives one full investigation turn on an already-started session: issues
+   * tool calls (via the onToolCall handler), collects evidence, and resolves
+   * once a root cause has been synthesized (and, for high-risk findings, a
+   * remediation proposal has been submitted for approval).
+   */
+  runInvestigation(
+    sessionId: string,
+    context?: InvestigationDriveContext
+  ): Promise<InvestigationDriveResult>;
 }

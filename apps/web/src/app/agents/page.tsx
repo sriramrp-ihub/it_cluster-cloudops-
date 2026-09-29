@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import Link from "next/link";
-import { fetchAgents, deleteAgent, connectAgent, AgentItem } from "../../lib/api";
+import { fetchAgents, deleteAgent, connectAgent, assignAgentCloudAccount, updateAgentRole, fetchCloudAccounts, AgentItem, CloudAccountItem } from "../../lib/api";
 import { useOperator } from "../../auth/OperatorContext";
 import { useAgentChat } from "../../context/AgentChatContext";
 import { TestAgentModal } from "../../components/agents/TestAgentModal";
@@ -13,6 +13,7 @@ export default function AgentsFleetPage() {
   const { session } = useOperator();
   const { setChatContext, openChat } = useAgentChat();
   const [agents, setAgents] = useState<AgentItem[]>([]);
+  const [cloudAccounts, setCloudAccounts] = useState<CloudAccountItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -22,6 +23,8 @@ export default function AgentsFleetPage() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [selectedTestAgent, setSelectedTestAgent] = useState<AgentItem | null>(null);
   const [connectingAgentId, setConnectingAgentId] = useState<string | null>(null);
+  const [assigningAgentId, setAssigningAgentId] = useState<string | null>(null);
+  const [updatingRoleAgentId, setUpdatingRoleAgentId] = useState<string | null>(null);
 
   const tenantId = session?.tenantId || "ten_default_tenant";
   const operatorId = session?.operatorId || "op_admin_operator";
@@ -30,12 +33,46 @@ export default function AgentsFleetPage() {
     setLoading(true);
     setErrorMsg(null);
     try {
-      const data = await fetchAgents(tenantId, operatorId);
-      setAgents(data);
+      const [agentData, accountData] = await Promise.all([
+        fetchAgents(tenantId, operatorId),
+        fetchCloudAccounts(tenantId, operatorId).catch(() => [])
+      ]);
+      setAgents(agentData);
+      setCloudAccounts(accountData);
     } catch (err: any) {
       setErrorMsg(`Failed to load agents: ${err.message}`);
     } finally {
       setLoading(false);
+    }
+  }
+
+  function accountLabel(account: CloudAccountItem): string {
+    return `${account.provider.toUpperCase()} · ${account.accountId} (${account.region})`;
+  }
+
+  async function handleAssignCloudAccount(agentId: string, cloudAccountId: string) {
+    setAssigningAgentId(agentId);
+    setErrorMsg(null);
+    try {
+      await assignAgentCloudAccount(agentId, cloudAccountId || null, tenantId, operatorId);
+      await loadAgents();
+    } catch (err: any) {
+      setErrorMsg(`Failed to assign cloud account: ${err.message}`);
+    } finally {
+      setAssigningAgentId(null);
+    }
+  }
+
+  async function handleChangeRole(agentId: string, role: string) {
+    setUpdatingRoleAgentId(agentId);
+    setErrorMsg(null);
+    try {
+      await updateAgentRole(agentId, role as any, tenantId, operatorId);
+      await loadAgents();
+    } catch (err: any) {
+      setErrorMsg(`Failed to update agent role: ${err.message}`);
+    } finally {
+      setUpdatingRoleAgentId(null);
     }
   }
 
@@ -169,6 +206,15 @@ export default function AgentsFleetPage() {
                     <div style={{ fontSize: "12px", color: "var(--mid-warm-gray)", marginTop: "2px" }}>
                       Type: <strong style={{ color: "var(--dark-warm-gray)", textTransform: "capitalize" }}>{agent.type}</strong> • Protocol: <span className="code-inline" style={{ fontSize: "11px" }}>{agent.runtimeProtocol}</span>
                     </div>
+                    <div style={{ fontSize: "11.5px", marginTop: "4px" }}>
+                      {agent.cloudAccountId ? (
+                        <span style={{ color: "var(--mid-warm-gray)" }}>
+                          Cloud Account: <span className="code-inline" style={{ fontSize: "11px" }}>{cloudAccounts.find((a) => a.id === agent.cloudAccountId)?.accountId || agent.cloudAccountId}</span>
+                        </span>
+                      ) : (
+                        <span style={{ color: "#b45309", fontWeight: 600 }}>No cloud account assigned</span>
+                      )}
+                    </div>
                   </div>
                   <span className="status-pill connected" style={{ fontSize: "11px" }}>
                     <span className="status-dot-inner" />
@@ -266,6 +312,8 @@ export default function AgentsFleetPage() {
                   <th>Agent Name</th>
                   <th>Framework</th>
                   <th>Status</th>
+                  <th>Role</th>
+                  <th>Cloud Account</th>
                   <th>Registered On</th>
                   <th style={{ textAlign: "right" }}>Actions</th>
                 </tr>
@@ -312,6 +360,55 @@ export default function AgentsFleetPage() {
                           <span className="status-dot-inner" />
                           {agent.status}
                         </span>
+                      </td>
+                      <td>
+                        {/* ADR-0007 Phase C1b: orchestration/routing role — purely scheduling
+                            metadata for swarm eligibility (resolveSwarmParticipants), never a
+                            permission grant. Re-assignable at any time. */}
+                        <select
+                          value={agent.role || "generalist"}
+                          onChange={(e) => handleChangeRole(agent.id, e.target.value)}
+                          disabled={updatingRoleAgentId === agent.id}
+                          title="Orchestration role (swarm eligibility only — not a permission)"
+                          style={{
+                            fontSize: "11px",
+                            fontFamily: "var(--font-mono)",
+                            padding: "3px 6px",
+                            borderRadius: "4px",
+                            border: "1px solid var(--warm-gray-border)",
+                            backgroundColor: agent.role && agent.role !== "generalist" ? "#eef2ff" : "#ffffff",
+                            color: "var(--dark-warm-gray)",
+                            textTransform: "capitalize"
+                          }}
+                        >
+                          <option value="generalist">Generalist</option>
+                          <option value="investigator">Investigator</option>
+                          <option value="verifier">Verifier</option>
+                          <option value="synthesizer">Synthesizer</option>
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          value={agent.cloudAccountId || ""}
+                          onChange={(e) => handleAssignCloudAccount(agent.id, e.target.value)}
+                          disabled={assigningAgentId === agent.id}
+                          style={{
+                            fontSize: "12px",
+                            padding: "4px 6px",
+                            borderRadius: "4px",
+                            border: agent.cloudAccountId ? "1px solid var(--warm-gray-border)" : "1px solid #fde68a",
+                            backgroundColor: agent.cloudAccountId ? "#ffffff" : "#fffbeb",
+                            color: agent.cloudAccountId ? "var(--dark-warm-gray)" : "#b45309",
+                            maxWidth: "220px"
+                          }}
+                        >
+                          <option value="">Unassigned</option>
+                          {cloudAccounts.map((acc) => (
+                            <option key={acc.id} value={acc.id}>
+                              {accountLabel(acc)}
+                            </option>
+                          ))}
+                        </select>
                       </td>
                       <td style={{ fontFamily: "var(--font-mono)", fontSize: "12px", color: "var(--mid-warm-gray)" }}>
                         {new Date(agent.createdAt).toLocaleDateString()}

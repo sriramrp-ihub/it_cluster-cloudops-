@@ -48,6 +48,17 @@ export const CLOUDOPS_MCP_SERVER_NAME = "cloudops-control-plane";
  */
 export const GOVERNED_MAX_TURNS = 20;
 
+/**
+ * ADR-0007 Phase C1a: provider resilience. Ships as a documented no-op
+ * (empty array) — this repo's own anti-fabrication norm (see
+ * docs/benchmarks/manual-engineer-baseline.md's CO-026 deferral) means we do
+ * not invent a plausible-looking second provider/model here. Once a real
+ * fallback provider/model is actually configured and credentialed for this
+ * deployment, populate this list; until then every governed profile gets an
+ * explicit, auditable "no fallback configured" rather than silent absence.
+ */
+export const GOVERNED_FALLBACK_PROVIDERS: string[] = [];
+
 export interface HermesProfileServiceConfig {
   hermesBin?: string | undefined;
   /** Base URL CloudOps's own API (and its /v1/mcp/sse route) is reachable at from this host. */
@@ -454,23 +465,67 @@ export class HermesProfileService {
   }
 
   /**
-   * ADR-0008 Phase B (§4.3): sets the two tool-loop guardrail config keys
-   * live-verified against the installed Hermes CLI this ADR's design session
-   * confirmed are real and settable per-profile:
+   * ADR-0008 Phase B (§4.3) + ADR-0007 Phase C1a: sets the tool-loop
+   * guardrail AND provider-resilience/context-compaction config keys
+   * live-verified against the installed Hermes CLI (v0.18.2) this session:
    *   hermes -p <profile> config set agent.max_turns <GOVERNED_MAX_TURNS>
    *   hermes -p <profile> config set tool_loop_guardrails.hard_stop_enabled true
+   *   hermes -p <profile> config set fallback_providers '[]'
+   *   hermes -p <profile> config set compression.enabled true
+   *   hermes -p <profile> config set compression.threshold 0.6
+   *   hermes -p <profile> config set compression.target_ratio 0.2
+   *   hermes -p <profile> config set compression.protect_last_n 20
+   *   hermes -p <profile> config set compression.protect_first_n 3
+   *   hermes -p <profile> config set compression.abort_on_summary_failure true
+   *   hermes -p <profile> config set compression.in_place false
+   * (Every key above was live-verified this session against a disposable
+   * scratch profile — created, each key set and independently confirmed
+   * present in that profile's own config.yaml, then the scratch profile
+   * deleted — not guessed from documentation.)
+   *
+   * Phase C1a rationale for the compression values chosen (deliberately more
+   * conservative than Hermes's own defaults where it matters for an
+   * unattended loop):
+   *   - threshold: 0.6, tighter than Hermes's own 0.50 default — no human is
+   *     watching an unattended investigation loop to notice a context window
+   *     getting dangerously full before compaction kicks in.
+   *   - target_ratio: 0.2 — Hermes's own default; no evidence a different
+   *     value is needed for this use case.
+   *   - protect_last_n / protect_first_n: 20 / 3 — Hermes's own defaults,
+   *     kept as-is.
+   *   - abort_on_summary_failure: true — fail closed. A corrupted/failed
+   *     context summary must never silently continue and produce a
+   *     confident-sounding wrong answer.
+   *   - in_place: false — Hermes's own default; no evidence a different
+   *     value is needed.
+   * fallback_providers ships as a documented no-op (GOVERNED_FALLBACK_PROVIDERS
+   * is an empty array by default) unless a real second provider/model is
+   * actually configured and credentialed for this deployment — this repo's
+   * own anti-fabrication norm (docs/benchmarks/manual-engineer-baseline.md's
+   * CO-026 deferral) means we do not fabricate a plausible-looking value here.
+   *
    * Never throws and never contributes to `provisionProfile()`'s
-   * governance-status computation — a mis-set turn budget is a cost/quality
-   * concern, not the security boundary GOVERNED_TOOLSETS_TO_DISABLE and the
-   * MCP-only invariant are. Every failure (CLI error, or a `config set` that
-   * ran but didn't echo back the live-verified `✓ Set ...` confirmation) is
-   * collected into the returned warnings array and logged, never thrown.
+   * governance-status computation — none of these are the security boundary
+   * GOVERNED_TOOLSETS_TO_DISABLE and the MCP-only invariant are; they're
+   * cost/quality/resilience knobs. Every failure (CLI error, or a
+   * `config set` that ran but didn't echo back the live-verified `✓ Set ...`
+   * confirmation) is collected into the returned warnings array and logged,
+   * never thrown.
    */
   private async configureInvestigationGuardrails(profileName: string): Promise<string[]> {
     const warnings: string[] = [];
     const settings: Array<[string, string]> = [
       ["agent.max_turns", String(GOVERNED_MAX_TURNS)],
-      ["tool_loop_guardrails.hard_stop_enabled", "true"]
+      ["tool_loop_guardrails.hard_stop_enabled", "true"],
+      // ADR-0007 Phase C1a: provider resilience + context compaction.
+      ["fallback_providers", JSON.stringify(GOVERNED_FALLBACK_PROVIDERS)],
+      ["compression.enabled", "true"],
+      ["compression.threshold", "0.6"],
+      ["compression.target_ratio", "0.2"],
+      ["compression.protect_last_n", "20"],
+      ["compression.protect_first_n", "3"],
+      ["compression.abort_on_summary_failure", "true"],
+      ["compression.in_place", "false"]
     ];
 
     for (const [key, value] of settings) {

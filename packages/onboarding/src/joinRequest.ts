@@ -10,8 +10,10 @@ import {
   ValidationError,
   type JoinRequestId,
   type JoinRequestStatus,
-  type AgentId
+  type AgentId,
+  type AgentRole
 } from "@cloudops/shared";
+import { VALID_AGENT_ROLES } from "@cloudops/identity";
 import { InviteService } from "./invite.js";
 import { recordAuditEvent } from "./audit.js";
 
@@ -65,6 +67,7 @@ export interface ApproveJoinRequestResult {
     id: AgentId;
     name: string;
     status: "APPROVED";
+    role: AgentRole;
   };
 }
 
@@ -87,6 +90,7 @@ export interface IJoinRequestRepository {
     reason: string | null,
     tx?: Transaction<DatabaseSchema>
   ): Promise<void>;
+  updateDeclaredCapabilitiesForAgent(tenantId: string, agentId: AgentId, capabilities: string[]): Promise<number>;
 }
 
 function mapJoinRequestRow(row: any): JoinRequestRecord {
@@ -231,6 +235,28 @@ export class JoinRequestRepository implements IJoinRequestRepository {
       .where("id", "=", id)
       .execute();
   }
+
+  /**
+   * Overwrites the declared_capabilities on every join request row tied to
+   * this agent (normally just one, but updated on all to avoid depending on
+   * findFirst's arbitrary row order if more than one ever exists). This is
+   * the only place declared_capabilities is ever touched after initial
+   * onboarding — resolveAuthorizedCapabilities has no other way to widen an
+   * already-onboarded agent's grant when new tools are added to the catalog.
+   */
+  async updateDeclaredCapabilitiesForAgent(
+    tenantId: string,
+    agentId: AgentId,
+    capabilities: string[]
+  ): Promise<number> {
+    const result = await this.db
+      .updateTable("agent_join_requests")
+      .set({ declared_capabilities: JSON.stringify(capabilities) as any } as any)
+      .where("tenant_id", "=", tenantId)
+      .where("agent_id", "=", agentId)
+      .execute();
+    return result.reduce((sum, r) => sum + Number(r.numUpdatedRows || 0), 0);
+  }
 }
 
 export class JoinRequestService {
@@ -322,6 +348,31 @@ export class JoinRequestService {
   }
 
   /**
+   * Re-syncs an already-onboarded agent's granted capabilities to a given
+   * list (normally the full current canonical tool catalog). Without this,
+   * an agent onboarded before a new tool shipped is permanently stuck
+   * unable to use it — declared_capabilities was otherwise write-once at
+   * join-request time.
+   */
+  async syncCapabilities(tenantId: string, agentId: AgentId, capabilities: string[], operatorId: string): Promise<{ updatedRows: number }> {
+    const updatedRows = await this.repo.updateDeclaredCapabilitiesForAgent(tenantId, agentId, capabilities);
+
+    await recordAuditEvent(
+      {
+        tenantId,
+        eventType: "AGENT_CAPABILITIES_SYNCED",
+        actorType: "OPERATOR",
+        actorId: operatorId,
+        payload: { agentId, capabilities, updatedRows }
+      },
+      undefined,
+      this.db
+    );
+
+    return { updatedRows };
+  }
+
+  /**
    * Operator approval workflow.
    * Transactionally:
    * 1. Transitions join request to APPROVED
@@ -329,15 +380,27 @@ export class JoinRequestService {
    * 3. Mints available claim credential slot
    * 4. Emits audit events
    */
+  /**
+   * ADR-0007 Phase C1b: `role` is optional and defaults to 'generalist' —
+   * every existing caller that never passes it keeps onboarding agents
+   * exactly as before this ADR (never swarm-eligible). Validated here
+   * (fail closed on an unrecognized value) rather than trusting the
+   * operator-supplied string straight into the DB.
+   */
   async approveJoinRequest(
     tenantId: string,
     id: JoinRequestId,
-    operatorId: string
+    operatorId: string,
+    role: AgentRole = "generalist"
   ): Promise<ApproveJoinRequestResult> {
     const jr = await this.getJoinRequest(tenantId, id);
 
     if (jr.status !== "PENDING_APPROVAL") {
       throw new ConflictError(`Cannot approve join request with status '${jr.status}'. Expected 'PENDING_APPROVAL'.`);
+    }
+
+    if (!VALID_AGENT_ROLES.includes(role)) {
+      throw new ValidationError(`Unsupported agent role '${role}'. Supported roles: ${VALID_AGENT_ROLES.join(", ")}`);
     }
 
     const agentId = generateAgentId();
@@ -356,6 +419,7 @@ export class JoinRequestService {
           version: jr.agentVersion,
           runtime_protocol: jr.gatewayProtocol,
           status: "APPROVED", // Approved is strictly NOT Connected!
+          role,
           created_at: reviewedAt,
           updated_at: reviewedAt
         } as any)
@@ -423,7 +487,8 @@ export class JoinRequestService {
         agent: {
           id: agentId,
           name: jr.agentName,
-          status: "APPROVED"
+          status: "APPROVED",
+          role
         }
       };
     });

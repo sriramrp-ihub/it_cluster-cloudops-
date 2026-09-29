@@ -1,5 +1,5 @@
-import { generateAgentId, NotFoundError, ValidationError, type AgentId, type AgentStatus } from "@cloudops/shared";
-import { AgentRecord, AgentGovernancePatch, CreateAgentDto, IAgentRepository, AgentRepository } from "./repository.js";
+import { generateAgentId, NotFoundError, ValidationError, type AgentId, type AgentStatus, type AgentRole } from "@cloudops/shared";
+import { AgentRecord, AgentGovernancePatch, CreateAgentDto, IAgentRepository, AgentRepository, VALID_AGENT_ROLES } from "./repository.js";
 
 export const SUPPORTED_AGENT_TYPES = ["hermes", "openclaw", "custom"] as const;
 export type SupportedAgentType = (typeof SUPPORTED_AGENT_TYPES)[number];
@@ -77,6 +77,23 @@ export class AgentService {
   async updateGovernance(tenantId: string, id: AgentId, patch: AgentGovernancePatch): Promise<AgentRecord> {
     await this.getAgent(tenantId, id);
     await this.repo.updateGovernance(tenantId, id, patch);
+    return this.getAgent(tenantId, id);
+  }
+
+  /**
+   * ADR-0007 Phase C1b: (re-)assigns an agent's orchestration/routing role —
+   * purely scheduling metadata for resolveSwarmParticipants() (see
+   * packages/runtime/src/swarmRouting.ts), never a PolicyEngine input.
+   * Re-assignable at any time (unlike declared_capabilities, which is
+   * write-once outside syncCapabilities) since a role change carries no
+   * security implication to reason carefully about.
+   */
+  async updateRole(tenantId: string, id: AgentId, role: string): Promise<AgentRecord> {
+    if (!VALID_AGENT_ROLES.includes(role as AgentRole)) {
+      throw new ValidationError(`Unsupported agent role '${role}'. Supported roles: ${VALID_AGENT_ROLES.join(", ")}`);
+    }
+    await this.getAgent(tenantId, id);
+    await this.repo.updateRole(tenantId, id, role as AgentRole);
     return this.getAgent(tenantId, id);
   }
 

@@ -435,7 +435,8 @@ export const investigationRoutes: FastifyPluginAsync<InvestigationRoutesOptions>
         service: serviceName,
         region,
         alertDescription: createdIncident.alertDescription,
-        liveInference: true
+        liveInference: true,
+        runId: run.id
       })
       .then(async (result) => {
         await runService.completeRun(run.id, "COMPLETED", JSON.stringify(result.rootCause));
@@ -716,7 +717,8 @@ If you have enough to proceed:
         service,
         region,
         alertDescription: incDetails.incident.alertDescription,
-        liveInference: true
+        liveInference: true,
+        runId: run.id
       })
       .then(async (result) => {
         await runService.completeRun(run.id, "COMPLETED", JSON.stringify(result.rootCause));
@@ -845,7 +847,8 @@ If you have enough to proceed:
           service: serviceName,
           region,
           alertDescription: createdIncident.alertDescription,
-          liveInference: true
+          liveInference: true,
+          runId: run.id
         })
         .then(async (result) => {
           await runService.completeRun(run.id, "COMPLETED", JSON.stringify(result.rootCause));

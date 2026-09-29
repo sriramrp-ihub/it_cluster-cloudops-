@@ -13,6 +13,8 @@ export * from "./mockAgentAdapter.js";
 export * from "./hermesAgentAdapter.js";
 export * from "./agentAdapterFactory.js";
 export * from "./hermesProfileService.js";
+export * from "./swarmRouting.js";
+export * from "./swarmRunTrace.js";
 
 export interface RuntimeAdapter {
   readonly runtimeType: string;

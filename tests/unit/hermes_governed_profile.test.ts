@@ -16,8 +16,30 @@ import {
   HermesProfileService,
   GOVERNED_TOOLSETS_TO_DISABLE,
   CLOUDOPS_MCP_SERVER_NAME,
-  GOVERNED_MAX_TURNS
+  GOVERNED_MAX_TURNS,
+  GOVERNED_FALLBACK_PROVIDERS
 } from "@cloudops/runtime";
+
+/**
+ * ADR-0007 Phase C1a: the full list of guardrail/resilience/compaction
+ * config keys `configureInvestigationGuardrails()` sets on every
+ * successfully locked-down profile, in the order it sets them. Live-verified
+ * this session against a disposable scratch Hermes profile (created, each
+ * key set and independently confirmed present in that profile's own
+ * config.yaml, then the scratch profile deleted).
+ */
+const ALL_GUARDRAIL_CONFIG_KEYS = [
+  "agent.max_turns",
+  "tool_loop_guardrails.hard_stop_enabled",
+  "fallback_providers",
+  "compression.enabled",
+  "compression.threshold",
+  "compression.target_ratio",
+  "compression.protect_last_n",
+  "compression.protect_first_n",
+  "compression.abort_on_summary_failure",
+  "compression.in_place"
+] as const;
 
 // ── Fixtures: real CLI output, live-verified against `hermes` v0.18.2 this
 // session (see ADR-0008's companion audit) — not guessed. ──────────────────
@@ -449,6 +471,64 @@ describe("HermesProfileService (ADR-0008 Phase A)", () => {
       ]);
     });
 
+    it("ADR-0007 Phase C1a: sets the fallback_providers and compression.* config keys on every successfully locked-down profile", async () => {
+      const scenario = defaultScenario();
+      wireExecFile(scenario);
+      const db = createDbMock(undefined);
+      const svc = new HermesProfileService({ db, credentialService: createCredentialServiceMock(), hermesBin: "hermes-fake" });
+
+      const result = await svc.provisionProfile("ten_test", "ag_c1a_001");
+
+      expect(result.governanceStatus).toBe("LOCKED_DOWN");
+      expect(result.guardrailWarnings).toEqual([]);
+
+      // fallback_providers ships as a documented no-op (empty array) — never
+      // a fabricated plausible-looking provider name (CO-026 anti-fabrication
+      // convention).
+      expect(GOVERNED_FALLBACK_PROVIDERS).toEqual([]);
+
+      const configSetCalls = mockExecFile.mock.calls.filter(
+        (c) => c[1].includes("config") && c[1].includes("set")
+      );
+      const flatArgs = configSetCalls.map((c) => c[1] as string[]);
+
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "fallback_providers", "[]"]);
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "compression.enabled", "true"]);
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "compression.threshold", "0.6"]);
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "compression.target_ratio", "0.2"]);
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "compression.protect_last_n", "20"]);
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "compression.protect_first_n", "3"]);
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "compression.abort_on_summary_failure", "true"]);
+      expect(flatArgs).toContainEqual(["-p", "ag_c1a_001", "config", "set", "compression.in_place", "false"]);
+
+      // All 10 guardrail/resilience/compaction keys were attempted (2 from
+      // Phase B + 8 new Phase C1a ones), distinct from the 2 unconditional
+      // MCP-transport-fix config-set calls made during registration.
+      const guardrailKeyCalls = configSetCalls.filter((c) =>
+        (ALL_GUARDRAIL_CONFIG_KEYS as readonly string[]).includes(c[1][c[1].indexOf("set") + 1])
+      );
+      expect(guardrailKeyCalls).toHaveLength(ALL_GUARDRAIL_CONFIG_KEYS.length);
+    });
+
+    it("ADR-0007 Phase C1a: a fallback_providers/compression.* config-set failure is non-fatal — governance_status stays LOCKED_DOWN", async () => {
+      const scenario = defaultScenario();
+      scenario.configSetSucceeds = false;
+      wireExecFile(scenario);
+      const db = createDbMock(undefined);
+      const svc = new HermesProfileService({ db, credentialService: createCredentialServiceMock(), hermesBin: "hermes-fake" });
+
+      const result = await svc.provisionProfile("ten_test", "ag_c1a_002");
+
+      expect(result.governanceStatus).toBe("LOCKED_DOWN");
+      expect(result.mcpRegistered).toBe(true);
+      expect(result.errors).toEqual([]);
+
+      expect(result.guardrailWarnings.length).toBe(ALL_GUARDRAIL_CONFIG_KEYS.length);
+      expect(result.guardrailWarnings.some((w) => w.includes("fallback_providers"))).toBe(true);
+      expect(result.guardrailWarnings.some((w) => w.includes("compression.enabled"))).toBe(true);
+      expect(result.guardrailWarnings.some((w) => w.includes("compression.abort_on_summary_failure"))).toBe(true);
+    });
+
     it("does not fail provisioning when the guardrail config-set calls fail — governance_status stays LOCKED_DOWN", async () => {
       const scenario = defaultScenario();
       scenario.configSetSucceeds = false;
@@ -467,8 +547,9 @@ describe("HermesProfileService (ADR-0008 Phase A)", () => {
 
       // The failure is still visible, just in its own bucket, never mixed
       // into `errors` (which reporting code may reasonably read as "why did
-      // this fail closed").
-      expect(result.guardrailWarnings.length).toBe(2);
+      // this fail closed"). Now 10 keys total (2 Phase B + 8 Phase C1a) since
+      // every one of them shares the same non-fatal config-set failure mode.
+      expect(result.guardrailWarnings.length).toBe(ALL_GUARDRAIL_CONFIG_KEYS.length);
       expect(result.guardrailWarnings.some((w) => w.includes("agent.max_turns"))).toBe(true);
       expect(result.guardrailWarnings.some((w) => w.includes("hard_stop_enabled"))).toBe(true);
 

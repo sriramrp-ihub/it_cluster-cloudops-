@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import {
   type AgentAdapter,
   type AgentExecutionContext,
@@ -16,6 +17,8 @@ import {
   logger,
   sanitizeLogString
 } from "@cloudops/shared";
+import { resolveSwarmParticipants, type SwarmEligibility, type SwarmParticipant } from "./swarmRouting.js";
+import { createSwarmChildRun, completeSwarmChildRun } from "./swarmRunTrace.js";
 
 export function cleanLlmOutput(output: string): string {
   return output
@@ -89,6 +92,21 @@ export interface HermesAgentConfig {
   provider?: string | undefined;
   /** ADR-0008 Phase A: initial governed Hermes profile name, if known at construction time. */
   hermesProfileName?: string | undefined;
+  /**
+   * ADR-0007 Phase C1b: bounded per-stage timeout (poll-for-ready + claim +
+   * oneshot inference + complete) for each swarm worker/verifier/synthesizer
+   * task. Any stage that doesn't complete within this budget is a clean
+   * failure that falls through to the adaptive tier — never a silent hang.
+   * Defaults to 90s per the design's own sizing rationale (generous enough
+   * for a real tool-calling turn, small enough to bound worst-case latency).
+   */
+  swarmStageTimeoutMs?: number | undefined;
+  /**
+   * ADR-0007 Phase C1b: swarm-eligibility resolver, injectable for tests
+   * (defaults to the real `resolveSwarmParticipants`, which hits the real DB
+   * and independently re-verifies governance live — see swarmRouting.ts).
+   */
+  resolveSwarmEligibility?: ((tenantId: string) => Promise<SwarmEligibility>) | undefined;
 }
 
 export class HermesAgentAdapter implements AgentAdapter {
@@ -120,6 +138,10 @@ export class HermesAgentAdapter implements AgentAdapter {
    * additive, opt-in behavior change.
    */
   public hermesProfileName?: string | undefined;
+  /** ADR-0007 Phase C1b: see HermesAgentConfig.swarmStageTimeoutMs. */
+  private readonly swarmStageTimeoutMs: number;
+  /** ADR-0007 Phase C1b: see HermesAgentConfig.resolveSwarmEligibility. */
+  private readonly resolveSwarmEligibility: (tenantId: string) => Promise<SwarmEligibility>;
 
   constructor(config: HermesAgentConfig = {}) {
     this.endpoint = config.endpoint || process.env.HERMES_URL || "http://127.0.0.1:8080";
@@ -138,6 +160,8 @@ export class HermesAgentAdapter implements AgentAdapter {
     this.activeModel = config.model;
     this.activeProvider = config.provider;
     this.hermesProfileName = config.hermesProfileName;
+    this.swarmStageTimeoutMs = config.swarmStageTimeoutMs ?? 90000;
+    this.resolveSwarmEligibility = config.resolveSwarmEligibility || resolveSwarmParticipants;
   }
 
   /**
@@ -401,6 +425,35 @@ export class HermesAgentAdapter implements AgentAdapter {
       throw new NotFoundError(`Session not found: ${sessionId}`);
     }
 
+    // ADR-0007 Phase C1b: tier 0, tried before Phase B's adaptive tier.
+    // Opt-in strictly at the fleet-composition level — resolveSwarmEligibility
+    // (real impl: resolveSwarmParticipants) returns eligible:false with zero
+    // side effects for every tenant that hasn't deliberately onboarded a
+    // role-tagged fleet (i.e. everyone today), so this branch is a pure
+    // no-op for them. ANY failure once inside the swarm attempt (CLI error,
+    // stage timeout, unparseable stage output) is caught here and falls
+    // through to the adaptive tier exactly like that tier already falls
+    // through to the fixed script — the swarm tier is a new rung on the same
+    // fail-safe ladder, not a special case with its own failure handling.
+    try {
+      const swarmEligibility = await this.resolveSwarmEligibility(session.tenantId);
+      if (swarmEligibility.eligible) {
+        try {
+          return await this.runSwarmInvestigation(sessionId, incidentContext, swarmEligibility);
+        } catch (err) {
+          logger.warn(
+            { err, sessionId, tenantId: session.tenantId },
+            "Swarm investigation failed, falling back to adaptive/fixed-script investigation"
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err, sessionId, tenantId: session.tenantId },
+        "Swarm eligibility resolution failed, falling back to adaptive/fixed-script investigation"
+      );
+    }
+
     if (this.hermesProfileName) {
       try {
         return await this.runAdaptiveInvestigation(sessionId, incidentContext);
@@ -413,6 +466,574 @@ export class HermesAgentAdapter implements AgentAdapter {
     }
 
     return this.runFixedScriptInvestigation(sessionId, incidentContext);
+  }
+
+  // ── ADR-0007 Phase C1b: Kanban Swarm CLI plumbing ─────────────────────
+
+  /**
+   * Runs `hermes kanban <args...>`. Mirrors HermesProfileService's own
+   * `runHermes()` convention exactly: never throws for a clean process exit
+   * (even non-zero) since `hermes kanban claim`/`promote` on a task whose
+   * dependencies aren't actually satisfied print a plain "cannot claim ..."
+   * message and still exit 0 (live-verified this session — see this
+   * feature's design notes) — callers must parse stdout, never branch on
+   * exit code. Only throws when the CLI itself couldn't be run at all
+   * (binary missing, killed by timeout).
+   */
+  private runKanbanCli(args: string[], timeoutMs = 20000): Promise<{ stdout: string; stderr: string; code: number }> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        this.hermesBin,
+        ["kanban", ...args],
+        { timeout: timeoutMs, maxBuffer: 5 * 1024 * 1024, env: { ...process.env } },
+        (err: any, stdout, stderr) => {
+          const stdoutStr = stdout?.toString() ?? "";
+          const stderrStr = stderr?.toString() ?? "";
+          if (err) {
+            if (typeof err.code === "number") {
+              resolve({ stdout: stdoutStr, stderr: stderrStr, code: err.code });
+              return;
+            }
+            reject(new Error(`Hermes kanban CLI invocation failed (kanban ${args.join(" ")}): ${err?.message || err}`));
+            return;
+          }
+          resolve({ stdout: stdoutStr, stderr: stderrStr, code: 0 });
+        }
+      );
+    });
+  }
+
+  /**
+   * Runs one oneshot Hermes inference turn against an EXPLICIT profile,
+   * independent of `this.hermesProfileName` — unlike `executeHermesInference()`
+   * (which reads that shared instance field), swarm workers run genuinely in
+   * parallel against DIFFERENT profiles, so this must never touch shared
+   * mutable adapter state. Otherwise identical invocation shape
+   * (`-p <profile> -z <prompt> --ignore-rules`) and the same redaction of
+   * anything the model might echo back from its inherited process
+   * environment.
+   */
+  private runHermesOneshotForProfile(profileName: string, prompt: string, timeoutMs: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        this.hermesBin,
+        ["-p", profileName, "-z", prompt, "--ignore-rules"],
+        { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, env: { ...process.env } },
+        (err: any, stdout, stderr) => {
+          if (err) {
+            reject(
+              new Error(
+                `Swarm oneshot inference failed for profile '${profileName}': ${err?.message || err}${stderr ? ` (${stderr.toString().slice(0, 500)})` : ""}`
+              )
+            );
+            return;
+          }
+          const stdoutStr = stdout?.toString() ?? "";
+          const cleaned = cleanLlmOutput(stdoutStr);
+          resolve(sanitizeLogString(cleaned || stdoutStr.trim()));
+        }
+      );
+    });
+  }
+
+  /**
+   * Polls `hermes kanban show <taskId> --json` until the task's status flips
+   * to 'ready' (or a terminal 'done'/'archived' status, treated as already
+   * satisfied), bounded by `timeoutMs`. Live-verified this session: a
+   * dependent task (verifier/synthesizer) genuinely sits at 'todo' until
+   * EVERY parent task is `complete`d, at which point it flips to 'ready' via
+   * a pure DB-level transition — no `hermes gateway` dispatcher daemon
+   * required for this manual/synchronous claim→run→complete flow. Throws
+   * (never hangs silently) on a 'blocked' status or on timeout — either is a
+   * clean failure the caller's try/catch turns into a fall-through to the
+   * adaptive tier.
+   */
+  private async waitForKanbanTaskReady(taskId: string, timeoutMs: number, pollIntervalMs = 1000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const { stdout } = await this.runKanbanCli(["show", taskId, "--json"]);
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch {
+        // keep polling — a transient unparseable response isn't necessarily terminal
+      }
+      const status = parsed?.task?.status;
+      if (status === "ready" || status === "done" || status === "archived") {
+        return;
+      }
+      if (status === "blocked") {
+        throw new Error(`Swarm task ${taskId} is blocked, cannot proceed: ${stdout}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Swarm task ${taskId} did not become ready within ${timeoutMs}ms (status: ${status ?? "unknown"})`);
+      }
+      await new Promise((r) => setTimeout(r, Math.min(pollIntervalMs, Math.max(0, deadline - Date.now()))));
+    }
+  }
+
+  /**
+   * ADR-0007 Phase C1b: tier 0 of `runInvestigation()`'s fallback chain — a
+   * Kanban-Swarm-orchestrated investigation across N real, onboarded,
+   * independently-governed CloudOps agents (>= 1 'investigator' + exactly
+   * one 'verifier' + one 'synthesizer' — see swarmRouting.ts). This is
+   * honestly "CloudOps re-implements a thin manual dispatcher over kanban's
+   * atomic claim primitive," not "we use Hermes's full auto-dispatch swarm
+   * feature": one `hermes kanban swarm ... --json` call builds the
+   * dependency graph, then THIS Node process drives each stage to
+   * completion itself via ordinary `execFile` calls (poll for ready → claim
+   * → run one oneshot inference turn against that stage's OWN governed
+   * Hermes profile → complete), never `hermes gateway`/the daemon dispatcher
+   * (a machine-wide singleton — the wrong dependency for a synchronous,
+   * on-demand feature per this design's own rationale).
+   *
+   * Every tool call any worker/verifier/synthesizer profile makes happens
+   * INSIDE that profile's own Hermes tool-calling loop against ITS OWN
+   * governed MCP registration (`cloudops-control-plane`) — exactly like
+   * Phase B's adaptive tier, this TypeScript process never sees individual
+   * tool calls, and every one of them still goes through the exact same
+   * CloudOpsMcpServer/PolicyEngine.evaluate() choke point every other call in
+   * this system uses (no shortcut, no second code path). `role` is never
+   * part of that evaluation — it only decided WHICH already-governed profile
+   * got assigned to WHICH slot in the graph.
+   *
+   * Worker split mirrors the pre-swarm fixed 3-step script's own tool
+   * choices — aws_ecs_describe_services / aws_cloudwatch_get_metric_data /
+   * aws_ecs_describe_stopped_tasks — now genuinely parallel (Promise.all)
+   * and independently verified by a dedicated verifier stage before the
+   * synthesizer ever sees them. When fewer than 3 'investigator' agents are
+   * available, the 3 fixed tool assignments cycle through whichever
+   * investigator profiles ARE available (a swarm worker card is just
+   * PROFILE:TITLE — nothing prevents the same profile from holding two
+   * worker cards with different titles/tools).
+   *
+   * The synthesizer's final output is parsed via the exact same
+   * `extractJsonFromLlmOutput()` used everywhere else in this file, against
+   * the EXACT SAME JSON schema `runAdaptiveInvestigation()`'s prompt
+   * specifies (finding/rootCause/confidence/remediationTool/
+   * remediationParams/riskLevel/requiresApproval/investigationNarrative) —
+   * no second schema invented for this tier. ANY failure at any stage
+   * (unparseable worker/verifier/synthesizer output, a claim that never
+   * succeeds, a stage that doesn't become ready within
+   * `this.swarmStageTimeoutMs`) throws and is caught by `runInvestigation()`'s
+   * own try/catch, falling through to the adaptive tier — never a silent
+   * hang, never a partially-synthesized result presented as final.
+   */
+  private async runSwarmInvestigation(
+    sessionId: string,
+    incidentContext: InvestigationDriveContext | undefined,
+    swarm: SwarmEligibility
+  ): Promise<InvestigationDriveResult> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new NotFoundError(`Session not found: ${sessionId}`);
+    }
+    if (!swarm.eligible || !swarm.verifier || !swarm.synthesizer || swarm.investigators.length < 1) {
+      // Defensive — callers must only invoke this with an eligible() result.
+      throw new Error("runSwarmInvestigation invoked with a non-eligible SwarmEligibility result");
+    }
+
+    const targetCluster = incidentContext?.cluster || "cloudops-test";
+    const targetService = incidentContext?.service || "starvision-motors";
+    const targetRegion = incidentContext?.region || "us-east-1";
+    const alertDescription = incidentContext?.alertDescription || "ECS service health anomaly";
+    const parentRunId = incidentContext?.runId ?? null;
+    const stageTimeoutMs = this.swarmStageTimeoutMs;
+
+    session.currentStep = 1;
+    this.emitEvent(sessionId, {
+      type: "STATUS",
+      sessionId,
+      timestamp: new Date(),
+      data: {
+        status: "ACTIVE",
+        mode: "swarm",
+        message: `Dispatching Kanban Swarm across ${swarm.investigators.length} investigator(s), 1 verifier, and 1 synthesizer.`
+      }
+    });
+    this.emitEvent(sessionId, {
+      type: "STEP",
+      sessionId,
+      timestamp: new Date(),
+      data: { step: 1, toolName: "hermes_kanban_swarm_create", status: "running" }
+    });
+
+    const goal = `Investigate ECS service health incident. Service="${targetService}" Cluster="${targetCluster}" Region="${targetRegion}". Alert: ${alertDescription}`;
+
+    const workerToolPlan: Array<{ tool: string; title: string; instruction: string }> = [
+      {
+        tool: "aws_ecs_describe_services",
+        title: "Investigate ECS service status",
+        instruction: `Call the "aws_ecs_describe_services" tool for service "${targetService}" in cluster "${targetCluster}" (region "${targetRegion}") and assess baseline service health (desired/running/pending task counts, deployment rollout state).`
+      },
+      {
+        tool: "aws_cloudwatch_get_metric_data",
+        title: "Investigate correlated CloudWatch metrics",
+        instruction: `Call the "aws_cloudwatch_get_metric_data" tool for service "${targetService}" in cluster "${targetCluster}" (region "${targetRegion}") and check for a correlated metric anomaly (e.g. 5xx spike).`
+      },
+      {
+        tool: "aws_ecs_describe_stopped_tasks",
+        title: "Investigate recently stopped tasks",
+        instruction: `Call the "aws_ecs_describe_stopped_tasks" tool for service "${targetService}" in cluster "${targetCluster}" (region "${targetRegion}") and inspect recently stopped tasks for a concrete container-level failure signal.`
+      }
+    ];
+    const workerAssignments = workerToolPlan.map((plan, idx) => ({
+      ...plan,
+      participant: swarm.investigators[idx % swarm.investigators.length]!
+    }));
+
+    const kanbanArgs = [
+      "swarm",
+      goal,
+      ...workerAssignments.flatMap((w) => ["--worker", `${w.participant.hermesProfileName}:${w.title}`]),
+      "--verifier",
+      swarm.verifier.hermesProfileName,
+      "--synthesizer",
+      swarm.synthesizer.hermesProfileName,
+      "--tenant",
+      session.tenantId,
+      "--json"
+    ];
+
+    const swarmCreate = await this.runKanbanCli(kanbanArgs, 20000);
+    let topology: any;
+    try {
+      topology = JSON.parse(swarmCreate.stdout);
+    } catch {
+      throw new Error(`'hermes kanban swarm' did not return parseable JSON: ${swarmCreate.stdout || swarmCreate.stderr}`);
+    }
+    if (
+      !Array.isArray(topology?.worker_ids) ||
+      topology.worker_ids.length !== workerAssignments.length ||
+      !topology.verifier_id ||
+      !topology.synthesizer_id
+    ) {
+      throw new Error(`Unexpected 'hermes kanban swarm' output shape: ${swarmCreate.stdout}`);
+    }
+
+    // ── Worker stage: genuinely parallel (Promise.all), each independently
+    // claimed/run/completed against its own profile and its own tool. ──────
+    let stepCursor = 2;
+    const workerResults = await Promise.all(
+      workerAssignments.map(async (assignment, idx) => {
+        const taskId: string = topology.worker_ids[idx];
+        const stepNum = stepCursor + idx;
+        this.emitEvent(sessionId, {
+          type: "STEP",
+          sessionId,
+          timestamp: new Date(),
+          data: {
+            step: stepNum,
+            toolName: `swarm_investigator:${assignment.tool}`,
+            status: "running",
+            assignee: assignment.participant.agentId
+          }
+        });
+
+        const childRunId = await createSwarmChildRun({
+          tenantId: session.tenantId,
+          agentId: assignment.participant.agentId,
+          parentRunId,
+          userPrompt: assignment.instruction
+        });
+
+        try {
+          await this.waitForKanbanTaskReady(taskId, stageTimeoutMs);
+          const claim = await this.runKanbanCli(["claim", taskId]);
+          if (!/Claimed/i.test(claim.stdout)) {
+            throw new Error(`Failed to claim swarm worker task ${taskId}: ${claim.stdout || claim.stderr}`);
+          }
+
+          const workerPrompt = `You are a CloudOps swarm investigation worker. ${assignment.instruction}
+
+Once you are done — this must be your FINAL message, after you've finished calling the tool — respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
+{
+  "domainFinding": "<concise 1-2 sentence finding from this specific tool call>",
+  "evidence": "<the concrete data point(s) that support this finding>",
+  "narrative": "<one short sentence describing what you did and learned>"
+}`;
+
+          const rawOutput = await this.runHermesOneshotForProfile(assignment.participant.hermesProfileName, workerPrompt, stageTimeoutMs);
+          const parsed = extractJsonFromLlmOutput(rawOutput);
+          if (!parsed || typeof parsed.domainFinding !== "string") {
+            throw new Error(`Swarm worker ${taskId} (${assignment.tool}) returned unparseable output`);
+          }
+
+          await this.runKanbanCli([
+            "complete",
+            taskId,
+            "--result",
+            JSON.stringify(parsed),
+            "--summary",
+            String(parsed.domainFinding).slice(0, 200)
+          ]);
+
+          this.emitEvent(sessionId, {
+            type: "OBSERVATION",
+            sessionId,
+            timestamp: new Date(),
+            data: {
+              step: stepNum,
+              toolName: `swarm_investigator:${assignment.tool}`,
+              observation: parsed.domainFinding,
+              evidence: parsed.evidence
+            }
+          });
+
+          await completeSwarmChildRun(childRunId, "COMPLETED", JSON.stringify(parsed));
+          return { tool: assignment.tool, ...parsed } as { tool: string; domainFinding: string; evidence?: unknown; narrative?: string };
+        } catch (err: any) {
+          await completeSwarmChildRun(childRunId, "FAILED", err?.message || String(err));
+          throw err;
+        }
+      })
+    );
+    stepCursor += workerAssignments.length;
+
+    // ── Verifier stage ──────────────────────────────────────────────────
+    this.emitEvent(sessionId, {
+      type: "STEP",
+      sessionId,
+      timestamp: new Date(),
+      data: { step: stepCursor, toolName: "swarm_verifier", status: "running", assignee: swarm.verifier.agentId }
+    });
+
+    const verifierChildRunId = await createSwarmChildRun({
+      tenantId: session.tenantId,
+      agentId: swarm.verifier.agentId,
+      parentRunId,
+      userPrompt: `Verify ${workerResults.length} swarm worker finding(s) for incident: ${goal}`
+    });
+
+    let verifierParsed: any;
+    try {
+      await this.waitForKanbanTaskReady(topology.verifier_id, stageTimeoutMs);
+      const verifierClaim = await this.runKanbanCli(["claim", topology.verifier_id]);
+      if (!/Claimed/i.test(verifierClaim.stdout)) {
+        throw new Error(`Failed to claim swarm verifier task ${topology.verifier_id}: ${verifierClaim.stdout || verifierClaim.stderr}`);
+      }
+
+      const verifierPrompt = `You are a CloudOps swarm investigation verifier. Review the following worker findings for incident: ${goal}
+
+${workerResults.map((w, i) => `Worker ${i + 1} (${w.tool}): finding="${w.domainFinding}" evidence=${JSON.stringify(w.evidence ?? null)}`).join("\n")}
+
+Cross-check these findings against each other for consistency. Once done, respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
+{
+  "verifiedFindings": ["<each worker finding you consider corroborated>"],
+  "flaggedInconsistencies": ["<any contradiction or unsupported claim you found, empty array if none>"],
+  "overallConfidence": <number between 0.0 and 1.0>
+}`;
+
+      const verifierRaw = await this.runHermesOneshotForProfile(swarm.verifier.hermesProfileName, verifierPrompt, stageTimeoutMs);
+      verifierParsed = extractJsonFromLlmOutput(verifierRaw);
+      if (!verifierParsed || !Array.isArray(verifierParsed.verifiedFindings)) {
+        throw new Error(`Swarm verifier ${topology.verifier_id} returned unparseable output`);
+      }
+
+      const gate = (verifierParsed.flaggedInconsistencies?.length ?? 0) === 0 ? "pass" : "flagged";
+      await this.runKanbanCli([
+        "complete",
+        topology.verifier_id,
+        "--result",
+        JSON.stringify(verifierParsed),
+        "--metadata",
+        JSON.stringify({ gate })
+      ]);
+
+      this.emitEvent(sessionId, {
+        type: "OBSERVATION",
+        sessionId,
+        timestamp: new Date(),
+        data: {
+          step: stepCursor,
+          toolName: "swarm_verifier",
+          observation: `Verifier reviewed ${workerResults.length} worker finding(s); overallConfidence=${verifierParsed.overallConfidence}; gate=${gate}.`
+        }
+      });
+
+      await completeSwarmChildRun(verifierChildRunId, "COMPLETED", JSON.stringify(verifierParsed));
+    } catch (err: any) {
+      await completeSwarmChildRun(verifierChildRunId, "FAILED", err?.message || String(err));
+      throw err;
+    }
+    stepCursor += 1;
+
+    // ── Synthesizer stage — the ONLY stage whose output becomes the final
+    // InvestigationDriveResult, using the EXACT SAME schema
+    // runAdaptiveInvestigation()'s prompt specifies. ───────────────────────
+    this.emitEvent(sessionId, {
+      type: "STEP",
+      sessionId,
+      timestamp: new Date(),
+      data: { step: stepCursor, toolName: "swarm_synthesizer", status: "running", assignee: swarm.synthesizer.agentId }
+    });
+
+    const synthesizerChildRunId = await createSwarmChildRun({
+      tenantId: session.tenantId,
+      agentId: swarm.synthesizer.agentId,
+      parentRunId,
+      userPrompt: `Synthesize verified swarm findings for incident: ${goal}`
+    });
+
+    let parsed: any;
+    try {
+      await this.waitForKanbanTaskReady(topology.synthesizer_id, stageTimeoutMs);
+      const synthClaim = await this.runKanbanCli(["claim", topology.synthesizer_id]);
+      if (!/Claimed/i.test(synthClaim.stdout)) {
+        throw new Error(`Failed to claim swarm synthesizer task ${topology.synthesizer_id}: ${synthClaim.stdout || synthClaim.stderr}`);
+      }
+
+      const synthesizerPrompt = `You are the CloudOps swarm investigation synthesizer, producing the FINAL result for incident: ${goal}
+
+Verified worker findings:
+${workerResults.map((w, i) => `Worker ${i + 1} (${w.tool}): "${w.domainFinding}" (evidence: ${JSON.stringify(w.evidence ?? null)})`).join("\n")}
+
+Verifier assessment: verifiedFindings=${JSON.stringify(verifierParsed.verifiedFindings)}, flaggedInconsistencies=${JSON.stringify(verifierParsed.flaggedInconsistencies)}, overallConfidence=${verifierParsed.overallConfidence}
+
+Available remediation tools:
+- "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
+- "aws_ecs_update_service_image": Use if a specific image tag needs updating.
+- "aws_ecs_update_service": Use if task counts or service definition need forced update.
+- "aws_ecs_describe_services": Use if no failure is detected (informational only).
+
+Synthesize the root cause and choose the safest remediation action. Respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
+{
+  "finding": "<concise 1-2 sentence finding summary>",
+  "rootCause": "<detailed technical root cause explanation>",
+  "confidence": <number between 0.0 and 1.0>,
+  "remediationTool": "<tool name>",
+  "remediationParams": { "cluster": "${targetCluster}", "service": "${targetService}", "region": "${targetRegion}" },
+  "riskLevel": "<LOW|MEDIUM|HIGH|CRITICAL>",
+  "requiresApproval": <boolean>,
+  "investigationNarrative": ["<one short sentence per worker/verifier step, in order>"]
+}`;
+
+      const synthRaw = await this.runHermesOneshotForProfile(swarm.synthesizer.hermesProfileName, synthesizerPrompt, stageTimeoutMs);
+      parsed = extractJsonFromLlmOutput(synthRaw);
+      if (!parsed || !parsed.finding || !parsed.rootCause) {
+        throw new Error("Swarm synthesizer did not return a parseable finding/rootCause JSON response");
+      }
+
+      await this.runKanbanCli([
+        "complete",
+        topology.synthesizer_id,
+        "--result",
+        JSON.stringify(parsed),
+        "--summary",
+        String(parsed.finding).slice(0, 200)
+      ]);
+
+      await completeSwarmChildRun(synthesizerChildRunId, "COMPLETED", JSON.stringify(parsed));
+    } catch (err: any) {
+      await completeSwarmChildRun(synthesizerChildRunId, "FAILED", err?.message || String(err));
+      throw err;
+    }
+
+    // ── Reconstruct the same ROOT_CAUSE/PROPOSAL event shapes + approval
+    // gating the adaptive/fixed-script tiers already emit — no UI contract
+    // change, just role-labeled toolNames and more events. ────────────────
+    const finding: string = parsed.finding;
+    const rootCauseText: string = parsed.rootCause;
+    const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0.85;
+    const remediationToolName: string = parsed.remediationTool || "aws_ecs_describe_services";
+    const remediationParams: Record<string, unknown> =
+      parsed.remediationParams && typeof parsed.remediationParams === "object"
+        ? parsed.remediationParams
+        : { cluster: targetCluster, service: targetService, region: targetRegion };
+    let riskLevel: string = parsed.riskLevel ? String(parsed.riskLevel).toUpperCase() : "LOW";
+    if (
+      (remediationToolName.includes("rollback") ||
+        remediationToolName.includes("update") ||
+        remediationToolName.includes("remediate")) &&
+      riskLevel !== "CRITICAL"
+    ) {
+      riskLevel = "HIGH";
+    }
+
+    const narrative: string[] = Array.isArray(parsed.investigationNarrative)
+      ? parsed.investigationNarrative.filter((line: unknown): line is string => typeof line === "string" && line.trim().length > 0)
+      : [];
+    narrative.forEach((line, idx) => {
+      this.emitEvent(sessionId, {
+        type: "OBSERVATION",
+        sessionId,
+        timestamp: new Date(),
+        data: { step: stepCursor + 1 + idx, toolName: "swarm_synthesizer", observation: line }
+      });
+    });
+
+    const evidenceCollected = session.evidenceCollected || [];
+    const rootCause = {
+      finding,
+      rootCause: rootCauseText,
+      confidence,
+      evidenceIds: evidenceCollected,
+      citedRunbooks: [],
+      affectedResources: [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
+      dataSource: `live:${this.adapterType}:swarm`,
+      recommendedRemediation: {
+        toolName: remediationToolName,
+        parameters: remediationParams,
+        riskLevel,
+        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL"
+      }
+    };
+
+    this.emitEvent(sessionId, {
+      type: "ROOT_CAUSE",
+      sessionId,
+      timestamp: new Date(),
+      data: rootCause
+    });
+
+    const handler =
+      this.toolCallHandlers.get(sessionId) ||
+      (async (call: AgentToolCall): Promise<AgentToolResult> => ({
+        callId: call.callId,
+        status: "SUCCESS",
+        data: { status: "INSPECTED", timestamp: new Date().toISOString() }
+      }));
+
+    if (riskLevel === "HIGH" || riskLevel === "CRITICAL") {
+      this.emitEvent(sessionId, {
+        type: "PROPOSAL",
+        sessionId,
+        timestamp: new Date(),
+        data: {
+          toolName: remediationToolName,
+          remediation: rootCause.recommendedRemediation,
+          status: "AWAITING_APPROVAL"
+        }
+      });
+
+      const proposalCall: AgentToolCall = {
+        callId: `call_${randomUUID()}`,
+        toolName: remediationToolName,
+        arguments: remediationParams,
+        timestamp: new Date(),
+        reasoning: `${finding} ${rootCauseText}`.trim(),
+        evidenceRefs: [...evidenceCollected]
+      };
+
+      const proposalResult = await handler(proposalCall);
+
+      if (proposalResult.status === "AWAITING_APPROVAL") {
+        session.status = "WAITING_APPROVAL";
+        session.pendingApprovalId = proposalResult.approvalId;
+      } else {
+        session.status = "COMPLETED";
+      }
+    } else {
+      session.status = "COMPLETED";
+    }
+
+    session.evidenceCollected = evidenceCollected;
+
+    return {
+      status: session.status,
+      rootCause,
+      approvalId: session.pendingApprovalId || undefined
+    };
   }
 
   /**

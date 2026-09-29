@@ -501,6 +501,7 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
         governanceStatus: agent.governanceStatus,
         governanceVerifiedAt: agent.governanceVerifiedAt?.toISOString() ?? null,
         mcpRegistered: agent.mcpRegistered,
+        role: agent.role,
         createdAt: agent.createdAt.toISOString(),
         updatedAt: agent.updatedAt.toISOString()
       }))
@@ -533,6 +534,7 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
         governanceStatus: agent.governanceStatus,
         governanceVerifiedAt: agent.governanceVerifiedAt?.toISOString() ?? null,
         mcpRegistered: agent.mcpRegistered,
+        role: agent.role,
         createdAt: agent.createdAt.toISOString(),
         updatedAt: agent.updatedAt.toISOString()
       });
@@ -599,6 +601,37 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (fastif
       return reply.status(200).send({
         id: agent.id,
         cloudAccountId: agent.cloudAccountId
+      });
+    }
+  );
+
+  /**
+   * PATCH /v1/agents/:id/role
+   * ADR-0007 Phase C1b: (re-)assigns an agent's orchestration/routing role
+   * (generalist/investigator/verifier/synthesizer) — purely scheduling
+   * metadata resolveSwarmParticipants() reads to decide swarm eligibility,
+   * never a PolicyEngine/capability-tier input. Re-assignable at any time,
+   * mirroring the existing /cloud-account PATCH's shape.
+   */
+  fastify.patch<{ Params: { id: string }; Body: { role: string } }>(
+    "/v1/agents/:id/role",
+    { preHandler: [requireOperatorAuth] },
+    async (request, reply) => {
+      const operator = request.operator!;
+      const { id } = request.params;
+      const { role } = request.body || ({} as any);
+
+      if (typeof role !== "string" || role.trim().length === 0) {
+        return reply.status(400).send({
+          error: { code: "VALIDATION_ERROR", message: "role must be a non-empty string" }
+        });
+      }
+
+      const agent = await agentService.updateRole(operator.tenantId, id as any, role);
+
+      return reply.status(200).send({
+        id: agent.id,
+        role: agent.role
       });
     }
   );

@@ -33,6 +33,31 @@ export const AgentGovernanceStatus = {
 } as const;
 export type AgentGovernanceStatus = (typeof AgentGovernanceStatus)[keyof typeof AgentGovernanceStatus];
 
+/**
+ * ADR-0007 Phase C1b (Multi-Agent Swarm — orchestration model): a purely
+ * orchestration/routing tag for which slot(s) an agent can fill in a Kanban
+ * Swarm investigation graph (packages/runtime/src/swarmRouting.ts). This is
+ * NOT a security/authorization concept and must NEVER become a
+ * PolicyEngine/capability-tier input — an agent's actually-authorized
+ * actions are governed entirely by its granted_capabilities
+ * (defence_claw/.../capability_tiers.rego has, and must keep, zero
+ * awareness of this value). Mirrors AgentStatus/AgentGovernanceStatus's
+ * plain-string-column convention (no DB CHECK constraint — enforced here,
+ * at the application layer).
+ *   generalist   — default for every agent onboarded before/without this
+ *                  feature; never eligible to fill a swarm slot
+ *   investigator — eligible to fill a parallel-worker slot in a swarm
+ *   verifier     — eligible to fill the single verifier slot in a swarm
+ *   synthesizer  — eligible to fill the single synthesizer slot in a swarm
+ */
+export const AgentRole = {
+  GENERALIST: "generalist",
+  INVESTIGATOR: "investigator",
+  VERIFIER: "verifier",
+  SYNTHESIZER: "synthesizer"
+} as const;
+export type AgentRole = (typeof AgentRole)[keyof typeof AgentRole];
+
 export const SessionStatus = {
   REGISTERING: "REGISTERING",
   CHALLENGE_ISSUED: "CHALLENGE_ISSUED",

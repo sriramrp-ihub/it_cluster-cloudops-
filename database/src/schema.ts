@@ -34,6 +34,10 @@ export interface AgentTable {
   governance_status: Generated<string>;
   governance_verified_at: Date | null;
   mcp_registered: Generated<boolean>;
+  // ADR-0007 Phase C1b: orchestration/routing role for swarm eligibility
+  // (see database/migrations/020_agent_roles.sql). Never a PolicyEngine
+  // input — see packages/runtime/src/swarmRouting.ts.
+  role: Generated<string>;
 }
 
 export interface AgentCredentialTable {
@@ -200,6 +204,11 @@ export interface RunTable {
   trace_id: string | null;
   created_at: Generated<Date>;
   completed_at: Date | null;
+  // ADR-0007 Phase C1b: additive self-reference linking a swarm
+  // worker/verifier/synthesizer's own run back to the outer investigation's
+  // run (see database/migrations/021_run_parent_child.sql). NULL for every
+  // non-swarm run.
+  parent_run_id: string | null;
 }
 
 export interface ToolExecutionTable {

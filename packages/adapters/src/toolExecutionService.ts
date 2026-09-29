@@ -16,6 +16,15 @@ export interface CreateRunParams {
   agentId: string;
   sessionId?: string | undefined;
   userPrompt: string;
+  /**
+   * ADR-0007 Phase C1b: links this run back to an outer investigation's run
+   * (e.g. a swarm worker/verifier/synthesizer's own run, linked to the
+   * investigation that triggered the swarm) — see
+   * database/migrations/021_run_parent_child.sql. Additive and optional;
+   * every existing caller that never sets this keeps getting
+   * `parent_run_id: null`, exactly as before this column existed.
+   */
+  parentRunId?: string | undefined;
 }
 
 export interface RunRecord {
@@ -29,6 +38,7 @@ export interface RunRecord {
   traceId: string;
   createdAt: Date;
   completedAt: Date | null;
+  parentRunId: string | null;
 }
 
 /**
@@ -60,6 +70,7 @@ export class RunService {
         user_prompt: params.userPrompt,
         status: "RUNNING",
         trace_id: traceId,
+        parent_run_id: params.parentRunId || null,
         created_at: now
       } as any)
       .execute();
@@ -81,7 +92,8 @@ export class RunService {
       finalResponse: null,
       traceId,
       createdAt: now,
-      completedAt: null
+      completedAt: null,
+      parentRunId: params.parentRunId || null
     };
   }
 
