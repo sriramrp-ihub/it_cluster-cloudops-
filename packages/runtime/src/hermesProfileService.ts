@@ -35,6 +35,19 @@ export const GOVERNED_TOOLSETS_TO_DISABLE = [
 /** The one MCP server every governed profile is allowed to have. */
 export const CLOUDOPS_MCP_SERVER_NAME = "cloudops-control-plane";
 
+/**
+ * ADR-0008 Phase B (§4.3): bounded turn budget for autonomous, unattended
+ * investigation loops. Hermes's own global default (`agent.max_turns: 90`,
+ * per the installed CLI's `hermes_cli/config.py` `DEFAULT_CONFIG`, live-read
+ * during the Phase B design session) is sized for interactive human
+ * sessions; an unattended adaptive investigation should be bounded tighter —
+ * generous enough for a real multi-tool investigation, small enough to bound
+ * worst-case cost/latency. This is a product/ops tuning call, not a security
+ * invariant (see GOVERNED_TOOLSETS_TO_DISABLE above for the actual security
+ * boundary), which is why a failure to set it never flips governance_status.
+ */
+export const GOVERNED_MAX_TURNS = 20;
+
 export interface HermesProfileServiceConfig {
   hermesBin?: string | undefined;
   /** Base URL CloudOps's own API (and its /v1/mcp/sse route) is reachable at from this host. */
@@ -52,6 +65,18 @@ export interface ProvisionGovernedProfileResult {
   disabledToolsets: string[];
   verifiedAt: Date;
   errors: string[];
+  /**
+   * ADR-0008 Phase B (§4.3): non-fatal issues from setting the investigation
+   * turn-budget/hard-stop guardrails. Deliberately a SEPARATE field from
+   * `errors` — a guardrail config-set failure must never be able to flip
+   * `governanceStatus` to FAILED (it's a cost/quality knob, not a security
+   * invariant), so it's never mixed into the array that reporting code might
+   * reasonably treat as "why did this fail closed". Empty whenever every
+   * guardrail setting was confirmed applied (or guardrail configuration
+   * wasn't attempted at all, e.g. because the security-critical lockdown
+   * steps above already failed).
+   */
+  guardrailWarnings: string[];
 }
 
 export interface VerifyGovernanceResult {
@@ -354,6 +379,41 @@ export class HermesProfileService {
         { stdin, timeoutMs: Math.max(this.cliTimeoutMs, 30000) }
       );
 
+      // Live-verified this Phase B session (not in the original Phase A
+      // code — see this ADR's design notes for why): the installed Hermes
+      // CLI's `mcp` Python client defaults to the modern Streamable HTTP
+      // transport, which POSTs JSON-RPC messages to the SAME url it did the
+      // initial SSE handshake against. CloudOps's own MCP server
+      // (packages/tools/src/mcpServer.ts, apps/api's /v1/mcp/sse + separate
+      // /v1/mcp/messages routes) implements the MCP SDK's older
+      // `SSEServerTransport` — GET /v1/mcp/sse for the event stream, POST to
+      // a DIFFERENT url (/v1/mcp/messages?sessionId=...) for JSON-RPC. That
+      // is a real transport-version mismatch, not a reachability problem:
+      // `hermes mcp add` has no `--transport` flag, so its own connectivity
+      // probe reliably fails ("Session terminated") and saves the server
+      // disabled, exactly like a genuinely unreachable endpoint would.
+      // Explicitly setting `transport: sse` (config key confirmed by reading
+      // hermes-agent's own tools/mcp_tool.py this session) and re-enabling
+      // is what actually fixes it — live-verified: `hermes mcp test` then
+      // reports a real "Connected" and discovers all registered tools. This
+      // must run unconditionally (mcp add's own probe already failed and
+      // disabled the entry by this point in every real environment observed
+      // so far), before the independent mcp list/mcp test re-verification
+      // below, which is what actually proves this worked rather than just
+      // trusting the config write.
+      await this.runHermes(profileName, [
+        "config",
+        "set",
+        `mcp_servers.${CLOUDOPS_MCP_SERVER_NAME}.transport`,
+        "sse"
+      ]);
+      await this.runHermes(profileName, [
+        "config",
+        "set",
+        `mcp_servers.${CLOUDOPS_MCP_SERVER_NAME}.enabled`,
+        "true"
+      ]);
+
       const listResult = await this.runHermes(profileName, ["mcp", "list"]);
       const servers = this.parseMcpList(listResult.stdout);
       const ours = servers.find((s) => s.name === CLOUDOPS_MCP_SERVER_NAME);
@@ -380,7 +440,59 @@ export class HermesProfileService {
       errors.push(`MCP registration failed: ${err?.message || err}`);
     }
 
-    return this.finalizeProvision(tenantId, agentId, profileName, disabledToolsets, toolsetsLockedDown && mcpRegistered, errors);
+    const succeeded = toolsetsLockedDown && mcpRegistered;
+
+    // 3. ADR-0008 Phase B (§4.3): set the autonomous-investigation turn
+    // budget and hard-stop guardrail on every profile that actually reached
+    // LOCKED_DOWN. Deliberately gated on `succeeded` (not run for a profile
+    // that's about to be marked FAILED anyway) and deliberately NOT allowed
+    // to affect `succeeded` itself — see configureInvestigationGuardrails's
+    // own doc comment and ProvisionGovernedProfileResult.guardrailWarnings.
+    const guardrailWarnings = succeeded ? await this.configureInvestigationGuardrails(profileName) : [];
+
+    return this.finalizeProvision(tenantId, agentId, profileName, disabledToolsets, succeeded, errors, guardrailWarnings);
+  }
+
+  /**
+   * ADR-0008 Phase B (§4.3): sets the two tool-loop guardrail config keys
+   * live-verified against the installed Hermes CLI this ADR's design session
+   * confirmed are real and settable per-profile:
+   *   hermes -p <profile> config set agent.max_turns <GOVERNED_MAX_TURNS>
+   *   hermes -p <profile> config set tool_loop_guardrails.hard_stop_enabled true
+   * Never throws and never contributes to `provisionProfile()`'s
+   * governance-status computation — a mis-set turn budget is a cost/quality
+   * concern, not the security boundary GOVERNED_TOOLSETS_TO_DISABLE and the
+   * MCP-only invariant are. Every failure (CLI error, or a `config set` that
+   * ran but didn't echo back the live-verified `✓ Set ...` confirmation) is
+   * collected into the returned warnings array and logged, never thrown.
+   */
+  private async configureInvestigationGuardrails(profileName: string): Promise<string[]> {
+    const warnings: string[] = [];
+    const settings: Array<[string, string]> = [
+      ["agent.max_turns", String(GOVERNED_MAX_TURNS)],
+      ["tool_loop_guardrails.hard_stop_enabled", "true"]
+    ];
+
+    for (const [key, value] of settings) {
+      try {
+        const result = await this.runHermes(profileName, ["config", "set", key, value]);
+        const applied = /✓\s*Set\b/i.test(result.stdout);
+        if (!applied) {
+          warnings.push(`Guardrail config '${key}=${value}' did not confirm as applied: ${result.stdout || result.stderr}`);
+        }
+      } catch (err: any) {
+        warnings.push(`Guardrail config '${key}=${value}' failed: ${err?.message || err}`);
+      }
+    }
+
+    if (warnings.length > 0) {
+      logger.warn(
+        { profileName, warnings },
+        "Hermes investigation guardrail configuration incomplete (non-fatal — does not affect governance_status)"
+      );
+    }
+
+    return warnings;
   }
 
   private async finalizeProvision(
@@ -389,7 +501,8 @@ export class HermesProfileService {
     profileName: string,
     disabledToolsets: string[],
     succeeded: boolean,
-    errors: string[]
+    errors: string[],
+    guardrailWarnings: string[] = []
   ): Promise<ProvisionGovernedProfileResult> {
     const verifiedAt = new Date();
     const governanceStatus: AgentGovernanceStatus = succeeded ? "LOCKED_DOWN" : "FAILED";
@@ -408,7 +521,7 @@ export class HermesProfileService {
       actorType: "SYSTEM",
       actorId: "hermes-profile-service",
       agentId: String(agentId),
-      payload: { hermesProfileName: profileName, governanceStatus, disabledToolsets, errors }
+      payload: { hermesProfileName: profileName, governanceStatus, disabledToolsets, errors, guardrailWarnings }
     });
 
     if (governanceStatus === "FAILED") {
@@ -424,7 +537,8 @@ export class HermesProfileService {
       mcpRegistered,
       disabledToolsets,
       verifiedAt,
-      errors
+      errors,
+      guardrailWarnings
     };
   }
 

@@ -10,12 +10,22 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-application-auto-scaling": "^3.1141.0",
+    "@aws-sdk/client-cloudwatch": "^3.1140.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.1141.0",
+    "@aws-sdk/client-ec2": "^3.1127.0",
+    "@aws-sdk/client-ecs": "^3.1127.0",
+    "@aws-sdk/client-rds": "^3.1127.0",
+    "@aws-sdk/client-s3": "^3.1127.0",
+    "@aws-sdk/s3-request-presigner": "^3.1141.0",
     "@cloudops/adapters": "*",
     "@cloudops/approvals": "*",
+    "@cloudops/auth": "*",
+    "@cloudops/identity": "*",
     "@cloudops/policy": "*",
+    "@cloudops/runtime": "*",
     "@cloudops/shared": "*",
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "zod": "^3.24.2",
-    "@aws-sdk/client-ecs": "^3.1127.0"
+    "zod": "^3.24.2"
   }
 }

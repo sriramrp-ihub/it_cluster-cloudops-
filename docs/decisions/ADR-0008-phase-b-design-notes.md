@@ -1,6 +1,6 @@
 # ADR-0008 Phase B — Design Notes: Replacing the Fixed 3-Step Investigation Script
 
-**Status:** Design only — not implemented. Phase A (per-agent governed Hermes profile lifecycle) is implemented; see the "Implementation status" section ADR-0008 itself now carries.
+**Status:** Implemented and live-verified end-to-end (see the "Implementation status" section ADR-0008 itself now carries, and the "What actually shipped vs. this design" addendum at the bottom of this document). This document is kept as the historical design record; where the shipped code deviates from what's written below, the addendum says so explicitly rather than silently editing the original design.
 
 **Scope:** decision item 4 from ADR-0008 — "Replace the fixed 3-step investigation script with a real Hermes-driven MCP-only tool loop." This document is the precise design the task explicitly said was preferable to a rushed, half-working implementation.
 
@@ -119,3 +119,33 @@ Every tool call — adaptive or fixed-script — still lands on `CloudOpsMcpServ
 ## 5. What's explicitly NOT in scope here (per ADR-0007)
 
 No connector work, no multi-agent orchestration, no cloud deployment of the Hermes runtime. This stays exactly what ADR-0008 scoped: one agent's own investigation loop, against its own governed MCP server, still gated by the one shared `PolicyEngine`.
+
+## 6. What actually shipped vs. this design (implementation addendum)
+
+Written after implementing and live-verifying the design above. The shape described in §4 was followed as written; this section records the concrete outcomes, the one real correction found, and what's now live-verified vs. still only mocked.
+
+### §3's core assumption: confirmed, live, end-to-end
+
+This document's §3 explicitly said the "`-z` runs Hermes's real tool-calling loop against the registered MCP server" assumption had NOT been end-to-end verified. It now has been, in this session, against a real disposable governed profile, a real dev `apps/api` (Postgres/Redis/DefenseClaw via Docker, all genuinely running, not assumed absent), and the real installed `hermes` v0.18.2 CLI:
+
+- A single `hermes -p <profile> -z "Call aws_ecs_list_clusters and aws_s3_list_buckets, then summarize what you found." --ignore-rules` call caused Hermes to autonomously call BOTH tools — two independent real AWS SDK calls against the connected sandbox account — entirely on its own, no TypeScript orchestration in between.
+- Both calls landed as genuine `tool_executions` rows via the new `CloudOpsMcpServer` persistence (§4.4 below), with real input/output payloads (an actual ECS cluster ARN, an actual S3 bucket name) and the correct `run_id`, resolved lazily by the new `RunService.findActiveRunId()`.
+- Hermes's own final answer correctly summarized both real results, proving it used the tool outputs rather than fabricating a plausible-sounding response.
+
+This is the strongest form of verification this design called for, and it succeeded on the first fully-wired attempt.
+
+### A real Phase A gap found and fixed along the way
+
+Getting the live rig running surfaced one genuine bug in Phase A's already-shipped `HermesProfileService.provisionProfile()`, not anything this design predicted: the installed Hermes CLI's `mcp` Python client (`mcp==1.26.0`) defaults to the modern **Streamable HTTP** transport (single endpoint, POST JSON-RPC to the same URL as the SSE handshake). `CloudOpsMcpServer` implements the MCP SDK's older, separate-endpoint **SSE transport** (`SSEServerTransport`: `GET /v1/mcp/sse` for the event stream, `POST /v1/mcp/messages?sessionId=...` for JSON-RPC). `hermes mcp add` has no `--transport` flag to pick the legacy shape, so its own connectivity probe reliably 404'd on the mismatched POST target, reported "Session terminated", and saved the server registration disabled — meaning **every governed profile provisioned by Phase A's shipped code would have silently failed to ever actually reach a tool**, indistinguishable from a genuinely unreachable endpoint. `provisionProfile()` now runs `hermes config set mcp_servers.cloudops-control-plane.transport sse` (+ `.enabled true`) immediately after `mcp add`, live-verified this session to be the fix: `hermes mcp test` then reports a real `✓ Connected` and discovers all registered tools. This is called out explicitly rather than silently patched in because it changes behavior Phase A's own tests already covered (those tests are pure `execFile` mocks and don't simulate real transport negotiation, so they couldn't have caught this).
+
+Also worth noting: the sandbox's Hermes installation didn't have the `mcp` Python package installed at all until this session (`pip`/`uv pip install mcp==1.26.0 starlette==1.0.1` into Hermes's own venv, per `hermes-agent`'s own `pyproject.toml` `[mcp]` extra) — Phase A's session reported it couldn't get a combined live rig running at all, and this missing dependency is very likely why. That install is local to the Hermes CLI's own project directory, not part of this repo.
+
+### §4.4's design decisions: confirmed correct, not just assumed
+
+- **No reasoning-equivalent field on `CallToolRequest`**: checked directly against the installed `@modelcontextprotocol/sdk`'s `CallToolRequestParamsSchema` and `RequestHandlerExtra` types (not just taken on the design's word) — both carry only the standard `_meta` (`progressToken`, `io.modelcontextprotocol/related-task`) and session/auth metadata, nothing for a caller's rationale. §4.4(b)'s recommended fallback (`investigationNarrative` reconstructed from the model's own final JSON) was implemented as specified.
+- **`runId` resolution**: implemented as the design's parenthetical alternative — "resolve one per active agentId" — since `CloudOpsMcpServerOptions.runId` is genuinely unknown at SSE-connect time in the real route. `RunService.findActiveRunId()` (new) resolves the one `RUNNING` run for an agent and is cached for the life of the `CloudOpsMcpServer` instance (one instance per SSE connection, in practice one per Hermes CLI invocation). Live-verified both branches: an active run correctly threads `run_id` onto `tool_executions`; no active run correctly skips `tool_executions` (its schema requires a non-null `run_id`) while still recording `audit_events` with a null one.
+
+### What's still mocked-only, stated plainly
+
+- The specific fail-closed/fallback unit-test scenarios (adaptive-throws-falls-back, no-narrative handling, guardrail-config-set-failure-is-non-fatal) are verified via mocked `execFile`/fake-binary tests, matching Phase A's own test style — not against a live daemon, since they're deliberately testing error paths that are impractical to trigger reliably against a real CLI on demand.
+- No adversarial/concurrent-run scenario was live-tested (e.g. two investigations racing for the same agent's `findActiveRunId()` result) — the ADR's own modeling ("at most one active run per investigation session") was taken as given, consistent with how every route that calls `RunService.createRun()` already uses it today.

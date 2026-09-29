@@ -378,13 +378,304 @@ export class HermesAgentAdapter implements AgentAdapter {
   }
 
   /**
-   * Executes the Hermes autonomous investigation turn.
+   * ADR-0008 Phase B (§4.1): drives one full investigation turn. When this
+   * agent has its own governed Hermes profile (`this.hermesProfileName` —
+   * only ever set once `HermesProfileService` has independently verified
+   * `governance_status === 'LOCKED_DOWN'`, see investigations.ts's
+   * `applyGovernedProfile()`), first tries letting Hermes's own tool-calling
+   * loop drive the investigation adaptively against that profile's one MCP
+   * server, instead of walking the fixed 3-step script. ANY failure in that
+   * path — inference error, timeout, unparseable output, missing required
+   * fields — is caught here and falls through to the exact same fixed-script
+   * path used when there's no governed profile at all. This preserves the
+   * pre-Phase-B behavior as a safety net: a broken or unreachable adaptive
+   * loop degrades to today's grounded, deterministic investigation, it never
+   * surfaces as a failed investigation the caller has to handle specially.
+   */
+  async runInvestigation(
+    sessionId: string,
+    incidentContext?: InvestigationDriveContext
+  ): Promise<InvestigationDriveResult> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new NotFoundError(`Session not found: ${sessionId}`);
+    }
+
+    if (this.hermesProfileName) {
+      try {
+        return await this.runAdaptiveInvestigation(sessionId, incidentContext);
+      } catch (err) {
+        logger.warn(
+          { err, sessionId, hermesProfileName: this.hermesProfileName },
+          "Adaptive investigation loop failed, falling back to grounded fixed-script investigation"
+        );
+      }
+    }
+
+    return this.runFixedScriptInvestigation(sessionId, incidentContext);
+  }
+
+  /**
+   * ADR-0008 Phase B (§4.2): the Hermes-driven adaptive investigation loop.
+   * Builds ONE task prompt describing the incident and asks Hermes to
+   * investigate using whatever tools its governed profile has — its own MCP
+   * server, `cloudops-control-plane` (see HermesProfileService) — deciding
+   * itself what to check and in what order, then calls
+   * `executeHermesInference()` exactly once with `this.hermesProfileName`
+   * set, so it runs `-p <profile> -z "<prompt>" --ignore-rules`. Per the
+   * ADR-0008 Phase B design notes §3, `-z` (oneshot) is understood to run
+   * Hermes's normal multi-turn tool-calling loop and only suppress the CLI's
+   * own turn-by-turn chrome from stdout — this is what makes the
+   * investigation adaptive rather than a hardcoded script, but it also means
+   * this TypeScript process has NO visibility into individual tool calls
+   * Hermes makes along the way (they go straight from Hermes to
+   * CloudOpsMcpServer over SSE, never through this adapter) until the final
+   * response comes back.
+   *
+   * Emits the same AgentEvent shapes (STEP/OBSERVATION/EVIDENCE/ROOT_CAUSE/
+   * PROPOSAL) the fixed-script path emits, so the web UI needs no changes —
+   * just a variable count instead of a fixed 3, reconstructed from Hermes's
+   * own `investigationNarrative` in its final JSON (see the class-level note
+   * on why: the MCP protocol has no per-call reasoning field to capture
+   * live). HIGH/CRITICAL risk findings still go through the exact same
+   * `handler()`/approval-creation path the fixed-script path uses — Phase B
+   * changes how the investigation decides what to check, not what's allowed
+   * to execute unapproved.
+   */
+  private async runAdaptiveInvestigation(
+    sessionId: string,
+    incidentContext?: InvestigationDriveContext
+  ): Promise<InvestigationDriveResult> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new NotFoundError(`Session not found: ${sessionId}`);
+    }
+
+    const handler =
+      this.toolCallHandlers.get(sessionId) ||
+      (async (call: AgentToolCall): Promise<AgentToolResult> => ({
+        callId: call.callId,
+        status: "SUCCESS",
+        data: { status: "INSPECTED", timestamp: new Date().toISOString() }
+      }));
+
+    const targetCluster = incidentContext?.cluster || "cloudops-test";
+    const targetService = incidentContext?.service || "starvision-motors";
+    const targetRegion = incidentContext?.region || "us-east-1";
+
+    session.currentStep = 1;
+    this.emitEvent(sessionId, {
+      type: "STATUS",
+      sessionId,
+      timestamp: new Date(),
+      data: {
+        status: "ACTIVE",
+        mode: "adaptive",
+        message: `Delegating investigation to Hermes's own tool-calling loop via governed profile '${this.hermesProfileName}'.`
+      }
+    });
+    this.emitEvent(sessionId, {
+      type: "STEP",
+      sessionId,
+      timestamp: new Date(),
+      data: { step: 1, toolName: "hermes_adaptive_investigation", status: "running" }
+    });
+
+    if (!this.activeModel) {
+      await this.checkHermesHealth();
+    }
+    const effectiveModel = this.activeModel || "agent-runtime";
+    const effectiveAgentName = this.agentName || "CloudOps Autonomous SRE Agent";
+
+    const prompt = `You are ${effectiveAgentName} (${effectiveModel}), investigating a real production incident using the tools available to you.
+
+Incident:
+- Service: "${targetService}"
+- Cluster: "${targetCluster}"
+- Region: "${targetRegion}"
+- Alert: ${incidentContext?.alertDescription || "ECS service health anomaly"}
+
+Investigate this incident using your available tools — check service health, correlated metrics, and recent task/container failures as you judge relevant, in whatever order and however many calls you need. Once you have enough evidence, synthesize the root cause and choose the safest remediation action.
+
+Available remediation tools:
+- "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
+- "aws_ecs_update_service_image": Use if a specific image tag needs updating.
+- "aws_ecs_update_service": Use if task counts or service definition need forced update.
+- "aws_ecs_describe_services": Use if no failure is detected (informational only).
+
+Once you are done investigating — this must be your FINAL message, after you've finished calling tools — respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
+{
+  "finding": "<concise 1-2 sentence finding summary>",
+  "rootCause": "<detailed technical root cause explanation>",
+  "confidence": <number between 0.0 and 1.0>,
+  "remediationTool": "<tool name>",
+  "remediationParams": { "cluster": "${targetCluster}", "service": "${targetService}", "region": "${targetRegion}" },
+  "riskLevel": "<LOW|MEDIUM|HIGH|CRITICAL>",
+  "requiresApproval": <boolean>,
+  "investigationNarrative": ["<one short sentence per tool call/step you took and what you learned from it, in order>"]
+}`;
+
+    // A real multi-turn tool-calling loop against a live MCP server needs
+    // materially more time than the fixed path's single synthesis-only call
+    // (30s) — bounded by HermesProfileService's own GOVERNED_MAX_TURNS cap
+    // on the profile, not by this timeout, but the timeout still has to be
+    // generous enough to let a legitimate multi-tool investigation finish.
+    const rawOutput = await this.executeHermesInference(prompt, 120000);
+    const parsed = extractJsonFromLlmOutput(rawOutput);
+
+    if (!parsed || !parsed.finding || !parsed.rootCause) {
+      throw new Error(
+        "Adaptive investigation: Hermes did not return a parseable finding/rootCause JSON response"
+      );
+    }
+
+    const finding: string = parsed.finding;
+    const rootCauseText: string = parsed.rootCause;
+    const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0.85;
+    const remediationToolName: string = parsed.remediationTool || "aws_ecs_describe_services";
+    const remediationParams: Record<string, unknown> =
+      parsed.remediationParams && typeof parsed.remediationParams === "object"
+        ? parsed.remediationParams
+        : { cluster: targetCluster, service: targetService, region: targetRegion };
+    let riskLevel: string = parsed.riskLevel ? String(parsed.riskLevel).toUpperCase() : "LOW";
+    if (
+      (remediationToolName.includes("rollback") ||
+        remediationToolName.includes("update") ||
+        remediationToolName.includes("remediate")) &&
+      riskLevel !== "CRITICAL"
+    ) {
+      riskLevel = "HIGH";
+    }
+
+    // ADR-0008 Phase B design notes §4.4(b): Hermes's tool-calling loop talks
+    // to CloudOpsMcpServer directly over SSE — this process never sees each
+    // individual call the way the fixed-script path's handler() does, so
+    // there's no live per-call reasoning to attach the way
+    // tool_executions.reasoning_snippet normally captures (confirmed against
+    // the installed MCP SDK: neither CallToolRequestParamsSchema nor
+    // RequestHandlerExtra carry anything beyond the standard _meta
+    // progressToken/related-task keys). Instead, Hermes is asked to narrate
+    // its own steps as `investigationNarrative` above, reconstructed here
+    // into the same STEP/OBSERVATION event shapes the fixed path emits.
+    const narrative: string[] = Array.isArray(parsed.investigationNarrative)
+      ? parsed.investigationNarrative.filter((line: unknown): line is string => typeof line === "string" && line.trim().length > 0)
+      : [];
+
+    if (narrative.length === 0) {
+      // A valid, usable JSON response with nothing to reconstruct a
+      // step-by-step trace from isn't a failure — emit one OBSERVATION so
+      // the UI still shows the adaptive loop did something, rather than
+      // silently emitting zero steps beyond the initial STEP above.
+      this.emitEvent(sessionId, {
+        type: "OBSERVATION",
+        sessionId,
+        timestamp: new Date(),
+        data: {
+          step: 2,
+          toolName: "hermes_adaptive_investigation",
+          observation: `${effectiveAgentName} completed an adaptive investigation but did not narrate individual steps.`
+        }
+      });
+    } else {
+      narrative.forEach((line, idx) => {
+        this.emitEvent(sessionId, {
+          type: idx === 0 ? "STEP" : "OBSERVATION",
+          sessionId,
+          timestamp: new Date(),
+          data: {
+            step: idx + 2,
+            toolName: "hermes_adaptive_investigation",
+            observation: line,
+            ...(idx === 0 ? { status: "running" } : {})
+          }
+        });
+      });
+    }
+
+    // Adaptive tool calls happen inside Hermes's own loop against the MCP
+    // server directly, so this process never mints its own evidence ids the
+    // way the fixed-script path does per step — session.evidenceCollected
+    // stays whatever it already was (typically empty for an adaptive run).
+    const evidenceCollected = session.evidenceCollected || [];
+
+    const rootCause = {
+      finding,
+      rootCause: rootCauseText,
+      confidence,
+      evidenceIds: evidenceCollected,
+      citedRunbooks: [],
+      affectedResources: [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
+      dataSource: `live:${this.adapterType}:${effectiveModel}:adaptive`,
+      recommendedRemediation: {
+        toolName: remediationToolName,
+        parameters: remediationParams,
+        riskLevel,
+        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL"
+      }
+    };
+
+    this.emitEvent(sessionId, {
+      type: "ROOT_CAUSE",
+      sessionId,
+      timestamp: new Date(),
+      data: rootCause
+    });
+
+    // Same approval-gating path as the fixed-script path (§4.5 of the Phase
+    // B design notes): Phase B changes investigation, not remediation
+    // proposal.
+    if (riskLevel === "HIGH" || riskLevel === "CRITICAL") {
+      this.emitEvent(sessionId, {
+        type: "PROPOSAL",
+        sessionId,
+        timestamp: new Date(),
+        data: {
+          toolName: remediationToolName,
+          remediation: rootCause.recommendedRemediation,
+          status: "AWAITING_APPROVAL"
+        }
+      });
+
+      const proposalCall: AgentToolCall = {
+        callId: `call_${randomUUID()}`,
+        toolName: remediationToolName,
+        arguments: remediationParams,
+        timestamp: new Date(),
+        reasoning: `${finding} ${rootCauseText}`.trim(),
+        evidenceRefs: [...evidenceCollected]
+      };
+
+      const proposalResult = await handler(proposalCall);
+
+      if (proposalResult.status === "AWAITING_APPROVAL") {
+        session.status = "WAITING_APPROVAL";
+        session.pendingApprovalId = proposalResult.approvalId;
+      } else {
+        session.status = "COMPLETED";
+      }
+    } else {
+      session.status = "COMPLETED";
+    }
+
+    session.evidenceCollected = evidenceCollected;
+
+    return {
+      status: session.status,
+      rootCause,
+      approvalId: session.pendingApprovalId || undefined
+    };
+  }
+
+  /**
+   * The pre-Phase-B investigation turn, unchanged: the fixed-script safety
+   * net `runInvestigation()` falls back to whenever there's no governed
+   * Hermes profile, or the adaptive loop above throws for any reason.
    *
    * Each diagnostic step calls a canonical tool via the registered handler,
    * then derives its observation text DIRECTLY from the real tool result data.
    * No strings are hardcoded — every observation is grounded in live telemetry.
    */
-  async runInvestigation(
+  private async runFixedScriptInvestigation(
     sessionId: string,
     incidentContext?: InvestigationDriveContext
   ): Promise<InvestigationDriveResult> {

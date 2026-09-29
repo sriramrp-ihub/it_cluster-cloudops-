@@ -15,7 +15,8 @@ vi.mock("../../packages/runtime/src/audit.js", () => ({
 import {
   HermesProfileService,
   GOVERNED_TOOLSETS_TO_DISABLE,
-  CLOUDOPS_MCP_SERVER_NAME
+  CLOUDOPS_MCP_SERVER_NAME,
+  GOVERNED_MAX_TURNS
 } from "@cloudops/runtime";
 
 // ── Fixtures: real CLI output, live-verified against `hermes` v0.18.2 this
@@ -69,6 +70,14 @@ interface Scenario {
   mcpListStdout: string;
   mcpAddSucceeds: boolean;
   mcpTestStdout: string;
+  /**
+   * ADR-0008 Phase B (§4.3): whether `hermes config set ...` echoes back the
+   * live-verified `✓ Set ... in .../config.yaml` confirmation. Defaults to
+   * true so every existing Phase A scenario (none of which override this)
+   * exercises a realistic successful guardrail-configuration step too,
+   * without needing to touch any of those tests' own assertions.
+   */
+  configSetSucceeds: boolean;
 }
 
 function defaultScenario(): Scenario {
@@ -77,7 +86,8 @@ function defaultScenario(): Scenario {
     toolsListStdout: TOOLS_LIST_ALL_LOCKED_DOWN,
     mcpListStdout: MCP_LIST_EMPTY,
     mcpAddSucceeds: true,
-    mcpTestStdout: MCP_TEST_CONNECTED
+    mcpTestStdout: MCP_TEST_CONNECTED,
+    configSetSucceeds: true
   };
 }
 
@@ -140,6 +150,14 @@ function wireExecFile(scenario: Scenario) {
         respond(0, scenario.mcpAddSucceeds ? `Saved '${CLOUDOPS_MCP_SERVER_NAME}'\n` : "Failed to connect: timeout\n");
       } else if (args.includes("test")) {
         respond(0, scenario.mcpAddSucceeds ? scenario.mcpTestStdout : MCP_TEST_FAILED);
+      } else if (args.includes("config") && args.includes("set")) {
+        const key = args[args.indexOf("set") + 1];
+        respond(
+          0,
+          scenario.configSetSucceeds
+            ? `✓ Set ${key} in ~/.hermes/profiles/${args[1]}/config.yaml\n`
+            : "Error: could not write config file\n"
+        );
       } else {
         respond(0, "");
       }
@@ -388,6 +406,97 @@ describe("HermesProfileService (ADR-0008 Phase A)", () => {
       expect(result.governanceStatus).toBe("FAILED");
       expect(result.mcpRegistered).toBe(false);
       expect(result.mcpServers).toContain("sneaky-extra-server");
+    });
+  });
+
+  describe("provisionProfile guardrail configuration (ADR-0008 Phase B §4.3)", () => {
+    it("sets agent.max_turns and tool_loop_guardrails.hard_stop_enabled on every successfully locked-down profile", async () => {
+      const scenario = defaultScenario();
+      wireExecFile(scenario);
+      const db = createDbMock(undefined);
+      const svc = new HermesProfileService({ db, credentialService: createCredentialServiceMock(), hermesBin: "hermes-fake" });
+
+      const result = await svc.provisionProfile("ten_test", "ag_guardrail_001");
+
+      expect(result.governanceStatus).toBe("LOCKED_DOWN");
+      expect(result.guardrailWarnings).toEqual([]);
+
+      // Filter specifically to the two guardrail keys — provisioning also
+      // issues two OTHER `config set` calls for the MCP transport fix
+      // (mcp_servers.<name>.transport / .enabled, see provisionProfile's
+      // MCP registration step), which aren't guardrails and are asserted on
+      // separately below.
+      const configSetCalls = mockExecFile.mock.calls.filter(
+        (c) => c[1].includes("config") && c[1].includes("set") && (c[1].includes("agent.max_turns") || c[1].includes("tool_loop_guardrails.hard_stop_enabled"))
+      );
+      expect(configSetCalls).toHaveLength(2);
+      const flatArgs = configSetCalls.map((c) => c[1] as string[]);
+      expect(flatArgs).toContainEqual([
+        "-p",
+        "ag_guardrail_001",
+        "config",
+        "set",
+        "agent.max_turns",
+        String(GOVERNED_MAX_TURNS)
+      ]);
+      expect(flatArgs).toContainEqual([
+        "-p",
+        "ag_guardrail_001",
+        "config",
+        "set",
+        "tool_loop_guardrails.hard_stop_enabled",
+        "true"
+      ]);
+    });
+
+    it("does not fail provisioning when the guardrail config-set calls fail — governance_status stays LOCKED_DOWN", async () => {
+      const scenario = defaultScenario();
+      scenario.configSetSucceeds = false;
+      wireExecFile(scenario);
+      const db = createDbMock(undefined);
+      const svc = new HermesProfileService({ db, credentialService: createCredentialServiceMock(), hermesBin: "hermes-fake" });
+
+      const result = await svc.provisionProfile("ten_test", "ag_guardrail_002");
+
+      // The security-critical invariants (toolset lockdown, MCP-only
+      // registration) are unaffected by a guardrail config-set failure —
+      // this is the entire point of keeping it a separate, non-fatal step.
+      expect(result.governanceStatus).toBe("LOCKED_DOWN");
+      expect(result.mcpRegistered).toBe(true);
+      expect(result.errors).toEqual([]);
+
+      // The failure is still visible, just in its own bucket, never mixed
+      // into `errors` (which reporting code may reasonably read as "why did
+      // this fail closed").
+      expect(result.guardrailWarnings.length).toBe(2);
+      expect(result.guardrailWarnings.some((w) => w.includes("agent.max_turns"))).toBe(true);
+      expect(result.guardrailWarnings.some((w) => w.includes("hard_stop_enabled"))).toBe(true);
+
+      expect(db._updateChain.set).toHaveBeenCalledWith(
+        expect.objectContaining({ governance_status: "LOCKED_DOWN" })
+      );
+    });
+
+    it("skips guardrail configuration entirely when the base lockdown already failed", async () => {
+      const scenario = defaultScenario();
+      scenario.mcpAddSucceeds = false;
+      wireExecFile(scenario);
+      const db = createDbMock(undefined);
+      const svc = new HermesProfileService({ db, credentialService: createCredentialServiceMock(), hermesBin: "hermes-fake" });
+
+      const result = await svc.provisionProfile("ten_test", "ag_guardrail_003");
+
+      expect(result.governanceStatus).toBe("FAILED");
+      expect(result.guardrailWarnings).toEqual([]);
+      // The MCP transport-fix config-set calls (transport/enabled) still run
+      // unconditionally as part of the registration attempt itself — see
+      // provisionProfile's MCP registration step — but the investigation
+      // guardrail keys specifically must never be touched once the base
+      // lockdown has already failed.
+      const guardrailConfigSetCalls = mockExecFile.mock.calls.filter(
+        (c) => c[1].includes("config") && c[1].includes("set") && (c[1].includes("agent.max_turns") || c[1].includes("tool_loop_guardrails.hard_stop_enabled"))
+      );
+      expect(guardrailConfigSetCalls).toHaveLength(0);
     });
   });
 
