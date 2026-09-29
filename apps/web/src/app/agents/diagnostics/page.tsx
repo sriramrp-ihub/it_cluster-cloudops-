@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import Link from "next/link";
-import { fetchAgents, AgentItem } from "../../../lib/api";
+import { fetchAgents, verifyAgentGovernance, AgentItem } from "../../../lib/api";
 import { useOperator } from "../../../auth/OperatorContext";
 
 interface FrameLog {
@@ -24,6 +24,10 @@ export default function AgentDiagnosticsPage() {
   const [frameLogs, setFrameLogs] = useState<FrameLog[]>([]);
   const [authCredentialInput, setAuthCredentialInput] = useState("");
   const [authTypeInput, setAuthTypeInput] = useState<"BOOTSTRAP" | "RUNTIME">("BOOTSTRAP");
+
+  // ADR-0008 Phase A: governed Hermes profile lockdown status per agent.
+  const [verifyingId, setVerifyingId] = useState<string | null>(null);
+  const [verifyErrors, setVerifyErrors] = useState<Record<string, string[]>>({});
 
   const wsRef = useRef<WebSocket | null>(null);
   const tenantId = session?.tenantId || "ten_default_tenant";
@@ -151,6 +155,25 @@ export default function AgentDiagnosticsPage() {
 
   const connectedAgents = agents.filter((a) => a.status === "CONNECTED");
 
+  async function handleVerifyGovernance(id: string) {
+    setVerifyingId(id);
+    try {
+      const result = await verifyAgentGovernance(id, tenantId, operatorId);
+      setVerifyErrors((prev) => ({ ...prev, [id]: result.errors }));
+      await loadAgents();
+    } catch (err: any) {
+      setVerifyErrors((prev) => ({ ...prev, [id]: [err?.message || "Verification request failed"] }));
+    } finally {
+      setVerifyingId(null);
+    }
+  }
+
+  function governancePillClass(status?: string): string {
+    if (status === "LOCKED_DOWN") return "connected";
+    if (status === "FAILED") return "revoked";
+    return "pending";
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "2rem" }}>
       {/* Subnav Tabs */}
@@ -158,7 +181,7 @@ export default function AgentDiagnosticsPage() {
         <Link href="/agents" style={{ fontSize: "14px", color: "var(--mid-warm-gray)", textDecoration: "none", fontWeight: 500 }}>
           Fleet Directory
         </Link>
-        <Link href="/agents/add" style={{ fontSize: "14px", color: "var(--mid-warm-gray)", textDecoration: "none", fontWeight: 500 }}>
+        <Link href="/agents/new" style={{ fontSize: "14px", color: "var(--mid-warm-gray)", textDecoration: "none", fontWeight: 500 }}>
           + Add Agent
         </Link>
         <Link href="/agents/join-requests" style={{ fontSize: "14px", color: "var(--mid-warm-gray)", textDecoration: "none", fontWeight: 500 }}>
@@ -232,6 +255,77 @@ export default function AgentDiagnosticsPage() {
             90s Stale Session Eviction
           </div>
         </div>
+      </div>
+
+      {/* ADR-0008 Phase A: Governed Runtime lockdown status per agent */}
+      <div className="harvey-card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+          <h3 className="panel-title">Governed Runtime Lockdown</h3>
+          <button onClick={loadAgents} className="btn-secondary" style={{ fontSize: "11px", padding: "3px 8px" }}>
+            Refresh
+          </button>
+        </div>
+        <p className="body-subtle" style={{ marginBottom: "16px" }}>
+          Each agent runs its own isolated Hermes profile with every native toolset (terminal, file, code execution,
+          browser, computer use, delegation, cron) explicitly disabled — CloudOps&apos;s own governed MCP server is
+          its only tool source. &ldquo;Re-verify&rdquo; independently re-checks both invariants right now rather than
+          trusting the last recorded result.
+        </p>
+
+        {agents.length === 0 ? (
+          <div style={{ padding: "16px", color: "var(--muted-gray)", fontSize: "13px" }}>No agents registered yet.</div>
+        ) : (
+          <div className="data-table-container">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Agent</th>
+                  <th>Hermes Profile</th>
+                  <th>Governance</th>
+                  <th>Last Verified</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {agents.map((ag) => (
+                  <tr key={ag.id}>
+                    <td>
+                      <div style={{ fontWeight: 600 }}>{ag.name}</div>
+                      <div className="code-inline" style={{ fontSize: "11px" }}>{ag.id}</div>
+                    </td>
+                    <td style={{ fontFamily: "var(--font-mono)", fontSize: "12px" }}>
+                      {ag.hermesProfileName || "—"}
+                    </td>
+                    <td>
+                      <span className={`status-pill ${governancePillClass(ag.governanceStatus)}`}>
+                        <span className="status-dot-inner" />
+                        {ag.governanceStatus || "PENDING"}
+                      </span>
+                      {verifyErrors[ag.id] && verifyErrors[ag.id]!.length > 0 && (
+                        <div style={{ fontSize: "11px", color: "var(--danger, #b91c1c)", marginTop: "4px", maxWidth: "260px" }}>
+                          {verifyErrors[ag.id]!.join("; ")}
+                        </div>
+                      )}
+                    </td>
+                    <td style={{ fontSize: "12px", color: "var(--muted-gray)" }}>
+                      {ag.governanceVerifiedAt ? new Date(ag.governanceVerifiedAt).toLocaleString() : "never"}
+                    </td>
+                    <td>
+                      <button
+                        onClick={() => handleVerifyGovernance(ag.id)}
+                        disabled={verifyingId === ag.id}
+                        className="btn-secondary"
+                        style={{ fontSize: "11px", padding: "3px 8px" }}
+                      >
+                        {verifyingId === ag.id ? "Verifying…" : "Re-verify"}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* Two Column Console: Live Inspector & Active Sessions */}

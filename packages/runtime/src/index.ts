@@ -11,6 +11,8 @@ export * from "./audit.js";
 export * from "./agentAdapter.js";
 export * from "./mockAgentAdapter.js";
 export * from "./hermesAgentAdapter.js";
+export * from "./agentAdapterFactory.js";
+export * from "./hermesProfileService.js";
 
 export interface RuntimeAdapter {
   readonly runtimeType: string;

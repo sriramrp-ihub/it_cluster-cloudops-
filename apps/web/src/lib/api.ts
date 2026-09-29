@@ -28,8 +28,48 @@ export interface AgentItem {
   version: string;
   runtimeProtocol: string;
   status: "INVITED" | "APPROVED" | "REGISTERED" | "CONNECTED" | "SUSPENDED" | "REVOKED";
+  cloudAccountId: string | null;
+  /** ADR-0008 Phase A: governed Hermes profile lockdown tracking. */
+  hermesProfileName?: string | null;
+  governanceStatus?: "PENDING" | "LOCKED_DOWN" | "FAILED";
+  governanceVerifiedAt?: string | null;
+  mcpRegistered?: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface GovernanceVerificationResult {
+  agentId: string;
+  hermesProfileName: string | null;
+  governanceStatus: "PENDING" | "LOCKED_DOWN" | "FAILED";
+  toolsetsLockedDown: boolean;
+  enabledNativeToolsets: string[];
+  mcpRegistered: boolean;
+  mcpServers: string[];
+  verifiedAt: string;
+  errors: string[];
+}
+
+/**
+ * ADR-0008 Phase A: triggers an on-demand, independent re-check of an
+ * agent's governed Hermes profile (native toolsets still disabled, CloudOps
+ * own MCP server still the only one registered) rather than trusting the
+ * last-recorded status alone.
+ */
+export async function verifyAgentGovernance(
+  id: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<GovernanceVerificationResult> {
+  const res = await fetch(`${API_BASE}/v1/agents/${id}/verify-governance`, {
+    method: "POST",
+    headers: getAuthHeaders(tenantId, operatorId)
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+  return res.json();
 }
 
 export interface JoinRequestItem {
@@ -58,6 +98,115 @@ function getAuthHeaders(tenantId?: string, operatorId?: string): Record<string, 
     "x-tenant-id": tenantId || DEFAULT_TENANT,
     "x-operator-id": operatorId || DEFAULT_OPERATOR
   };
+}
+
+/**
+ * Resolves the real signed-in operator/tenant for a Server Component by
+ * forwarding its incoming cookie header to the same /v1/auth/session
+ * endpoint the client uses — Server Components have no access to
+ * OperatorContext, so without this they silently fell back to
+ * DEFAULT_TENANT/DEFAULT_OPERATOR above, which is why the Overview page
+ * (a Server Component) never reflected whatever the signed-in operator
+ * actually connected.
+ */
+export async function resolveServerSession(
+  cookieHeader: string
+): Promise<{ tenantId: string; operatorId: string } | null> {
+  if (!cookieHeader) return null;
+  try {
+    const res = await fetch(`${API_BASE}/v1/auth/session`, {
+      headers: { cookie: cookieHeader },
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    if (!body?.operator?.tenantId || !body?.operator?.id) return null;
+    return { tenantId: body.operator.tenantId, operatorId: body.operator.id };
+  } catch {
+    return null;
+  }
+}
+
+export interface TeamMember {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+/**
+ * Team membership — driven by the caller's own session cookie server-side
+ * (not x-tenant-id/x-operator-id headers), so these always use
+ * credentials: "include" rather than the getAuthHeaders() pattern the rest
+ * of this file uses.
+ */
+export async function fetchTeam(): Promise<TeamMember[]> {
+  const res = await fetch(`${API_BASE}/v1/auth/team`, { credentials: "include" });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return data.operators || [];
+}
+
+export async function addTeamMember(params: { name: string; email: string; password: string }): Promise<TeamMember> {
+  const res = await fetch(`${API_BASE}/v1/auth/team`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params)
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return data.operator;
+}
+
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/v1/auth/change-password`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ currentPassword, newPassword })
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+}
+
+/**
+ * Real per-tenant monthly cost guardrail — the cap PolicyEngine's
+ * FENCE_BUDGET_CAP rule checks every proposed mutation's estimated cost
+ * against. Driven by session cookie, like team/password above.
+ */
+export async function fetchTenantBudget(): Promise<number> {
+  const res = await fetch(`${API_BASE}/v1/auth/tenant/budget`, { credentials: "include" });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return data.monthlyBudgetLimitUsd;
+}
+
+export async function updateTenantBudget(monthlyBudgetLimitUsd: number): Promise<number> {
+  const res = await fetch(`${API_BASE}/v1/auth/tenant/budget`, {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ monthlyBudgetLimitUsd })
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return data.monthlyBudgetLimitUsd;
 }
 
 export async function fetchHealth(): Promise<HealthResponse> {
@@ -92,6 +241,47 @@ export async function fetchAgent(id: string, tenantId?: string, operatorId?: str
   const res = await fetch(`${API_BASE}/v1/agents/${id}`, {
     headers: getAuthHeaders(tenantId, operatorId),
     cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export async function assignAgentCloudAccount(
+  agentId: string,
+  cloudAccountId: string | null,
+  tenantId?: string,
+  operatorId?: string
+): Promise<{ id: string; cloudAccountId: string | null }> {
+  const res = await fetch(`${API_BASE}/v1/agents/${agentId}/cloud-account`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(tenantId, operatorId)
+    },
+    body: JSON.stringify({ cloudAccountId })
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export async function syncAgentCapabilities(
+  agentId: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<{ id: string; capabilities: string[]; updatedRows: number }> {
+  const res = await fetch(`${API_BASE}/v1/agents/${agentId}/sync-capabilities`, {
+    method: "POST",
+    headers: getAuthHeaders(tenantId, operatorId)
   });
 
   if (!res.ok) {
@@ -518,6 +708,98 @@ export async function connectAgent(
   }
 
   return res.json();
+}
+
+export interface AgentCostBucket {
+  agentId: string;
+  agentName: string;
+  cloudAccountId: string | null;
+  cloudAccountLabel: string | null;
+  executedMonthlyCostUsd: number;
+  pendingMonthlyCostUsd: number;
+  approvalCount: number;
+}
+
+export interface CloudAccountCostBucket {
+  cloudAccountId: string | null;
+  cloudAccountLabel: string;
+  executedMonthlyCostUsd: number;
+  pendingMonthlyCostUsd: number;
+  approvalCount: number;
+  agentIds: string[];
+}
+
+export interface CostSummary {
+  totals: {
+    executedMonthlyCostUsd: number;
+    pendingMonthlyCostUsd: number;
+    monthlyBudgetLimitUsd: number;
+  };
+  byAgent: AgentCostBucket[];
+  byCloudAccount: CloudAccountCostBucket[];
+  unassignedAgents: { id: string; name: string }[];
+}
+
+export async function fetchCostSummary(tenantId?: string, operatorId?: string): Promise<CostSummary> {
+  const res = await fetch(`${API_BASE}/v1/costs/summary`, {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export interface IamTemplateGroup {
+  id: string;
+  label: string;
+  description: string;
+  category: "ecs" | "ec2" | "s3" | "rds" | "cloudwatch" | "logs";
+  actions: string[];
+  tools: string[];
+  note?: string;
+}
+
+export async function fetchIamTemplateGroups(tenantId?: string, operatorId?: string): Promise<IamTemplateGroup[]> {
+  const res = await fetch(`${API_BASE}/v1/iam-templates`, {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data.groups || [];
+}
+
+export async function buildIamPolicy(
+  groupIds: string[],
+  tenantId?: string,
+  operatorId?: string
+): Promise<Record<string, unknown>> {
+  const res = await fetch(`${API_BASE}/v1/iam-templates/build`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...getAuthHeaders(tenantId, operatorId)
+    },
+    body: JSON.stringify({ groupIds })
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data.policy;
 }
 
 export async function testAgent(

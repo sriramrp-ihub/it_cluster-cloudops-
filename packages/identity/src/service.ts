@@ -1,5 +1,5 @@
 import { generateAgentId, NotFoundError, ValidationError, type AgentId, type AgentStatus } from "@cloudops/shared";
-import { AgentRecord, CreateAgentDto, IAgentRepository, AgentRepository } from "./repository.js";
+import { AgentRecord, AgentGovernancePatch, CreateAgentDto, IAgentRepository, AgentRepository } from "./repository.js";
 
 export const SUPPORTED_AGENT_TYPES = ["hermes", "openclaw", "custom"] as const;
 export type SupportedAgentType = (typeof SUPPORTED_AGENT_TYPES)[number];
@@ -55,6 +55,29 @@ export class AgentService {
   async updateStatus(tenantId: string, id: AgentId, status: AgentStatus): Promise<void> {
     await this.getAgent(tenantId, id);
     await this.repo.updateStatus(tenantId, id, status);
+  }
+
+  /**
+   * Assigns (or clears, with cloudAccountId=null) the single cloud account
+   * this agent acts against. Real tool-call credential resolution
+   * (packages/tools/src/registry.ts's resolveAwsCredentials) reads this
+   * mapping — without it, every agent in a tenant with multiple connected
+   * accounts effectively shared "any" account's credentials.
+   */
+  async assignCloudAccount(tenantId: string, id: AgentId, cloudAccountId: string | null): Promise<AgentRecord> {
+    await this.getAgent(tenantId, id);
+    await this.repo.updateCloudAccount(tenantId, id, cloudAccountId);
+    return this.getAgent(tenantId, id);
+  }
+
+  /**
+   * ADR-0008 Phase A: records the result of a governed Hermes profile
+   * (re-)provisioning or verification pass. See HermesProfileService.
+   */
+  async updateGovernance(tenantId: string, id: AgentId, patch: AgentGovernancePatch): Promise<AgentRecord> {
+    await this.getAgent(tenantId, id);
+    await this.repo.updateGovernance(tenantId, id, patch);
+    return this.getAgent(tenantId, id);
   }
 
   async deleteAgent(tenantId: string, id: AgentId): Promise<{ id: AgentId; name: string }> {

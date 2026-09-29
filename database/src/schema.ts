@@ -4,6 +4,17 @@ export interface TenantTable {
   id: string;
   name: string;
   created_at: Generated<Date>;
+  monthly_budget_limit_usd: Generated<number>;
+}
+
+export interface OperatorTable {
+  id: string;
+  tenant_id: string;
+  name: string;
+  email: string;
+  password_hash: string;
+  created_at: Generated<Date>;
+  last_login_at: Date | null;
 }
 
 export interface AgentTable {
@@ -14,8 +25,15 @@ export interface AgentTable {
   version: string;
   runtime_protocol: string;
   status: string;
+  cloud_account_id: string | null;
   created_at: Generated<Date>;
   updated_at: Generated<Date>;
+  // ADR-0008 Phase A: per-agent governed Hermes profile lockdown tracking
+  // (see database/migrations/019_hermes_governed_profiles.sql).
+  hermes_profile_name: string | null;
+  governance_status: Generated<string>;
+  governance_verified_at: Date | null;
+  mcp_registered: Generated<boolean>;
 }
 
 export interface AgentCredentialTable {
@@ -165,6 +183,8 @@ export interface ApprovalTable {
   error_message: string | null;
   dry_run_diff: string | null; // JSONB
   previous_state_snapshot: string | null; // JSONB
+  reverts_approval_id: string | null;
+  operator_prompt: string | null;
   created_at: Generated<Date>;
 }
 
@@ -177,6 +197,7 @@ export interface RunTable {
   user_prompt: string;
   status: string;
   final_response: string | null;
+  trace_id: string | null;
   created_at: Generated<Date>;
   completed_at: Date | null;
 }
@@ -191,6 +212,8 @@ export interface ToolExecutionTable {
   status: string;
   duration_ms: number | null;
   error_message: string | null;
+  reasoning_snippet: string | null;
+  evidence_refs: Generated<string[]>;
   created_at: Generated<Date>;
 }
 
@@ -287,8 +310,44 @@ export interface AgentConnectorTable {
   stopped_at: Date | null;
 }
 
+export interface RunbookTable {
+  id: string;
+  tenant_id: string;
+  title: string;
+  content: string;
+  tags: string; // JSONB
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
+export interface KnowledgeEmbeddingTable {
+  id: string;
+  tenant_id: string;
+  source_type: string; // 'RUNBOOK' | 'INCIDENT_RESOLUTION'
+  source_id: string;
+  chunk_index: Generated<number>;
+  content: string;
+  // Raw pgvector text representation ("[0.1,0.2,...]") — Kysely/pg has no
+  // native vector type, so embeddings are cast via sql`${...}::vector` on
+  // write and read back as text; @cloudops/embeddings owns the parsing.
+  embedding: string;
+  metadata: Generated<string>; // JSONB
+  created_at: Generated<Date>;
+}
+
+export interface TenantMemoryTable {
+  id: string;
+  tenant_id: string;
+  resource_ref: string | null;
+  incident_id: string | null;
+  summary: string;
+  source: Generated<string>;
+  created_at: Generated<Date>;
+}
+
 export interface DatabaseSchema {
   tenants: TenantTable;
+  operators: OperatorTable;
   agents: AgentTable;
   agent_credentials: AgentCredentialTable;
   agent_sessions: AgentSessionTable;
@@ -310,6 +369,9 @@ export interface DatabaseSchema {
   incidents: IncidentTable;
   investigations: InvestigationTable;
   incident_evidence: IncidentEvidenceTable;
+  runbooks: RunbookTable;
+  knowledge_embeddings: KnowledgeEmbeddingTable;
+  tenant_memory: TenantMemoryTable;
 }
 
 

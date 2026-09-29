@@ -15,6 +15,24 @@ export const AgentStatus = {
 } as const;
 export type AgentStatus = (typeof AgentStatus)[keyof typeof AgentStatus];
 
+/**
+ * ADR-0008 (Governed Runtime — MCP-Only Execution Boundary): tracks whether
+ * an agent's dedicated Hermes profile has its native toolsets verified
+ * disabled AND CloudOps's own MCP server verified as its only tool source.
+ * Mirrors AgentStatus's plain-string-column convention (no DB CHECK
+ * constraint — enforced here, at the application layer).
+ *   PENDING     — profile not yet provisioned, or provisioning hasn't run
+ *   LOCKED_DOWN — both invariants held as of governance_verified_at
+ *   FAILED      — provisioning or re-verification could not confirm the
+ *                 lockdown; must be treated as NOT governed
+ */
+export const AgentGovernanceStatus = {
+  PENDING: "PENDING",
+  LOCKED_DOWN: "LOCKED_DOWN",
+  FAILED: "FAILED"
+} as const;
+export type AgentGovernanceStatus = (typeof AgentGovernanceStatus)[keyof typeof AgentGovernanceStatus];
+
 export const SessionStatus = {
   REGISTERING: "REGISTERING",
   CHALLENGE_ISSUED: "CHALLENGE_ISSUED",

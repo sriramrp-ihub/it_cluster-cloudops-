@@ -5,13 +5,16 @@ import {
   type AgentSession,
   type AgentEvent,
   type AgentToolCall,
-  type AgentToolResult
+  type AgentToolResult,
+  type InvestigationDriveContext,
+  type InvestigationDriveResult
 } from "./agentAdapter.js";
 import {
   ValidationError,
   NotFoundError,
   validateIncidentContext,
-  logger
+  logger,
+  sanitizeLogString
 } from "@cloudops/shared";
 
 export function cleanLlmOutput(output: string): string {
@@ -84,6 +87,8 @@ export interface HermesAgentConfig {
   agentName?: string | undefined;
   model?: string | undefined;
   provider?: string | undefined;
+  /** ADR-0008 Phase A: initial governed Hermes profile name, if known at construction time. */
+  hermesProfileName?: string | undefined;
 }
 
 export class HermesAgentAdapter implements AgentAdapter {
@@ -105,6 +110,16 @@ export class HermesAgentAdapter implements AgentAdapter {
   public agentName?: string | undefined;
   public activeModel?: string | undefined;
   public activeProvider?: string | undefined;
+  /**
+   * ADR-0008 Phase A: the agent's own governed Hermes profile name (see
+   * HermesProfileService), set dynamically per request exactly like
+   * `agentName`/`activeModel` above (see apps/api's investigations.ts
+   * `applyGovernedProfile()` and agents.ts chat route). Left undefined by
+   * default — every existing caller that never sets this keeps talking to
+   * the shared/default profile exactly as before this ADR; this is a purely
+   * additive, opt-in behavior change.
+   */
+  public hermesProfileName?: string | undefined;
 
   constructor(config: HermesAgentConfig = {}) {
     this.endpoint = config.endpoint || process.env.HERMES_URL || "http://127.0.0.1:8080";
@@ -122,6 +137,7 @@ export class HermesAgentAdapter implements AgentAdapter {
     this.agentName = config.agentName;
     this.activeModel = config.model;
     this.activeProvider = config.provider;
+    this.hermesProfileName = config.hermesProfileName;
   }
 
   /**
@@ -213,9 +229,35 @@ export class HermesAgentAdapter implements AgentAdapter {
     const { promisify } = await import("node:util");
     const execFileAsync = promisify(execFile);
 
+    // ADR-0008 Phase A: when this.hermesProfileName is set (a governed,
+    // verified-LOCKED_DOWN profile — see HermesProfileService and
+    // investigations.ts's applyGovernedProfile()), every inference call
+    // this agent's session makes runs against ITS OWN isolated profile
+    // (`-p <profile>`) instead of the shared default one — real per-agent
+    // isolation, not a per-tenant convention layered on shared state.
+    // Unset (the default for every caller that predates this ADR), this is
+    // byte-for-byte the same invocation as before.
+    const profileArgs = this.hermesProfileName ? ["-p", this.hermesProfileName] : [];
+
     const { stdout } = await execFileAsync(
       this.hermesBin,
-      ["-z", prompt, "--ignore-rules"],
+      // History here: "-t ''" (empty toolsets) doesn't mean "load nothing" —
+      // Hermes treats an empty string as unset and loads every installed
+      // personal-assistant plugin anyway. The next fix, --safe-mode, solved
+      // the latency but also silently dropped the configured model/provider
+      // (it implies --ignore-user-config). The real source of the slowdown
+      // was one specific *enabled* plugin (servicenow_pipeline) being fully
+      // loaded on every call — disabled persistently via `hermes plugins
+      // disable servicenow_pipeline`, a one-time config change, not a
+      // per-call flag. That leaves --ignore-rules as the only flag still
+      // needed here: it skips Hermes's own AGENTS.md/memory/skill injection,
+      // which is deliberate, not a leftover workaround — that memory lives
+      // in one global file shared by every tenant this process ever talks
+      // to (~/.hermes/memories/USER.md), so injecting it here would leak
+      // one tenant's facts into another's chat responses. Real per-tenant
+      // memory is CloudOps' own concern (see tenantMemoryService), not
+      // Hermes's.
+      [...profileArgs, "-z", prompt, "--ignore-rules"],
       {
         timeout,
         maxBuffer: 10 * 1024 * 1024,
@@ -224,7 +266,15 @@ export class HermesAgentAdapter implements AgentAdapter {
     );
 
     const cleaned = cleanLlmOutput(stdout);
-    return cleaned || stdout.trim();
+    // Phase 3.8: the subprocess above inherits the full process environment
+    // (DATABASE_URL, REDIS_ENCRYPTION_KEY, DEFENSECLAW_GATEWAY_TOKEN, and any
+    // future cloud credentials) — the model has no business echoing any of
+    // it back, but nothing stops it from trying (prompt injection or plain
+    // accident). This is the single choke point every caller of live LLM
+    // inference goes through (investigation root-cause synthesis, the
+    // operator chat endpoint), so redacting here covers both without either
+    // caller having to remember to.
+    return sanitizeLogString(cleaned || stdout.trim());
   }
 
   async start(context: AgentExecutionContext): Promise<AgentSession> {
@@ -336,18 +386,8 @@ export class HermesAgentAdapter implements AgentAdapter {
    */
   async runInvestigation(
     sessionId: string,
-    incidentContext?: {
-      cluster?: string;
-      service?: string;
-      region?: string;
-      alertDescription?: string;
-      liveInference?: boolean;
-    }
-  ): Promise<{
-    status: string;
-    rootCause: Record<string, unknown>;
-    approvalId?: string | undefined;
-  }> {
+    incidentContext?: InvestigationDriveContext
+  ): Promise<InvestigationDriveResult> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new NotFoundError(`Session not found: ${sessionId}`);
@@ -400,7 +440,9 @@ export class HermesAgentAdapter implements AgentAdapter {
       callId: `call_${randomUUID()}`,
       toolName: "aws_ecs_describe_services",
       arguments: { cluster: targetCluster, services: [targetService], region: targetRegion },
-      timestamp: new Date()
+      timestamp: new Date(),
+      reasoning: "Establishing baseline service health (desired/running/pending task counts) before diagnosing the reported alert.",
+      evidenceRefs: []
     });
 
     // Build observation from real data
@@ -451,7 +493,9 @@ export class HermesAgentAdapter implements AgentAdapter {
         cluster: targetCluster,
         service: targetService
       },
-      timestamp: new Date()
+      timestamp: new Date(),
+      reasoning: "Checking for a correlated metric anomaly (e.g. 5xx spike) that would corroborate or narrow down the service-health signal from the previous step.",
+      evidenceRefs: [...evidenceCollected]
     });
 
     const metricData = (step2Result.data as any);
@@ -500,7 +544,9 @@ export class HermesAgentAdapter implements AgentAdapter {
       callId: `call_${randomUUID()}`,
       toolName: "aws_ecs_describe_stopped_tasks",
       arguments: { cluster: targetCluster, service: targetService, region: targetRegion },
-      timestamp: new Date()
+      timestamp: new Date(),
+      reasoning: "Inspecting recently stopped tasks for a concrete container-level failure signal (e.g. exit reason), since service status and metrics alone don't explain a root cause.",
+      evidenceRefs: [...evidenceCollected]
     });
 
     const stoppedData = (step3Result.data as any);
@@ -544,6 +590,42 @@ export class HermesAgentAdapter implements AgentAdapter {
 
     await delay(900);
 
+    // ── Retrieval (Phase 2.9): ground the synthesis step in any relevant
+    // runbook/past-incident-resolution content for this tenant. Fails soft —
+    // an empty/missing knowledge base must never block the investigation.
+    let retrievedChunks: Array<{ sourceId: string; content: string; distance: number; metadata: Record<string, unknown> }> = [];
+    try {
+      const { searchKnowledge } = await import("@cloudops/embeddings");
+      const retrievalQuery = `${incidentContext?.alertDescription || ""} ${step3Observation}`.trim();
+      retrievedChunks = await searchKnowledge(session.tenantId, retrievalQuery, 2);
+    } catch (err) {
+      logger.debug({ err }, "Runbook retrieval skipped (no knowledge base reachable for this tenant)");
+    }
+    // A generous relevance ceiling (cosine distance range is [0,2] for
+    // normalized vectors) — filters out results retrieved only because they
+    // were the least-bad match in a mostly-unrelated knowledge base.
+    const citedRunbooks = retrievedChunks
+      .filter((c) => c.distance < 1.2)
+      .map((c) => ({
+        title: (c.metadata as any)?.runbookTitle || c.sourceId,
+        sourceId: c.sourceId,
+        distance: c.distance,
+        excerpt: c.content
+      }));
+
+    if (citedRunbooks.length > 0) {
+      this.emitEvent(sessionId, {
+        type: "OBSERVATION",
+        sessionId,
+        timestamp: new Date(),
+        data: {
+          step: 4,
+          toolName: "runbook_retrieval",
+          observation: `Retrieved ${citedRunbooks.length} relevant runbook excerpt(s): ${citedRunbooks.map((r) => r.title).join(", ")}`
+        }
+      });
+    }
+
     // ── Step 4: Root Cause Synthesis (Grounded in real telemetry & live LLM reasoning) ───
     let finding = "";
     let rootCauseText = "";
@@ -566,6 +648,13 @@ export class HermesAgentAdapter implements AgentAdapter {
         const effectiveModel = this.activeModel || "agent-runtime";
         const effectiveAgentName = this.agentName || "CloudOps Autonomous SRE Agent";
 
+        const runbookSection =
+          citedRunbooks.length > 0
+            ? `\nRelevant Runbook Excerpts (cite by title in your rootCause if you rely on one):\n` +
+              citedRunbooks.map((r) => `--- "${r.title}" ---\n${r.excerpt}`).join("\n\n") +
+              "\n"
+            : "";
+
         const inferencePrompt = `You are ${effectiveAgentName} (${effectiveModel}).
 Analyze the following telemetry collected for service "${targetService}" in cluster "${targetCluster}" (${targetRegion}):
 Alert: ${incidentContext?.alertDescription || "ECS service health anomaly"}
@@ -574,8 +663,8 @@ Telemetry Data:
 - Service Status: ${step1Observation}
 - CloudWatch Target Group Metrics: ${step2Observation}
 - Stopped Tasks & Container Exit Diagnostics: ${step3Observation}
-
-Based on these observations, synthesize the root cause and choose the safest remediation action.
+${runbookSection}
+Based on these observations${citedRunbooks.length > 0 ? " and any relevant runbook excerpts above" : ""}, synthesize the root cause and choose the safest remediation action.
 Available remediation tools:
 - "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
 - "aws_ecs_update_service_image": Use if specific image tag needs updating.
@@ -585,7 +674,7 @@ Available remediation tools:
 Respond strictly with valid JSON conforming to this schema (no markdown, no backticks):
 {
   "finding": "<concise 1-2 sentence finding summary>",
-  "rootCause": "<detailed technical root cause explanation>",
+  "rootCause": "<detailed technical root cause explanation. If a runbook excerpt informed this, name it explicitly, e.g. 'Per runbook \\"X\\", ...'>",
   "confidence": <number between 0.0 and 1.0>,
   "remediationTool": "<tool name>",
   "remediationParams": { "cluster": "${targetCluster}", "service": "${targetService}", "region": "${targetRegion}" },
@@ -721,6 +810,14 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
         remediationParams = { cluster: targetCluster, services: [targetService], region: targetRegion };
         riskLevel = "LOW";
       }
+
+      // Grounded fallback path has no LLM to cite the runbook on its own —
+      // append the citation directly so retrieval still informs the output
+      // whenever live inference is unavailable (e.g. no Hermes daemon).
+      if (citedRunbooks.length > 0) {
+        const top = citedRunbooks[0]!;
+        rootCauseText += ` Per runbook "${top.title}": ${top.excerpt}`;
+      }
     }
 
     const rootCause = {
@@ -728,6 +825,7 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
       rootCause: rootCauseText,
       confidence,
       evidenceIds: evidenceCollected,
+      citedRunbooks: citedRunbooks.map((r) => ({ title: r.title, sourceId: r.sourceId, distance: r.distance })),
       affectedResources: svc?.serviceArn
         ? [svc.serviceArn]
         : [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
@@ -767,7 +865,13 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
         callId: `call_${randomUUID()}`,
         toolName: remediationToolName,
         arguments: remediationParams,
-        timestamp: new Date()
+        timestamp: new Date(),
+        // The actual justification for this mutation — the synthesized
+        // finding and root cause, not a generic "proposing remediation"
+        // placeholder. This is the single most important reasoning_snippet
+        // in the whole investigation: it's what a human approver reads.
+        reasoning: `${finding} ${rootCauseText}`.trim(),
+        evidenceRefs: [...evidenceCollected]
       };
 
       const proposalResult = await handler(proposalCall);

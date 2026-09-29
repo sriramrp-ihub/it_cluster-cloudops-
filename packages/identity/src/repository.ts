@@ -1,7 +1,7 @@
 import { Kysely, Transaction } from "kysely";
 import type { DatabaseSchema, AgentTable } from "@cloudops/database";
 import { getDatabase } from "@cloudops/database";
-import type { AgentId, AgentStatus } from "@cloudops/shared";
+import type { AgentId, AgentStatus, AgentGovernanceStatus } from "@cloudops/shared";
 
 export interface AgentRecord {
   id: AgentId;
@@ -11,8 +11,22 @@ export interface AgentRecord {
   version: string;
   runtimeProtocol: string;
   status: AgentStatus;
+  cloudAccountId: string | null;
   createdAt: Date;
   updatedAt: Date;
+  /** ADR-0008 Phase A: governed Hermes profile lockdown tracking. */
+  hermesProfileName: string | null;
+  governanceStatus: AgentGovernanceStatus;
+  governanceVerifiedAt: Date | null;
+  mcpRegistered: boolean;
+}
+
+/** Patch accepted by IAgentRepository.updateGovernance — see HermesProfileService. */
+export interface AgentGovernancePatch {
+  hermesProfileName: string | null;
+  governanceStatus: AgentGovernanceStatus;
+  governanceVerifiedAt: Date | null;
+  mcpRegistered: boolean;
 }
 
 export interface CreateAgentDto {
@@ -34,8 +48,13 @@ function mapAgentRow(row: any): AgentRecord {
     version: row.version,
     runtimeProtocol: row.runtime_protocol,
     status: row.status as AgentStatus,
+    cloudAccountId: row.cloud_account_id ?? null,
     createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at)
+    updatedAt: new Date(row.updated_at),
+    hermesProfileName: row.hermes_profile_name ?? null,
+    governanceStatus: (row.governance_status as AgentGovernanceStatus) ?? "PENDING",
+    governanceVerifiedAt: row.governance_verified_at ? new Date(row.governance_verified_at) : null,
+    mcpRegistered: Boolean(row.mcp_registered)
   };
 }
 
@@ -43,6 +62,8 @@ export interface IAgentRepository {
   create(dto: CreateAgentDto, tx?: Transaction<DatabaseSchema>): Promise<AgentRecord>;
   findById(tenantId: string, id: AgentId): Promise<AgentRecord | null>;
   updateStatus(tenantId: string, id: AgentId, status: AgentStatus, tx?: Transaction<DatabaseSchema>): Promise<void>;
+  updateCloudAccount(tenantId: string, id: AgentId, cloudAccountId: string | null): Promise<void>;
+  updateGovernance(tenantId: string, id: AgentId, patch: AgentGovernancePatch): Promise<void>;
   list(tenantId: string): Promise<AgentRecord[]>;
   delete(tenantId: string, id: AgentId, tx?: Transaction<DatabaseSchema>): Promise<boolean>;
 }
@@ -97,6 +118,41 @@ export class AgentRepository implements IAgentRepository {
       .updateTable("agents")
       .set({
         status,
+        updated_at: new Date()
+      } as any)
+      .where("tenant_id", "=", tenantId)
+      .where("id", "=", id)
+      .execute();
+  }
+
+  async updateCloudAccount(tenantId: string, id: AgentId, cloudAccountId: string | null): Promise<void> {
+    await this.db
+      .updateTable("agents")
+      .set({
+        cloud_account_id: cloudAccountId,
+        updated_at: new Date()
+      } as any)
+      .where("tenant_id", "=", tenantId)
+      .where("id", "=", id)
+      .execute();
+  }
+
+  /**
+   * ADR-0008 Phase A: records the outcome of (re-)provisioning this agent's
+   * governed Hermes profile — see HermesProfileService.provisionProfile()/
+   * verifyGovernance(). Intentionally a plain field update, not gated on
+   * current status, so a re-verification that finds a previously
+   * LOCKED_DOWN profile has drifted (e.g. a toolset was re-enabled out of
+   * band) can flip it back to FAILED.
+   */
+  async updateGovernance(tenantId: string, id: AgentId, patch: AgentGovernancePatch): Promise<void> {
+    await this.db
+      .updateTable("agents")
+      .set({
+        hermes_profile_name: patch.hermesProfileName,
+        governance_status: patch.governanceStatus,
+        governance_verified_at: patch.governanceVerifiedAt,
+        mcp_registered: patch.mcpRegistered,
         updated_at: new Date()
       } as any)
       .where("tenant_id", "=", tenantId)

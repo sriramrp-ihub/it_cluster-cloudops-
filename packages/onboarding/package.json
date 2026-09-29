@@ -20,6 +20,7 @@
     "@cloudops/database": "*",
     "@cloudops/identity": "*",
     "@cloudops/audit": "*",
+    "@cloudops/runtime": "*",
     "@cloudops/shared": "*",
     "zod": "^3.24.2"
   }

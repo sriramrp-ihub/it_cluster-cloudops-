@@ -8,9 +8,11 @@ import {
   ValidationError,
   generateClaimCredential,
   hashToken,
+  logger,
   type ClaimCredential,
   type AgentId
 } from "@cloudops/shared";
+import { HermesProfileService } from "@cloudops/runtime";
 import { InviteService } from "./invite.js";
 import { JoinRequestRepository } from "./joinRequest.js";
 import { recordAuditEvent } from "./audit.js";
@@ -32,7 +34,8 @@ export class ClaimService {
   constructor(
     private readonly inviteService: InviteService = new InviteService(),
     private readonly joinRequestRepo: JoinRequestRepository = new JoinRequestRepository(),
-    private readonly db: Kysely<DatabaseSchema> = getDatabase()
+    private readonly db: Kysely<DatabaseSchema> = getDatabase(),
+    private readonly hermesProfileService: HermesProfileService = new HermesProfileService()
   ) {}
 
   /**
@@ -61,7 +64,7 @@ export class ClaimService {
     const agentId = jr.agentId;
 
     // 3. Atomic consumption inside PostgreSQL transaction with row lock
-    return this.db.transaction().execute(async (tx) => {
+    const result: ClaimCredentialResult = await this.db.transaction().execute(async (tx) => {
       // Lock the claim credentials row for this join request
       const claimRow = await tx
         .selectFrom("agent_claim_credentials")
@@ -149,5 +152,27 @@ export class ClaimService {
         nextAction: "REGISTER_GATEWAY"
       };
     });
+
+    // ADR-0008 Phase A: provision this agent's isolated, governed Hermes
+    // profile now that its identity is real (post-commit — CLI subprocess
+    // calls have no business running inside the DB transaction above).
+    // Deliberately awaited rather than fire-and-forget, so a caller
+    // inspecting the agent's governance status immediately after claim sees
+    // an accurate result rather than a stale PENDING — but deliberately
+    // caught rather than re-thrown: the credential claim itself already
+    // committed and must not fail because Hermes's own lockdown couldn't be
+    // confirmed. A failure here leaves governance_status='FAILED' (fail
+    // closed, never silently marked usable) for diagnostics/an operator to
+    // act on, without breaking this endpoint's existing response contract.
+    try {
+      await this.hermesProfileService.provisionProfile(result.tenantId, result.agentId);
+    } catch (err: any) {
+      logger.error(
+        { err, agentId: result.agentId, tenantId: result.tenantId },
+        "Hermes governed profile provisioning threw unexpectedly during credential claim"
+      );
+    }
+
+    return result;
   }
 }
