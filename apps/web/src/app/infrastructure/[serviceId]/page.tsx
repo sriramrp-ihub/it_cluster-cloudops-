@@ -7,8 +7,10 @@ import { useOperator } from "../../../auth/OperatorContext";
 import {
   fetchCloudAccounts,
   fetchAccountWorkloads,
+  fetchEcsServiceDetail,
   DiscoveredWorkload,
-  CloudAccountItem
+  CloudAccountItem,
+  EcsServiceDetail
 } from "../../../lib/api";
 
 export default function ServiceDetailPage({ params }: { params: Promise<{ serviceId: string }> }) {
@@ -25,6 +27,8 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
   const [workload, setWorkload] = useState<DiscoveredWorkload | null>(null);
   const [loading, setLoading] = useState(true);
   const [account, setAccount] = useState<CloudAccountItem | null>(null);
+  const [ecsDetail, setEcsDetail] = useState<EcsServiceDetail | null>(null);
+  const [loadingEcsDetail, setLoadingEcsDetail] = useState(false);
 
   const loadWorkloadDetails = useCallback(async () => {
     setLoading(true);
@@ -71,8 +75,35 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
     loadWorkloadDetails();
   }, [loadWorkloadDetails]);
 
+  // Real, live ECS drill-down — deployment state, task definition summary,
+  // per-task detail, target health, and recent CPU/Memory metrics. Fetched
+  // directly from the read-only API route (not the agent/LLM tool-call path)
+  // once the workload and its owning cloud account are known.
+  useEffect(() => {
+    if (!workload || !account || workload.type !== "ECS_SERVICE" || !workload.cluster) {
+      setEcsDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingEcsDetail(true);
+    fetchEcsServiceDetail(account.id, workload.cluster, workload.name, workload.region, tenantId, operatorId)
+      .then((detail) => {
+        if (!cancelled) setEcsDetail(detail);
+      })
+      .catch(() => {
+        if (!cancelled) setEcsDetail(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingEcsDetail(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workload, account, tenantId, operatorId]);
+
   const isProvisioned = workload !== null;
   const isHealthy = workload?.status === "HEALTHY";
+  const isEcsService = workload?.type === "ECS_SERVICE";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "2rem" }}>
@@ -164,7 +195,7 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
         <>
           {/* 3. Progressive Disclosure Tabs */}
           <div className="tab-navigation-bar">
-            {(["overview", "config", "tasks"] as const).map((tabKey) => (
+            {(isEcsService ? (["overview", "config", "tasks", "metrics"] as const) : (["overview", "config", "tasks"] as const)).map((tabKey) => (
               <button
                 key={tabKey}
                 type="button"
@@ -249,7 +280,10 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
               <div style={{ display: "flex", flexDirection: "column", gap: "8px", fontSize: "13px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
                   <span style={{ color: "var(--mid-warm-gray)" }}>Task Definition:</span>
-                  <span className="code-inline">{workload.taskDefinition || "N/A"}</span>
+                  <span className="code-inline">
+                    {ecsDetail?.taskDefinition?.taskDefinitionArn || workload.taskDefinition || "N/A"}
+                    {ecsDetail?.taskDefinition?.revision ? ` (rev ${ecsDetail.taskDefinition.revision})` : ""}
+                  </span>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
                   <span style={{ color: "var(--mid-warm-gray)" }}>Resource Type:</span>
@@ -259,15 +293,146 @@ export default function ServiceDetailPage({ params }: { params: Promise<{ servic
                   <span style={{ color: "var(--mid-warm-gray)" }}>Cluster Name:</span>
                   <span className="code-inline">{workload.cluster || "default"}</span>
                 </div>
+                {ecsDetail?.taskDefinition?.cpu && (
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                    <span style={{ color: "var(--mid-warm-gray)" }}>CPU / Memory:</span>
+                    <span className="code-inline">{ecsDetail.taskDefinition.cpu} / {ecsDetail.taskDefinition.memory}</span>
+                  </div>
+                )}
+                {(ecsDetail?.taskDefinition?.containerDefinitions || []).map((c: any) => (
+                  <div key={c.name} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                    <span style={{ color: "var(--mid-warm-gray)" }}>Container &quot;{c.name}&quot; image:</span>
+                    <span className="code-inline" style={{ wordBreak: "break-all", textAlign: "right" }}>{c.image}</span>
+                  </div>
+                ))}
+                {ecsDetail?.taskDefinition?.error && (
+                  <div style={{ fontSize: "12px", color: "#b45309", marginTop: "4px" }}>
+                    Live task definition detail unavailable: {ecsDetail.taskDefinition.error}
+                  </div>
+                )}
+                {ecsDetail?.imageCheck && (
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                    <span style={{ color: "var(--mid-warm-gray)" }}>Deployed image exists in ECR:</span>
+                    {ecsDetail.imageCheck.found === true ? (
+                      <span style={{ color: "#16a34a", fontSize: "12.5px" }}>
+                        Confirmed ({ecsDetail.imageCheck.images?.[0]?.imageDigest?.slice(0, 19)}…)
+                      </span>
+                    ) : ecsDetail.imageCheck.found === false ? (
+                      <span style={{ color: "#dc2626", fontSize: "12.5px" }}>
+                        Missing — {ecsDetail.imageCheck.note || "tag/digest not found in ECR"}
+                      </span>
+                    ) : (
+                      <span style={{ color: "var(--mid-warm-gray)", fontSize: "12.5px" }}>
+                        {ecsDetail.imageCheck.note || ecsDetail.imageCheck.error || "Unknown"}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           )}
 
           {activeTab === "tasks" && (
             <div className="harvey-card" style={{ padding: "24px" }}>
-              <h3 className="panel-title" style={{ marginBottom: "12px" }}>Discovered Task Replicas</h3>
-              <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>
-                Active running count: <strong>{workload.runningCount ?? 0}</strong> of <strong>{workload.desiredCount ?? 0}</strong> desired.
+              <h3 className="panel-title" style={{ marginBottom: "12px" }}>Real ECS Task Detail</h3>
+              {loadingEcsDetail && (
+                <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>Fetching live task detail…</div>
+              )}
+              {!loadingEcsDetail && !ecsDetail && (
+                <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>
+                  Active running count: <strong>{workload.runningCount ?? 0}</strong> of <strong>{workload.desiredCount ?? 0}</strong> desired.
+                </div>
+              )}
+              {!loadingEcsDetail && ecsDetail?.tasks?.error && (
+                <div style={{ fontSize: "13px", color: "#b45309" }}>
+                  Live task detail unavailable: {ecsDetail.tasks.error}
+                </div>
+              )}
+              {!loadingEcsDetail && Array.isArray(ecsDetail?.tasks?.tasks) && ecsDetail.tasks.tasks.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                  {ecsDetail.tasks.tasks.map((t: any) => (
+                    <div key={t.taskArn} style={{ padding: "10px 12px", border: "1px solid var(--border-subtle)", borderRadius: "8px", fontSize: "13px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+                        <span className="code-inline">{(t.taskArn || "").split("/").pop()}</span>
+                        <span className={`status-pill ${t.lastStatus === "RUNNING" ? "connected" : "attention"}`} style={{ fontSize: "10.5px" }}>
+                          {t.lastStatus}
+                        </span>
+                      </div>
+                      <div style={{ color: "var(--mid-warm-gray)", fontSize: "12px" }}>
+                        Health: {t.healthStatus || "UNKNOWN"} · AZ: {t.availabilityZone || "—"} · CPU/Mem: {t.cpu}/{t.memory}
+                      </div>
+                      {(t.containers || []).map((c: any) => (
+                        <div key={c.name} style={{ marginTop: "4px", fontSize: "12px", color: "var(--near-black-ink)" }}>
+                          Container &quot;{c.name}&quot;: {c.lastStatus}
+                          {c.exitCode !== undefined && c.exitCode !== null ? ` (exit ${c.exitCode})` : ""}
+                          {c.reason ? ` — ${c.reason}` : ""}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {!loadingEcsDetail && Array.isArray(ecsDetail?.tasks?.tasks) && ecsDetail.tasks.tasks.length === 0 && !ecsDetail?.tasks?.error && (
+                <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>No tasks currently found for this service.</div>
+              )}
+            </div>
+          )}
+
+          {activeTab === "metrics" && isEcsService && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "1rem" }}>
+                {(["cpu", "memory"] as const).map((key) => {
+                  const m = ecsDetail?.metrics?.[key];
+                  const points: any[] = m?.datapoints || [];
+                  const latest = points.length > 0 ? points[points.length - 1] : undefined;
+                  return (
+                    <div key={key} className="harvey-card" style={{ padding: "16px 20px" }}>
+                      <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--mid-warm-gray)", textTransform: "uppercase" }}>
+                        {key === "cpu" ? "CPU Utilization" : "Memory Utilization"} (real CloudWatch)
+                      </div>
+                      {loadingEcsDetail ? (
+                        <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)", marginTop: "8px" }}>Loading…</div>
+                      ) : m?.error ? (
+                        <div style={{ fontSize: "12px", color: "#b45309", marginTop: "8px" }}>{m.error}</div>
+                      ) : latest?.average !== undefined ? (
+                        <div style={{ fontSize: "24px", fontWeight: 600, color: "var(--near-black-ink)", marginTop: "4px" }}>
+                          {Number(latest.average).toFixed(1)}%
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: "12px", color: "var(--mid-warm-gray)", marginTop: "8px" }}>
+                          {m?.note || `No datapoints (${m?.alarmState || "INSUFFICIENT_DATA"})`}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="harvey-card" style={{ padding: "20px 24px" }}>
+                <h3 className="panel-title" style={{ marginBottom: "8px" }}>Load Balancer Target Health</h3>
+                {loadingEcsDetail ? (
+                  <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>Loading…</div>
+                ) : ecsDetail?.targetHealth?.status === "NO_LOAD_BALANCER" ? (
+                  <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>{ecsDetail.targetHealth.note}</div>
+                ) : ecsDetail?.targetHealth?.error ? (
+                  <div style={{ fontSize: "13px", color: "#b45309" }}>{ecsDetail.targetHealth.error}</div>
+                ) : Array.isArray(ecsDetail?.targetHealth?.targets) ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px" }}>
+                    <div style={{ color: "var(--mid-warm-gray)", marginBottom: "4px" }}>
+                      {ecsDetail.targetHealth.healthyCount} healthy / {ecsDetail.targetHealth.targetCount} total
+                    </div>
+                    {ecsDetail.targetHealth.targets.map((t: any) => (
+                      <div key={`${t.targetId}:${t.port}`} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                        <span className="code-inline">{t.targetId}:{t.port}</span>
+                        <span style={{ color: t.state === "healthy" ? "#16a34a" : "#dc2626" }}>
+                          {t.state}{t.reason ? ` (${t.reason})` : ""}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: "13px", color: "var(--mid-warm-gray)" }}>No target health data available.</div>
+                )}
               </div>
             </div>
           )}

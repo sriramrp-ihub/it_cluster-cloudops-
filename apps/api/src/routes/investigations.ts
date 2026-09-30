@@ -518,14 +518,21 @@ ${workloadList}
 ${history ? `\nConversation so far:\n${history}\n` : ""}
 Operator's latest message: "${latest.text}"
 
-Decide: do you have enough information to identify exactly ONE service from the list above, and a clear description of the symptom?
+Decide which of THREE outcomes actually fits — do not force this into an investigation if it isn't one:
 
-Respond with ONLY valid JSON, no markdown, no backticks, matching exactly one of these two shapes:
+1. The operator has NOT described any real symptom/issue with a cloud resource — this includes small talk, a meta-question about the platform/agent/connection itself (e.g. "is this runtime responding", "are you working"), or an explicit "nothing's wrong" — even after a clarifying question. This is NOT an investigation request. Do not invent a plausible-sounding service symptom to justify starting one anyway.
+2. The operator described something real, but it's ambiguous which service, or the symptom itself still isn't clear enough to act on.
+3. You have enough to proceed: exactly one real service from the list above, and an actual described symptom.
 
-If you need more information (ambiguous which service, or no real symptom described yet):
+Respond with ONLY valid JSON, no markdown, no backticks, matching exactly one of these three shapes:
+
+Outcome 1 (not an investigation — answer directly, do not ask a clarifying question, do not start anything):
+{"notActionable": true, "response": "<a short, direct, honest reply to what the operator actually said — e.g. confirm the runtime/connection is up if that's what they asked, or acknowledge there's nothing to investigate>"}
+
+Outcome 2 (need more information):
 {"needsClarification": true, "question": "<a single, specific clarifying question to ask the operator>"}
 
-If you have enough to proceed:
+Outcome 3 (enough to proceed):
 {"needsClarification": false, "service": "<exact name from the list above>", "cluster": "<its cluster>", "region": "<its region>", "severity": "<CRITICAL|HIGH|MEDIUM|LOW>", "alertDescription": "<a concise technical restatement of the symptom for the investigation log>"}`;
 
     try {
@@ -536,6 +543,19 @@ If you have enough to proceed:
         return reply.status(200).send({
           needsClarification: true,
           question: "I couldn't quite parse that — which service is affected, and what are you seeing (errors, high latency, crash loops)?"
+        });
+      }
+
+      // A real, honest answer that never should have been forced into an
+      // investigation — e.g. "is the runtime responding" or "nothing's
+      // wrong". No incident is created, no investigation starts; this is
+      // just a direct chat reply. Checked before needsClarification so a
+      // model that (correctly) recognizes there's nothing to investigate
+      // isn't overridden into asking yet another clarifying question.
+      if (parsed.notActionable) {
+        return reply.status(200).send({
+          notActionable: true,
+          response: parsed.response || "There's nothing to investigate from that — let me know if you're seeing a real issue with a specific service."
         });
       }
 
@@ -896,6 +916,98 @@ If you have enough to proceed:
       }
 
       throw new NotFoundError(`Investigation ${id} not found`);
+    }
+  );
+
+  /**
+   * GET /v1/investigations/:id/swarm-trace
+   * ADR-0007 Phase C1b: read-only, post-hoc swarm topology data for a past
+   * (or in-progress) investigation — the historical counterpart to the live
+   * SSE stream's `mode: "swarm"` events. `:id` accepts the same investigation
+   * id OR incident id the plain GET /v1/investigations/:id route above
+   * already accepts (same dual lookup, for the same reason: the web UI's
+   * `selectedIncidentId` is often actually an incident id).
+   *
+   * The overwhelming majority of investigations are NOT swarm-mode, so this
+   * always returns 200 with `{isSwarm: false}` rather than a 404/error for
+   * every one of them — "not a swarm investigation" is an expected, common
+   * shape, not a failure. Only investigations with at least one
+   * `parent_run_id`-linked child run (a real worker/verifier/synthesizer
+   * sub-run — see swarmRunTrace.ts) come back `isSwarm: true`.
+   *
+   * Resolving an investigation id to its own OUTER run id has no dedicated
+   * FK to walk (`investigations` and `runs` are two independent inserts in
+   * the same request handler, not linked by any column — `runs.session_id`
+   * looked like that link at first glance, but it's actually FK-constrained
+   * to the unrelated `agent_sessions` credential-session table, so it can
+   * never legitimately hold an investigation's own ephemeral adapter
+   * session id). `investigation.agent_id` and the outer run's own agent_id
+   * are always set from the exact same `effectiveAgentId` inside that one
+   * request handler, so `findRunByAgentNearTime()` — nearest run by the same
+   * agent, close in time to when the investigation started — is this
+   * route's actual (deliberately fuzzy, not exact-key) correlator.
+   */
+  fastify.get<{ Params: { id: string } }>(
+    "/v1/investigations/:id/swarm-trace",
+    async (request, reply) => {
+      const tenantId = getTenantId(request);
+      const { id } = request.params;
+
+      const directInv = await incidentService.getInvestigation(tenantId, id);
+      const incidentData = directInv ? null : await incidentService.getIncident(tenantId, id).catch(() => null);
+      const investigation = directInv?.investigation || incidentData?.investigations?.[0];
+
+      if (!investigation || !investigation.agentId) {
+        return reply.status(200).send({ isSwarm: false });
+      }
+
+      const outerRun = await runService.findRunByAgentNearTime(
+        tenantId,
+        investigation.agentId,
+        new Date(investigation.startedAt)
+      );
+      if (!outerRun) {
+        return reply.status(200).send({ isSwarm: false });
+      }
+
+      const children = await runService.getSwarmChildRuns(tenantId, outerRun.id);
+      if (children.length === 0) {
+        return reply.status(200).send({ isSwarm: false });
+      }
+
+      return reply.status(200).send({
+        isSwarm: true,
+        run: {
+          id: outerRun.id,
+          agentId: outerRun.agent_id,
+          status: outerRun.status,
+          createdAt: outerRun.created_at,
+          completedAt: outerRun.completed_at
+        },
+        children: children.map((c: any) => ({
+          runId: c.id,
+          agentId: c.agent_id,
+          agentName: c.agent_name,
+          role: c.agent_role,
+          status: c.status,
+          userPrompt: c.user_prompt,
+          // Each worker/verifier/synthesizer's own final JSON payload
+          // (domainFinding/verifiedFindings/finding — see
+          // hermesAgentAdapter.ts's runSwarmInvestigation()), left as a raw
+          // string for the frontend to parse per-role rather than guessing a
+          // shared schema across three genuinely different JSON contracts.
+          finalResponse: c.final_response,
+          createdAt: c.created_at,
+          completedAt: c.completed_at,
+          toolExecutions: c.toolExecutions.map((te: any) => ({
+            toolName: te.tool_name,
+            status: te.status,
+            durationMs: te.duration_ms,
+            errorMessage: te.error_message,
+            createdAt: te.created_at
+          }))
+        }))
+      });
     }
   );
 

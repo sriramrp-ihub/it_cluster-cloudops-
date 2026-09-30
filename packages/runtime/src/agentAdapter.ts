@@ -29,7 +29,18 @@ export interface AgentSession {
 }
 
 export interface AgentEvent {
-  type: "STEP" | "OBSERVATION" | "EVIDENCE" | "ROOT_CAUSE" | "PROPOSAL" | "STATUS" | "ERROR";
+  /**
+   * "PROGRESS" (added for the live swarm/adaptive-stage progress feature —
+   * see packages/runtime/src/swarmProgressPoller.ts) is purely additive: it
+   * reports a tool call that has already been persisted to `tool_executions`
+   * by a still-in-flight `runHermesOneshotForProfile()`/`executeHermesInference()`
+   * call, so operators aren't staring at a static "Running" card for up to
+   * `swarmStageTimeoutMs`. It never replaces or redefines STEP/OBSERVATION —
+   * any consumer that doesn't know about "PROGRESS" (the historical
+   * swarm-trace view, older frontend builds) simply never receives it and
+   * keeps working exactly as before.
+   */
+  type: "STEP" | "OBSERVATION" | "EVIDENCE" | "ROOT_CAUSE" | "PROPOSAL" | "STATUS" | "ERROR" | "PROGRESS";
   sessionId: string;
   timestamp: Date;
   data: Record<string, unknown>;

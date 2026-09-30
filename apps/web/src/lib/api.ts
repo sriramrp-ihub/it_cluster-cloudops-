@@ -574,6 +574,51 @@ export async function fetchAccountWorkloads(
   return res.json();
 }
 
+// The shape of each section below mirrors its underlying canonical tool's
+// real response — including an `error`/`code` when that real AWS call
+// failed, or fields like `alarmState: "NO_LOAD_BALANCER"` when a metric
+// structurally can't exist for this service. Sections are typed loosely
+// (Record<string, any>) rather than fully modeled, since this view only
+// ever passes them straight through for display.
+export interface EcsServiceDetail {
+  cluster: string;
+  service: string;
+  region: string;
+  serviceDetail: Record<string, any>;
+  taskDefinition: Record<string, any>;
+  tasks: Record<string, any>;
+  targetHealth: Record<string, any>;
+  metrics: { cpu: Record<string, any>; memory: Record<string, any> };
+  imageCheck: Record<string, any>;
+  fetchedAt: string;
+}
+
+export async function fetchEcsServiceDetail(
+  accountId: string,
+  cluster: string,
+  service: string,
+  region?: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<EcsServiceDetail> {
+  const url = new URL(`${API_BASE}/v1/cloud-accounts/${accountId}/ecs-service-detail`);
+  url.searchParams.set("cluster", cluster);
+  url.searchParams.set("service", service);
+  if (region) url.searchParams.set("region", region);
+
+  const res = await fetch(url.toString(), {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
 export interface IncidentItem {
   id: string;
   tenantId: string;
@@ -657,6 +702,61 @@ export async function fetchInvestigation(
   operatorId?: string
 ): Promise<any> {
   const res = await fetch(`${API_BASE}/v1/investigations/${investigationId}`, {
+    headers: getAuthHeaders(tenantId, operatorId),
+    cache: "no-store"
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+/** ADR-0007 Phase C1b: one node in a post-hoc swarm topology trace. */
+export interface SwarmTraceChild {
+  runId: string;
+  agentId: string;
+  agentName: string;
+  role: "generalist" | "investigator" | "verifier" | "synthesizer";
+  status: string;
+  userPrompt: string;
+  /** Raw JSON string of that stage's own output shape — parse per-role. */
+  finalResponse: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  toolExecutions: Array<{
+    toolName: string;
+    status: string;
+    durationMs: number | null;
+    errorMessage: string | null;
+    createdAt: string;
+  }>;
+}
+
+export type SwarmTraceResponse =
+  | { isSwarm: false }
+  | {
+      isSwarm: true;
+      run: { id: string; agentId: string; status: string; createdAt: string; completedAt: string | null };
+      children: SwarmTraceChild[];
+    };
+
+/**
+ * Read-only, post-hoc swarm topology data for a past (or in-progress)
+ * investigation — the historical counterpart to the live SSE stream's
+ * `mode: "swarm"` events. Always resolves 200 with `{isSwarm: false}` for
+ * the overwhelming majority of (non-swarm) investigations rather than
+ * throwing — callers should treat that as "render the ordinary flat step
+ * list", not as an error.
+ */
+export async function fetchSwarmTrace(
+  investigationId: string,
+  tenantId?: string,
+  operatorId?: string
+): Promise<SwarmTraceResponse> {
+  const res = await fetch(`${API_BASE}/v1/investigations/${investigationId}/swarm-trace`, {
     headers: getAuthHeaders(tenantId, operatorId),
     cache: "no-store"
   });

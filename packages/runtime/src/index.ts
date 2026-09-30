@@ -15,6 +15,7 @@ export * from "./agentAdapterFactory.js";
 export * from "./hermesProfileService.js";
 export * from "./swarmRouting.js";
 export * from "./swarmRunTrace.js";
+export * from "./swarmProgressPoller.js";
 
 export interface RuntimeAdapter {
   readonly runtimeType: string;

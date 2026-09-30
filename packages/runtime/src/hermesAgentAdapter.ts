@@ -18,7 +18,8 @@ import {
   sanitizeLogString
 } from "@cloudops/shared";
 import { resolveSwarmParticipants, type SwarmEligibility, type SwarmParticipant } from "./swarmRouting.js";
-import { createSwarmChildRun, completeSwarmChildRun } from "./swarmRunTrace.js";
+import { createSwarmChildRun, completeSwarmChildRun, listToolExecutionsForRun } from "./swarmRunTrace.js";
+import { startSwarmProgressPolling, type SwarmProgressPollHandle } from "./swarmProgressPoller.js";
 
 export function cleanLlmOutput(output: string): string {
   return output
@@ -81,6 +82,109 @@ export function extractJsonFromLlmOutput(output: string): any {
   return null;
 }
 
+/**
+ * Bug-fix (investigate/page.tsx's "Human Authorization: Required" prompt
+ * rendering for benign findings): every investigation tier below asks its
+ * LLM to pick a "remediationTool" even when the honest answer is "nothing
+ * is wrong" — each tier's own prompt explicitly offers a read-only tool
+ * for exactly that case (e.g. "aws_ecs_describe_services: Use if no
+ * failure is detected (informational only)"). Before this fix, all three
+ * tiers built an identical `recommendedRemediation` object regardless of
+ * which kind of tool got chosen, so the UI had no way to distinguish "here
+ * is an action that needs your approval" from "here is the read-only call
+ * that confirmed nothing needs fixing" — both looked identical downstream.
+ *
+ * This classifies whether the chosen tool is an actual mutating action, so
+ * callers can set `recommendedRemediation.actionNeeded` authoritatively
+ * (never trusting the LLM's own free-form JSON for this). Mirrors
+ * `packages/tools/src/registry.ts`'s own `CANONICAL_TOOLS` operationType
+ * convention (verified by inspection: every READ_ONLY tool name there
+ * contains "describe"/"list"/"get", every MUTATION/DEPLOY tool this file's
+ * prompts ever offer as a remediation candidate contains
+ * "rollback"/"update") rather than importing that registry directly —
+ * `packages/tools` already depends on `@cloudops/runtime`, so the reverse
+ * import would be circular.
+ */
+export function isMutatingRemediationTool(toolName: string): boolean {
+  const name = toolName.toLowerCase();
+  if (name.includes("describe") || name.includes("list") || name.includes("get_")) {
+    return false;
+  }
+  return true;
+}
+
+/** Honest verification tiers a completed investigation can report. Only the
+ * swarm tier (runSwarmInvestigation) ever runs an independent verifier
+ * stage — "verified"/"flagged" are its two real outcomes, taken directly
+ * from that stage's own already-computed `gate` (never re-derived here).
+ * The adaptive and fixed-script tiers have no separate verification step at
+ * all (a single LLM call, or a single grounded heuristic script, produces
+ * the whole finding) so they are ALWAYS "unverified" — never inferred as
+ * "verified" just because confidence happens to be high. */
+export type VerificationStatus = "verified" | "flagged" | "unverified";
+
+/**
+ * [PROPOSED — CloudOps-specific synthesis, not a documented claim that any
+ * competitor implements this exact ladder] A short, honest, qualitative
+ * label layered on top of the raw confidence score + verification status,
+ * following the *shape* of incident.io's documented graded-confidence
+ * pattern (a ladder of qualifiers, not a bare percentage presented as
+ * equally certain every time) — adapted to what this pipeline actually
+ * computes: verification status (verified/flagged/unverified) crossed with
+ * the numeric confidence score. This does NOT reproduce incident.io's exact
+ * 5-rung ladder (Speculation / Pattern match / Supported by context /
+ * Validated by system state / Validated, alternatives ruled out) — CloudOps
+ * has no signal to distinguish most of those rungs from each other, so
+ * inventing them would be fabricating certainty this pipeline doesn't have.
+ *
+ * Threshold reasoning (judgment calls, stated plainly):
+ *   - LOW_CONFIDENCE = 0.5: below coin-flip odds, the model itself isn't
+ *     sure — the natural line for "genuinely inconclusive" regardless of
+ *     which tier produced it or whether the swarm verifier found the
+ *     workers internally consistent. A verifier can corroborate two workers
+ *     that are both just guessing.
+ *   - HIGH_CONFIDENCE = 0.85: reuses a value already meaningful in this
+ *     file — line ~1105/~1348's own fallback default confidence for a
+ *     successful swarm/adaptive parse ("0.85 if the LLM didn't return a
+ *     number") — as the bar for "no meaningful doubt", rather than
+ *     inventing an unrelated cutoff.
+ *   - "heavily flagged" = 2 or more distinct flaggedInconsistencies: a
+ *     single flagged discrepancy (e.g. the real observed 2/2-vs-1/1 task
+ *     count case) is one noisy data point the synthesizer can still reason
+ *     about; two or more independent contradictions is a pattern, not
+ *     noise, so it's folded into "Inconclusive" even if the numeric
+ *     confidence score alone would have cleared 0.5.
+ */
+export function deriveConfidenceLabel(
+  confidence: number,
+  verificationStatus: VerificationStatus,
+  flaggedInconsistencies: string[]
+): string {
+  const LOW_CONFIDENCE = 0.5;
+  const HIGH_CONFIDENCE = 0.85;
+
+  if (confidence < LOW_CONFIDENCE) {
+    return "Inconclusive — confidence too low to act on";
+  }
+
+  if (verificationStatus === "flagged") {
+    if (flaggedInconsistencies.length >= 2) {
+      return `Inconclusive — ${flaggedInconsistencies.length} independent inconsistencies flagged`;
+    }
+    return "Supported by evidence — one inconsistency noted";
+  }
+
+  if (verificationStatus === "verified") {
+    return confidence >= HIGH_CONFIDENCE
+      ? "Validated — no contradictions found"
+      : "Validated — supported by verified evidence";
+  }
+
+  // "unverified": adaptive/fixed-script tiers, honestly, always — never
+  // upgraded to "verified" just because confidence is high.
+  return "Single-agent assessment — not independently verified";
+}
+
 export interface HermesAgentConfig {
   endpoint?: string | undefined;
   sessionToken?: string | undefined;
@@ -97,10 +201,39 @@ export interface HermesAgentConfig {
    * oneshot inference + complete) for each swarm worker/verifier/synthesizer
    * task. Any stage that doesn't complete within this budget is a clean
    * failure that falls through to the adaptive tier — never a silent hang.
-   * Defaults to 90s per the design's own sizing rationale (generous enough
-   * for a real tool-calling turn, small enough to bound worst-case latency).
+   *
+   * Raised from the original 90s to 180s, grounded in real timing data
+   * queried from this session's own `runs` table (every swarm sub-run is
+   * `parent_run_id IS NOT NULL`), not a guess:
+   *   - Every observed 90s-bucket FAILED sub-run (5 of them) died at almost
+   *     exactly 90.4s — the `execFile` timeout-kill signature — while already
+   *     mid-flight on 4 to 8 real tool calls (e.g. one had called
+   *     aws_ecs_describe_services, 5x aws_cloudwatch_get_metric_data,
+   *     aws_ecs_describe_task_definition_config, and
+   *     aws_ecs_describe_stopped_tasks before being killed) — genuinely
+   *     thorough exploration that the old 90s budget cut off mid-work, not a
+   *     hang.
+   *   - The longest sub-run that ever actually COMPLETED successfully within
+   *     the old 90s budget took 70.1s; the longest completed MULTI-tool
+   *     investigator specifically took 56.9s across 3 tool calls (one took
+   *     54.8s across 5 tool calls).
+   * 180s gives roughly 2x the old budget — comfortably above every real
+   * completed duration observed (max 70.1s) while giving the workers that
+   * were previously cut off mid-exploration real room to finish — while
+   * still bounding worst-case per-stage latency rather than leaving it
+   * unbounded.
    */
   swarmStageTimeoutMs?: number | undefined;
+  /**
+   * ADR-0007 Phase C1b: how often (ms) an in-flight swarm worker/verifier/
+   * synthesizer oneshot call (or the adaptive tier's single oneshot call) is
+   * polled for newly-persisted `tool_executions` rows, surfaced live as
+   * "PROGRESS" events (see `swarmProgressPoller.ts`). This is a live UX
+   * feature, not a tight loop — defaults to 2.5s, comfortably inside the
+   * 2-3s range that keeps the DB unbothered while still feeling live.
+   * Injectable purely for fast, deterministic tests.
+   */
+  swarmProgressPollIntervalMs?: number | undefined;
   /**
    * ADR-0007 Phase C1b: swarm-eligibility resolver, injectable for tests
    * (defaults to the real `resolveSwarmParticipants`, which hits the real DB
@@ -140,6 +273,8 @@ export class HermesAgentAdapter implements AgentAdapter {
   public hermesProfileName?: string | undefined;
   /** ADR-0007 Phase C1b: see HermesAgentConfig.swarmStageTimeoutMs. */
   private readonly swarmStageTimeoutMs: number;
+  /** ADR-0007 Phase C1b: see HermesAgentConfig.swarmProgressPollIntervalMs. */
+  private readonly swarmProgressPollIntervalMs: number;
   /** ADR-0007 Phase C1b: see HermesAgentConfig.resolveSwarmEligibility. */
   private readonly resolveSwarmEligibility: (tenantId: string) => Promise<SwarmEligibility>;
 
@@ -160,7 +295,8 @@ export class HermesAgentAdapter implements AgentAdapter {
     this.activeModel = config.model;
     this.activeProvider = config.provider;
     this.hermesProfileName = config.hermesProfileName;
-    this.swarmStageTimeoutMs = config.swarmStageTimeoutMs ?? 90000;
+    this.swarmStageTimeoutMs = config.swarmStageTimeoutMs ?? 180000;
+    this.swarmProgressPollIntervalMs = config.swarmProgressPollIntervalMs ?? 2500;
     this.resolveSwarmEligibility = config.resolveSwarmEligibility || resolveSwarmParticipants;
   }
 
@@ -504,6 +640,49 @@ export class HermesAgentAdapter implements AgentAdapter {
   }
 
   /**
+   * ADR-0007 Phase C1b: wires `swarmProgressPoller.ts`'s generic polling loop
+   * to this adapter's own `listToolExecutionsForRun` read and `emitEvent`
+   * write, for one specific stage (a swarm worker/verifier/synthesizer, or
+   * the adaptive tier's single oneshot call). Callers MUST wrap exactly the
+   * oneshot call being observed in `try { ... } finally { stopProgress(); }`
+   * — `stop()` is what guarantees no dangling `setInterval` once that call
+   * resolves, whether by success, timeout, or any other failure.
+   *
+   * `runId` is `null`/`undefined`-safe (see `startSwarmProgressPolling`): a
+   * failed `createSwarmChildRun` (fails soft, returns `null`) or a
+   * `runId`-less adaptive-tier call simply means no polling happens, never a
+   * thrown error.
+   */
+  private startProgressPolling(
+    sessionId: string,
+    stepNum: number,
+    toolLabel: string,
+    runId: string | null | undefined
+  ): SwarmProgressPollHandle {
+    return startSwarmProgressPolling({
+      runId,
+      intervalMs: this.swarmProgressPollIntervalMs,
+      fetchRows: (id) => listToolExecutionsForRun(id),
+      onNewRow: (row) => {
+        this.emitEvent(sessionId, {
+          type: "PROGRESS",
+          sessionId,
+          timestamp: new Date(),
+          data: {
+            step: stepNum,
+            toolName: toolLabel,
+            calledTool: row.toolName,
+            status: row.status
+          }
+        });
+      },
+      onError: (err) => {
+        logger.warn({ err, sessionId, runId, toolLabel }, "Swarm/adaptive progress poll tick failed (non-fatal)");
+      }
+    });
+  }
+
+  /**
    * Runs one oneshot Hermes inference turn against an EXPLICIT profile,
    * independent of `this.hermesProfileName` — unlike `executeHermesInference()`
    * (which reads that shared instance field), swarm workers run genuinely in
@@ -597,15 +776,21 @@ export class HermesAgentAdapter implements AgentAdapter {
    * part of that evaluation — it only decided WHICH already-governed profile
    * got assigned to WHICH slot in the graph.
    *
-   * Worker split mirrors the pre-swarm fixed 3-step script's own tool
-   * choices — aws_ecs_describe_services / aws_cloudwatch_get_metric_data /
-   * aws_ecs_describe_stopped_tasks — now genuinely parallel (Promise.all)
-   * and independently verified by a dedicated verifier stage before the
-   * synthesizer ever sees them. When fewer than 3 'investigator' agents are
-   * available, the 3 fixed tool assignments cycle through whichever
-   * investigator profiles ARE available (a swarm worker card is just
-   * PROFILE:TITLE — nothing prevents the same profile from holding two
-   * worker cards with different titles/tools).
+   * Worker split: ONE worker card per real, freshly-governed 'investigator'
+   * agent (no cycling a single agent across multiple fixed tool-slots the
+   * way this used to work) — each given the SAME incident and an
+   * investigative ANGLE/title (a framing lens, e.g. "Service health
+   * investigation"), never a pre-assigned tool. Which tool(s) it calls, if
+   * any, to answer that angle is entirely the worker's own Hermes
+   * tool-calling loop's decision against whatever its governed profile's MCP
+   * registration exposes (see resolveAuthorizedCapabilities.ts) — a worker
+   * may call zero, one, or several tools, and two workers may legitimately
+   * converge on the same tool or diverge entirely depending on what they
+   * find. This mirrors runAdaptiveInvestigation()'s own free-form design,
+   * just run N times in parallel under different framings instead of once.
+   * Workers run genuinely in parallel (Promise.all) and are independently
+   * verified by a dedicated verifier stage before the synthesizer ever sees
+   * them.
    *
    * The synthesizer's final output is parsed via the exact same
    * `extractJsonFromLlmOutput()` used everywhere else in this file, against
@@ -660,27 +845,33 @@ export class HermesAgentAdapter implements AgentAdapter {
 
     const goal = `Investigate ECS service health incident. Service="${targetService}" Cluster="${targetCluster}" Region="${targetRegion}". Alert: ${alertDescription}`;
 
-    const workerToolPlan: Array<{ tool: string; title: string; instruction: string }> = [
-      {
-        tool: "aws_ecs_describe_services",
-        title: "Investigate ECS service status",
-        instruction: `Call the "aws_ecs_describe_services" tool for service "${targetService}" in cluster "${targetCluster}" (region "${targetRegion}") and assess baseline service health (desired/running/pending task counts, deployment rollout state).`
-      },
-      {
-        tool: "aws_cloudwatch_get_metric_data",
-        title: "Investigate correlated CloudWatch metrics",
-        instruction: `Call the "aws_cloudwatch_get_metric_data" tool for service "${targetService}" in cluster "${targetCluster}" (region "${targetRegion}") and check for a correlated metric anomaly (e.g. 5xx spike).`
-      },
-      {
-        tool: "aws_ecs_describe_stopped_tasks",
-        title: "Investigate recently stopped tasks",
-        instruction: `Call the "aws_ecs_describe_stopped_tasks" tool for service "${targetService}" in cluster "${targetCluster}" (region "${targetRegion}") and inspect recently stopped tasks for a concrete container-level failure signal.`
-      }
+    // Investigative ANGLES — a framing/lens for the kanban card's human-
+    // readable title, never a tool assignment (see class doc comment above).
+    // Cycled (with a disambiguating suffix) only if there are more real
+    // investigator agents than predefined angles, so titles stay unique
+    // regardless of fleet size.
+    const INVESTIGATION_ANGLES = [
+      "Service health investigation",
+      "Traffic and error-rate investigation",
+      "Recent failure investigation",
+      "Resource and scaling investigation",
+      "Image and deployment investigation",
+      "Networking and connectivity investigation"
     ];
-    const workerAssignments = workerToolPlan.map((plan, idx) => ({
-      ...plan,
-      participant: swarm.investigators[idx % swarm.investigators.length]!
-    }));
+    const angleTitleForIndex = (idx: number): string => {
+      const base = INVESTIGATION_ANGLES[idx % INVESTIGATION_ANGLES.length]!;
+      const cycle = Math.floor(idx / INVESTIGATION_ANGLES.length);
+      return cycle === 0 ? base : `${base} (${cycle + 1})`;
+    };
+    const slugifyTitle = (title: string): string =>
+      title.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+    // One worker card per real, freshly-governed investigator agent — no
+    // cycling a single agent across multiple fixed tool-slots.
+    const workerAssignments = swarm.investigators.map((participant, idx) => {
+      const title = angleTitleForIndex(idx);
+      return { title, slug: slugifyTitle(title), participant };
+    });
 
     const kanbanArgs = [
       "swarm",
@@ -712,29 +903,59 @@ export class HermesAgentAdapter implements AgentAdapter {
     }
 
     // ── Worker stage: genuinely parallel (Promise.all), each independently
-    // claimed/run/completed against its own profile and its own tool. ──────
+    // claimed/run/completed against its own profile, freely picking its own
+    // tool(s) (zero, one, or several) via its own Hermes tool-calling loop —
+    // this TypeScript process only supplies the incident + angle framing,
+    // never a tool name. ─────────────────────────────────────────────────
     let stepCursor = 2;
     const workerResults = await Promise.all(
       workerAssignments.map(async (assignment, idx) => {
         const taskId: string = topology.worker_ids[idx];
         const stepNum = stepCursor + idx;
+        // The STEP/OBSERVATION toolName for a dynamic worker can't be a real
+        // tool name (unknown until the worker decides, possibly after
+        // calling several) — SwarmTopologyView.tsx keys/merges a worker node
+        // on the string after "swarm_investigator:", so it must be a STABLE
+        // identifier known up front and IDENTICAL across both events. The
+        // slugified angle title serves that role; which tool(s) were
+        // actually called is surfaced in the OBSERVATION's own text instead
+        // (see below) — no UI contract change, just what the label means.
+        const workerToolLabel = `swarm_investigator:${assignment.slug}`;
         this.emitEvent(sessionId, {
           type: "STEP",
           sessionId,
           timestamp: new Date(),
           data: {
             step: stepNum,
-            toolName: `swarm_investigator:${assignment.tool}`,
+            toolName: workerToolLabel,
             status: "running",
             assignee: assignment.participant.agentId
           }
         });
 
+        const workerPrompt = `You are a CloudOps swarm investigation worker. Your assigned investigative lens is: "${assignment.title}".
+
+Incident to investigate:
+- Service: "${targetService}"
+- Cluster: "${targetCluster}"
+- Region: "${targetRegion}"
+- Alert: ${alertDescription}
+
+Using whatever diagnostic tools are available to you that you judge relevant to this lens, investigate this incident and reach a finding. You may call zero, one, or several tools, in whatever order you judge best — there is no required tool and no required number of calls. Other workers are investigating this same incident through different lenses in parallel; it's fine (expected, even) if you end up calling the same tool as another worker, or a completely different one — call only what actually helps you answer YOUR lens. Do not call any remediation or mutation tool — root-cause synthesis and remediation choice happen in a later stage, not here.
+
+Once you are done — this must be your FINAL message, after you've finished calling any tools you needed — respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
+{
+  "domainFinding": "<concise 1-2 sentence finding from your investigation>",
+  "evidence": "<the concrete data point(s) that support this finding, or null if you found none>",
+  "toolsUsed": ["<name of each tool you actually called, in the order you called them — an empty array if you reached your finding without needing one>"],
+  "narrative": "<one short sentence describing what you did and learned>"
+}`;
+
         const childRunId = await createSwarmChildRun({
           tenantId: session.tenantId,
           agentId: assignment.participant.agentId,
           parentRunId,
-          userPrompt: assignment.instruction
+          userPrompt: workerPrompt
         });
 
         try {
@@ -744,20 +965,20 @@ export class HermesAgentAdapter implements AgentAdapter {
             throw new Error(`Failed to claim swarm worker task ${taskId}: ${claim.stdout || claim.stderr}`);
           }
 
-          const workerPrompt = `You are a CloudOps swarm investigation worker. ${assignment.instruction}
-
-Once you are done — this must be your FINAL message, after you've finished calling the tool — respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
-{
-  "domainFinding": "<concise 1-2 sentence finding from this specific tool call>",
-  "evidence": "<the concrete data point(s) that support this finding>",
-  "narrative": "<one short sentence describing what you did and learned>"
-}`;
-
-          const rawOutput = await this.runHermesOneshotForProfile(assignment.participant.hermesProfileName, workerPrompt, stageTimeoutMs);
+          const stopProgress = this.startProgressPolling(sessionId, stepNum, workerToolLabel, childRunId);
+          let rawOutput: string;
+          try {
+            rawOutput = await this.runHermesOneshotForProfile(assignment.participant.hermesProfileName, workerPrompt, stageTimeoutMs);
+          } finally {
+            stopProgress.stop();
+          }
           const parsed = extractJsonFromLlmOutput(rawOutput);
           if (!parsed || typeof parsed.domainFinding !== "string") {
-            throw new Error(`Swarm worker ${taskId} (${assignment.tool}) returned unparseable output`);
+            throw new Error(`Swarm worker ${taskId} (${assignment.title}) returned unparseable output`);
           }
+          const toolsUsed: string[] = Array.isArray(parsed.toolsUsed)
+            ? parsed.toolsUsed.filter((t: unknown): t is string => typeof t === "string" && t.trim().length > 0)
+            : [];
 
           await this.runKanbanCli([
             "complete",
@@ -768,20 +989,27 @@ Once you are done — this must be your FINAL message, after you've finished cal
             String(parsed.domainFinding).slice(0, 200)
           ]);
 
+          const toolsUsedSuffix = toolsUsed.length > 0 ? ` [tool(s) used: ${toolsUsed.join(", ")}]` : " [reached finding without calling a tool]";
           this.emitEvent(sessionId, {
             type: "OBSERVATION",
             sessionId,
             timestamp: new Date(),
             data: {
               step: stepNum,
-              toolName: `swarm_investigator:${assignment.tool}`,
-              observation: parsed.domainFinding,
+              toolName: workerToolLabel,
+              observation: `${parsed.domainFinding}${toolsUsedSuffix}`,
               evidence: parsed.evidence
             }
           });
 
           await completeSwarmChildRun(childRunId, "COMPLETED", JSON.stringify(parsed));
-          return { tool: assignment.tool, ...parsed } as { tool: string; domainFinding: string; evidence?: unknown; narrative?: string };
+          return { title: assignment.title, toolsUsed, ...parsed } as {
+            title: string;
+            toolsUsed: string[];
+            domainFinding: string;
+            evidence?: unknown;
+            narrative?: string;
+          };
         } catch (err: any) {
           await completeSwarmChildRun(childRunId, "FAILED", err?.message || String(err));
           throw err;
@@ -806,6 +1034,10 @@ Once you are done — this must be your FINAL message, after you've finished cal
     });
 
     let verifierParsed: any;
+    // Hoisted out of the try block so the rootCause construction below can
+    // reuse this stage's ALREADY-COMPUTED gate verbatim — never re-derive or
+    // guess it from verifierParsed a second time.
+    let verifierGate: "pass" | "flagged" = "pass";
     try {
       await this.waitForKanbanTaskReady(topology.verifier_id, stageTimeoutMs);
       const verifierClaim = await this.runKanbanCli(["claim", topology.verifier_id]);
@@ -815,29 +1047,35 @@ Once you are done — this must be your FINAL message, after you've finished cal
 
       const verifierPrompt = `You are a CloudOps swarm investigation verifier. Review the following worker findings for incident: ${goal}
 
-${workerResults.map((w, i) => `Worker ${i + 1} (${w.tool}): finding="${w.domainFinding}" evidence=${JSON.stringify(w.evidence ?? null)}`).join("\n")}
+${workerResults.map((w, i) => `Worker ${i + 1} (lens: "${w.title}", tool(s) used: ${w.toolsUsed.length > 0 ? w.toolsUsed.join(", ") : "none"}): finding="${w.domainFinding}" evidence=${JSON.stringify(w.evidence ?? null)}`).join("\n")}
 
-Cross-check these findings against each other for consistency. Once done, respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
+Judge each finding on its own merits — whether it's plausible given the tool(s) (if any) that produced it and consistent with the other workers' findings — not against any expectation of which tools should have been used or how many findings there should be. Cross-check these findings against each other for consistency. Once done, respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
 {
   "verifiedFindings": ["<each worker finding you consider corroborated>"],
   "flaggedInconsistencies": ["<any contradiction or unsupported claim you found, empty array if none>"],
   "overallConfidence": <number between 0.0 and 1.0>
 }`;
 
-      const verifierRaw = await this.runHermesOneshotForProfile(swarm.verifier.hermesProfileName, verifierPrompt, stageTimeoutMs);
+      const stopVerifierProgress = this.startProgressPolling(sessionId, stepCursor, "swarm_verifier", verifierChildRunId);
+      let verifierRaw: string;
+      try {
+        verifierRaw = await this.runHermesOneshotForProfile(swarm.verifier.hermesProfileName, verifierPrompt, stageTimeoutMs);
+      } finally {
+        stopVerifierProgress.stop();
+      }
       verifierParsed = extractJsonFromLlmOutput(verifierRaw);
       if (!verifierParsed || !Array.isArray(verifierParsed.verifiedFindings)) {
         throw new Error(`Swarm verifier ${topology.verifier_id} returned unparseable output`);
       }
 
-      const gate = (verifierParsed.flaggedInconsistencies?.length ?? 0) === 0 ? "pass" : "flagged";
+      verifierGate = (verifierParsed.flaggedInconsistencies?.length ?? 0) === 0 ? "pass" : "flagged";
       await this.runKanbanCli([
         "complete",
         topology.verifier_id,
         "--result",
         JSON.stringify(verifierParsed),
         "--metadata",
-        JSON.stringify({ gate })
+        JSON.stringify({ gate: verifierGate })
       ]);
 
       this.emitEvent(sessionId, {
@@ -847,7 +1085,7 @@ Cross-check these findings against each other for consistency. Once done, respon
         data: {
           step: stepCursor,
           toolName: "swarm_verifier",
-          observation: `Verifier reviewed ${workerResults.length} worker finding(s); overallConfidence=${verifierParsed.overallConfidence}; gate=${gate}.`
+          observation: `Verifier reviewed ${workerResults.length} worker finding(s); overallConfidence=${verifierParsed.overallConfidence}; gate=${verifierGate}.`
         }
       });
 
@@ -885,8 +1123,8 @@ Cross-check these findings against each other for consistency. Once done, respon
 
       const synthesizerPrompt = `You are the CloudOps swarm investigation synthesizer, producing the FINAL result for incident: ${goal}
 
-Verified worker findings:
-${workerResults.map((w, i) => `Worker ${i + 1} (${w.tool}): "${w.domainFinding}" (evidence: ${JSON.stringify(w.evidence ?? null)})`).join("\n")}
+Verified worker findings (each worker investigated through its own lens, freely choosing its own tool(s) — do not assume any fixed set or count of tools or domains was covered):
+${workerResults.map((w, i) => `Worker ${i + 1} (lens: "${w.title}", tool(s) used: ${w.toolsUsed.length > 0 ? w.toolsUsed.join(", ") : "none"}): "${w.domainFinding}" (evidence: ${JSON.stringify(w.evidence ?? null)})`).join("\n")}
 
 Verifier assessment: verifiedFindings=${JSON.stringify(verifierParsed.verifiedFindings)}, flaggedInconsistencies=${JSON.stringify(verifierParsed.flaggedInconsistencies)}, overallConfidence=${verifierParsed.overallConfidence}
 
@@ -908,7 +1146,13 @@ Synthesize the root cause and choose the safest remediation action. Respond with
   "investigationNarrative": ["<one short sentence per worker/verifier step, in order>"]
 }`;
 
-      const synthRaw = await this.runHermesOneshotForProfile(swarm.synthesizer.hermesProfileName, synthesizerPrompt, stageTimeoutMs);
+      const stopSynthProgress = this.startProgressPolling(sessionId, stepCursor, "swarm_synthesizer", synthesizerChildRunId);
+      let synthRaw: string;
+      try {
+        synthRaw = await this.runHermesOneshotForProfile(swarm.synthesizer.hermesProfileName, synthesizerPrompt, stageTimeoutMs);
+      } finally {
+        stopSynthProgress.stop();
+      }
       parsed = extractJsonFromLlmOutput(synthRaw);
       if (!parsed || !parsed.finding || !parsed.rootCause) {
         throw new Error("Swarm synthesizer did not return a parseable finding/rootCause JSON response");
@@ -963,6 +1207,14 @@ Synthesize the root cause and choose the safest remediation action. Respond with
     });
 
     const evidenceCollected = session.evidenceCollected || [];
+    // Real signal already computed by the verifier stage above — reused
+    // verbatim here, never re-derived or guessed. Only the swarm tier ever
+    // runs an independent verifier, so "verified"/"flagged" only ever
+    // appear here (see deriveConfidenceLabel's doc comment).
+    const verificationStatus: VerificationStatus = verifierGate === "pass" ? "verified" : "flagged";
+    const flaggedInconsistencies: string[] = Array.isArray(verifierParsed?.flaggedInconsistencies)
+      ? verifierParsed.flaggedInconsistencies.filter((s: unknown): s is string => typeof s === "string")
+      : [];
     const rootCause = {
       finding,
       rootCause: rootCauseText,
@@ -971,11 +1223,19 @@ Synthesize the root cause and choose the safest remediation action. Respond with
       citedRunbooks: [],
       affectedResources: [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
       dataSource: `live:${this.adapterType}:swarm`,
+      verificationStatus,
+      flaggedInconsistencies,
+      confidenceLabel: deriveConfidenceLabel(confidence, verificationStatus, flaggedInconsistencies),
+      // See isMutatingRemediationTool's doc comment: actionNeeded is false
+      // whenever the synthesizer's chosen "remediation" is actually a
+      // read-only confirmation call, i.e. the honest finding is "nothing
+      // to fix".
       recommendedRemediation: {
         toolName: remediationToolName,
         parameters: remediationParams,
         riskLevel,
-        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL"
+        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL",
+        actionNeeded: isMutatingRemediationTool(remediationToolName)
       }
     };
 
@@ -1116,7 +1376,7 @@ Incident:
 - Region: "${targetRegion}"
 - Alert: ${incidentContext?.alertDescription || "ECS service health anomaly"}
 
-Investigate this incident using your available tools — check service health, correlated metrics, and recent task/container failures as you judge relevant, in whatever order and however many calls you need. Once you have enough evidence, synthesize the root cause and choose the safest remediation action.
+Investigate this incident using whatever tools are available to you — there is no fixed checklist or required order. Decide for yourself which tool(s), if any, are relevant (service state, metrics, logs, load balancer/target health, recent task or image failures, or anything else available to you), and call as many or as few as you judge necessary. Once you have enough evidence, synthesize the root cause and choose the safest remediation action.
 
 Available remediation tools:
 - "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
@@ -1141,7 +1401,27 @@ Once you are done investigating — this must be your FINAL message, after you'v
     // (30s) — bounded by HermesProfileService's own GOVERNED_MAX_TURNS cap
     // on the profile, not by this timeout, but the timeout still has to be
     // generous enough to let a legitimate multi-tool investigation finish.
-    const rawOutput = await this.executeHermesInference(prompt, 120000);
+    //
+    // Same live-progress treatment as the swarm tier's oneshot calls (see
+    // startProgressPolling's doc comment): this call can run just as long
+    // against real AWS tool calls, and `incidentContext.runId` (the outer
+    // investigation's own run id, already threaded through by
+    // investigations.ts before runInvestigation() is even called) is the
+    // exact run id CloudOpsMcpServer's tool-call handler attributes each of
+    // THIS call's tool executions to (via RunService.findActiveRunId) — no
+    // extra plumbing needed to make this fit here.
+    const stopAdaptiveProgress = this.startProgressPolling(
+      sessionId,
+      1,
+      "hermes_adaptive_investigation",
+      incidentContext?.runId
+    );
+    let rawOutput: string;
+    try {
+      rawOutput = await this.executeHermesInference(prompt, 120000);
+    } finally {
+      stopAdaptiveProgress.stop();
+    }
     const parsed = extractJsonFromLlmOutput(rawOutput);
 
     if (!parsed || !parsed.finding || !parsed.rootCause) {
@@ -1219,6 +1499,12 @@ Once you are done investigating — this must be your FINAL message, after you'v
     // stays whatever it already was (typically empty for an adaptive run).
     const evidenceCollected = session.evidenceCollected || [];
 
+    // The adaptive tier is a single LLM call with no separate independent
+    // verification stage — always "unverified", honestly, never inferred as
+    // "verified" from a high confidence score.
+    const verificationStatus: VerificationStatus = "unverified";
+    const flaggedInconsistencies: string[] = [];
+
     const rootCause = {
       finding,
       rootCause: rootCauseText,
@@ -1227,11 +1513,18 @@ Once you are done investigating — this must be your FINAL message, after you'v
       citedRunbooks: [],
       affectedResources: [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
       dataSource: `live:${this.adapterType}:${effectiveModel}:adaptive`,
+      verificationStatus,
+      flaggedInconsistencies,
+      confidenceLabel: deriveConfidenceLabel(confidence, verificationStatus, flaggedInconsistencies),
+      // See isMutatingRemediationTool's doc comment: actionNeeded is false
+      // whenever the "remediation" is actually a read-only confirmation
+      // call, i.e. the honest finding is "nothing to fix".
       recommendedRemediation: {
         toolName: remediationToolName,
         parameters: remediationParams,
         riskLevel,
-        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL"
+        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL",
+        actionNeeded: isMutatingRemediationTool(remediationToolName)
       }
     };
 
@@ -1732,6 +2025,13 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
       }
     }
 
+    // The fixed-script path is either a single grounded-heuristics script or
+    // (when live inference is available) a single LLM call — no separate
+    // independent verification stage either way. Always "unverified",
+    // honestly, same as the adaptive tier.
+    const verificationStatus: VerificationStatus = "unverified";
+    const flaggedInconsistencies: string[] = [];
+
     const rootCause = {
       finding,
       rootCause: rootCauseText,
@@ -1742,11 +2042,21 @@ Respond strictly with valid JSON conforming to this schema (no markdown, no back
         ? [svc.serviceArn]
         : [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
       dataSource,
+      verificationStatus,
+      flaggedInconsistencies,
+      confidenceLabel: deriveConfidenceLabel(confidence, verificationStatus, flaggedInconsistencies),
+      // actionNeeded: false means the chosen "remediation" tool is actually
+      // a read-only inspection call (see isMutatingRemediationTool) — i.e.
+      // the honest outcome of this investigation is "nothing to fix", not
+      // a placeholder mutation the UI should ever present as needing
+      // authorization. requiresApproval stays derived from riskLevel alone
+      // (never from the LLM's own JSON output), same as before this fix.
       recommendedRemediation: {
         toolName: remediationToolName,
         parameters: remediationParams,
         riskLevel,
-        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL"
+        requiresApproval: riskLevel === "HIGH" || riskLevel === "CRITICAL",
+        actionNeeded: isMutatingRemediationTool(remediationToolName)
       }
     };
 

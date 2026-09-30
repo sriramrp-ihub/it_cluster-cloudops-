@@ -122,6 +122,18 @@ describe("HermesAgentAdapter adaptive investigation loop (ADR-0008 Phase B)", ()
 
     expect(result.status).toBe("COMPLETED");
     expect((result.rootCause as any).finding).toBe("Service is healthy");
+    // Bug fix: a healthy, LOW-risk finding whose "remediation" is really
+    // just the read-only aws_ecs_describe_services confirmation call must
+    // be marked actionNeeded: false, not presented as needing approval.
+    expect((result.rootCause as any).recommendedRemediation.actionNeeded).toBe(false);
+    expect((result.rootCause as any).recommendedRemediation.requiresApproval).toBe(false);
+    // The adaptive tier is a single LLM call with no independent
+    // verification stage — must always honestly report "unverified", even
+    // though the LLM's own confidence (0.9) is high. Never fabricated as
+    // "verified" just because nothing contradicted it.
+    expect((result.rootCause as any).verificationStatus).toBe("unverified");
+    expect((result.rootCause as any).flaggedInconsistencies).toEqual([]);
+    expect((result.rootCause as any).confidenceLabel).toBe("Single-agent assessment — not independently verified");
 
     const invocations = readInvocations(argsLog);
     expect(invocations.length).toBe(1);
@@ -184,6 +196,11 @@ describe("HermesAgentAdapter adaptive investigation loop (ADR-0008 Phase B)", ()
 
     expect(result.status).toBe("WAITING_APPROVAL");
     expect(result.approvalId).toBe("appr_test_001");
+    // Bug fix, other side of the same case: a real mutation (rollback),
+    // HIGH risk, must still be marked actionNeeded: true with a real
+    // approval gate — this fix must not weaken genuine mutation gating.
+    expect((result.rootCause as any).recommendedRemediation.actionNeeded).toBe(true);
+    expect((result.rootCause as any).recommendedRemediation.requiresApproval).toBe(true);
   });
 
   it("handles a final response with no investigationNarrative (no per-call reasoning to reconstruct) without failing", async () => {
@@ -251,6 +268,10 @@ describe("HermesAgentAdapter adaptive investigation loop (ADR-0008 Phase B)", ()
     expect(typeof (result.rootCause as any).finding).toBe("string");
     expect((result.rootCause as any).finding.length).toBeGreaterThan(0);
     expect(["COMPLETED", "WAITING_APPROVAL"]).toContain(result.status);
+    // Fixed-script tier (the ultimate fallback here) has no independent
+    // verification stage either — always honestly "unverified".
+    expect((result.rootCause as any).verificationStatus).toBe("unverified");
+    expect((result.rootCause as any).flaggedInconsistencies).toEqual([]);
   });
 
   it("does not attempt the adaptive path at all when hermesProfileName is unset (pre-Phase-B behavior unchanged)", async () => {
