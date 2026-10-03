@@ -4,7 +4,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import { useAgentChat } from "../../context/AgentChatContext";
 import { useOperator } from "../../auth/OperatorContext";
-import { fetchSwarmTrace, SwarmTraceResponse } from "../../lib/api";
+import { fetchSwarmTrace, SwarmTraceResponse, bulkResolveIncidents } from "../../lib/api";
 import {
   SwarmTopologyView,
   SwarmTopologyData,
@@ -12,6 +12,7 @@ import {
   SwarmRoleNode,
   SwarmNodeStatus
 } from "../../components/investigate/SwarmTopologyView";
+import { PostmortemView } from "../../components/postmortem/PostmortemView";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
 
@@ -279,6 +280,15 @@ export default function InvestigatePage() {
   const hasAutoPopulated = useRef(false);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [selectedIncidentId, setSelectedIncidentId] = useState<string | null>(null);
+  // Phase E2: bulk-resolve multi-select — first checkbox/multi-select
+  // pattern in this codebase, kept to plain state (no library) since it's
+  // just "which incident ids are currently checked in the table."
+  const [selectedForBulk, setSelectedForBulk] = useState<Set<string>>(new Set());
+  const [bulkResolving, setBulkResolving] = useState(false);
+  // Phase E4: postmortem modal — which (RESOLVED) incident's postmortem is
+  // currently open, or null when closed. PostmortemView fetches its own
+  // data given just the incident id; this page only tracks visibility.
+  const [postmortemIncidentId, setPostmortemIncidentId] = useState<string | null>(null);
   const [isInvestigating, setIsInvestigating] = useState(false);
   const [liveSteps, setLiveSteps] = useState<LiveStep[]>([]);
   const [rootCause, setRootCause] = useState<RootCause | null>(null);
@@ -601,6 +611,50 @@ export default function InvestigatePage() {
     } catch (err) {
       console.error("Failed to resolve incident", err);
     }
+  };
+
+  // Phase E2: bulk-resolve the checked incidents. Confirms before firing
+  // (same window.confirm pattern already used for the cloud-account
+  // disconnect action elsewhere in this app), then reports partial failure
+  // explicitly rather than only surfacing a generic success/error state —
+  // the endpoint itself isolates per-item failures, so the UI must not hide
+  // them behind a blanket "done."
+  const handleBulkResolveIncidents = async () => {
+    if (!tenantId || selectedForBulk.size === 0) return;
+    const ids = Array.from(selectedForBulk);
+    if (!window.confirm(`Resolve ${ids.length} selected incident${ids.length === 1 ? "" : "s"}? This cannot be undone.`)) {
+      return;
+    }
+    setBulkResolving(true);
+    try {
+      const result = await bulkResolveIncidents(ids, session?.operatorName || operatorId, tenantId, operatorId || undefined);
+      const resolvedSet = new Set(result.resolved);
+      setIncidents((prev) => prev.map((inc) => (resolvedSet.has(inc.id) ? { ...inc, status: "RESOLVED" } : inc)));
+      setSelectedForBulk(new Set());
+      if (result.failed.length > 0) {
+        window.alert(
+          `Resolved ${result.resolved.length} of ${result.totalRequested}. ${result.failed.length} failed:\n` +
+            result.failed.map((f) => `${f.incidentId}: ${f.error}`).join("\n")
+        );
+      }
+    } catch (err) {
+      console.error("Failed to bulk-resolve incidents", err);
+      window.alert("Bulk resolve request failed — see console for details.");
+    } finally {
+      setBulkResolving(false);
+    }
+  };
+
+  const toggleBulkSelect = (incidentId: string) => {
+    setSelectedForBulk((prev) => {
+      const next = new Set(prev);
+      if (next.has(incidentId)) {
+        next.delete(incidentId);
+      } else {
+        next.add(incidentId);
+      }
+      return next;
+    });
   };
 
   // 3. Start investigation for existing incident
@@ -1047,6 +1101,20 @@ export default function InvestigatePage() {
               Re-investigate Selected
             </button>
           )}
+
+          {/* Phase E4: only ever shown for a RESOLVED incident — matches
+              PostmortemService's own 409 guard server-side (a postmortem
+              can't be generated for an incident that isn't resolved yet). */}
+          {selectedIncident && selectedIncident.status === "RESOLVED" && (
+            <button
+              type="button"
+              onClick={() => setPostmortemIncidentId(selectedIncident.id)}
+              className="btn-secondary"
+              style={{ fontSize: "13px" }}
+            >
+              Generate Postmortem
+            </button>
+          )}
         </div>
       </div>
 
@@ -1107,96 +1175,10 @@ export default function InvestigatePage() {
         </form>
       </div>
 
-      {/* 2. Incidents List Table */}
-      <div className="harvey-card" style={{ padding: "0" }}>
-        <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--warm-gray-border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--near-black-ink)" }}>
-            Cloud Incidents in PostgreSQL
-          </div>
-          <div style={{ fontSize: "12px", color: "var(--mid-warm-gray)" }}>
-            Showing <strong>{incidents.length}</strong> logged incidents
-          </div>
-        </div>
-
-        {incidents.length > 0 ? (
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
-              <thead>
-                <tr style={{ background: "#faf9f7", borderBottom: "1px solid var(--warm-gray-border)", textAlign: "left" }}>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Severity</th>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Incident ID</th>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Workload / Service</th>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Provider</th>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Region</th>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Status</th>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Logged At</th>
-                  <th style={{ padding: "12px 16px", fontWeight: 600 }}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {incidents.map((inc) => (
-                  <tr
-                    key={inc.id}
-                    onClick={() => setSelectedIncidentId(inc.id)}
-                    style={{
-                      cursor: "pointer",
-                      borderBottom: "1px solid var(--warm-gray-border)",
-                      backgroundColor: selectedIncidentId === inc.id ? "#f5f4f0" : "transparent"
-                    }}
-                  >
-                    <td style={{ padding: "12px 16px" }}>
-                      <span className={`status-pill ${inc.severity.toLowerCase()}`}>
-                        {inc.severity}
-                      </span>
-                    </td>
-                    <td style={{ padding: "12px 16px", fontFamily: "var(--font-mono)", fontSize: "12px" }}>
-                      {inc.id}
-                    </td>
-                    <td style={{ padding: "12px 16px", fontWeight: 500 }}>
-                      {inc.service}
-                    </td>
-                    <td style={{ padding: "12px 16px" }}>{inc.provider}</td>
-                    <td style={{ padding: "12px 16px" }}>{inc.region}</td>
-                    <td style={{ padding: "12px 16px" }}>
-                      <span className="status-pill active">{inc.status}</span>
-                    </td>
-                    <td style={{ padding: "12px 16px", color: "var(--mid-warm-gray)", fontSize: "12px" }}>
-                      {new Date(inc.createdAt).toLocaleTimeString()}
-                    </td>
-                    <td style={{ padding: "12px 16px" }}>
-                      {inc.status !== "RESOLVED" && (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleResolveIncident(inc.id);
-                          }}
-                          className="btn-secondary"
-                          style={{ fontSize: "11.5px", padding: "4px 10px" }}
-                        >
-                          Resolve
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div style={{ padding: "36px 20px", textAlign: "center" }}>
-            <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "6px" }}>
-              No Active Incidents Logged Yet
-            </div>
-            {/* Database empty state: incidents stored in postgresql incident table */}
-            <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", maxWidth: "560px", margin: "0 auto" }}>
-              No active incidents recorded for this workspace. Describe what's wrong in the box above to start a real investigation.
-            </p>
-          </div>
-        )}
-      </div>
-
-      {/* 3. Operational Investigation Workspace */}
+      {/* 2. Operational Investigation Workspace — moved directly after the
+          chat box per operator request, so the live kanban/root-cause view
+          is the first thing visible once an investigation starts, instead
+          of being buried below the incidents table. */}
       <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: "1.5rem" }}>
         {/* Left Column: Live Agent Activity Stream */}
         <div className="harvey-card" style={{ padding: "24px" }}>
@@ -1466,6 +1448,179 @@ export default function InvestigatePage() {
           )}
         </div>
       </div>
+
+      {/* 3. Incidents List Table */}
+      <div className="harvey-card" style={{ padding: "0" }}>
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--warm-gray-border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--near-black-ink)" }}>
+            Cloud Incidents
+          </div>
+          <div style={{ fontSize: "12px", color: "var(--mid-warm-gray)" }}>
+            Showing <strong>{incidents.length}</strong> logged incidents
+          </div>
+        </div>
+
+        {/* Phase E2: bulk-resolve action bar — appears once >=1 row is checked */}
+        {selectedForBulk.size > 0 && (
+          <div
+            style={{
+              padding: "10px 20px",
+              borderBottom: "1px solid var(--warm-gray-border)",
+              background: "#faf9f7",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center"
+            }}
+          >
+            <span className="status-pill active" style={{ fontSize: "11.5px" }}>
+              {selectedForBulk.size} selected
+            </span>
+            <div style={{ display: "flex", gap: "8px" }}>
+              <button
+                type="button"
+                onClick={() => setSelectedForBulk(new Set())}
+                disabled={bulkResolving}
+                className="btn-secondary"
+                style={{ fontSize: "12px", padding: "6px 12px" }}
+              >
+                Clear selection
+              </button>
+              <button
+                type="button"
+                onClick={handleBulkResolveIncidents}
+                disabled={bulkResolving}
+                className="btn-primary"
+                style={{ fontSize: "12px", padding: "6px 12px" }}
+              >
+                {bulkResolving ? "Resolving..." : `Resolve ${selectedForBulk.size} selected`}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {incidents.length > 0 ? (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+              <thead>
+                <tr style={{ background: "#faf9f7", borderBottom: "1px solid var(--warm-gray-border)", textAlign: "left" }}>
+                  <th style={{ padding: "12px 16px", fontWeight: 600, width: "1%" }}>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all resolvable incidents"
+                      checked={
+                        incidents.some((inc) => inc.status !== "RESOLVED") &&
+                        incidents.filter((inc) => inc.status !== "RESOLVED").every((inc) => selectedForBulk.has(inc.id))
+                      }
+                      onChange={(e) => {
+                        e.stopPropagation();
+                        const resolvable = incidents.filter((inc) => inc.status !== "RESOLVED").map((inc) => inc.id);
+                        setSelectedForBulk(e.target.checked ? new Set(resolvable) : new Set());
+                      }}
+                    />
+                  </th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Severity</th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Incident ID</th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Workload / Service</th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Provider</th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Region</th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Status</th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}>Logged At</th>
+                  <th style={{ padding: "12px 16px", fontWeight: 600 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {incidents.map((inc) => (
+                  <tr
+                    key={inc.id}
+                    onClick={() => setSelectedIncidentId(inc.id)}
+                    style={{
+                      cursor: "pointer",
+                      borderBottom: "1px solid var(--warm-gray-border)",
+                      backgroundColor: selectedIncidentId === inc.id ? "#f5f4f0" : "transparent"
+                    }}
+                  >
+                    <td style={{ padding: "12px 16px" }} onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select incident ${inc.id}`}
+                        checked={selectedForBulk.has(inc.id)}
+                        disabled={inc.status === "RESOLVED"}
+                        onChange={() => toggleBulkSelect(inc.id)}
+                      />
+                    </td>
+                    <td style={{ padding: "12px 16px" }}>
+                      <span className={`status-pill ${inc.severity.toLowerCase()}`}>
+                        {inc.severity}
+                      </span>
+                    </td>
+                    <td style={{ padding: "12px 16px", fontFamily: "var(--font-mono)", fontSize: "12px" }}>
+                      {inc.id}
+                    </td>
+                    <td style={{ padding: "12px 16px", fontWeight: 500 }}>
+                      {inc.service}
+                    </td>
+                    <td style={{ padding: "12px 16px" }}>{inc.provider}</td>
+                    <td style={{ padding: "12px 16px" }}>{inc.region}</td>
+                    <td style={{ padding: "12px 16px" }}>
+                      <span className="status-pill active">{inc.status}</span>
+                    </td>
+                    <td style={{ padding: "12px 16px", color: "var(--mid-warm-gray)", fontSize: "12px" }}>
+                      {new Date(inc.createdAt).toLocaleTimeString()}
+                    </td>
+                    <td style={{ padding: "12px 16px" }}>
+                      {inc.status !== "RESOLVED" ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleResolveIncident(inc.id);
+                          }}
+                          className="btn-secondary"
+                          style={{ fontSize: "11.5px", padding: "4px 10px" }}
+                        >
+                          Resolve
+                        </button>
+                      ) : (
+                        /* Phase E4: per-row equivalent of the "Generate Postmortem"
+                           button above, for resolving a postmortem without first
+                           selecting the row via the "Re-investigate" panel. */
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPostmortemIncidentId(inc.id);
+                          }}
+                          className="btn-secondary"
+                          style={{ fontSize: "11.5px", padding: "4px 10px" }}
+                        >
+                          Postmortem
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div style={{ padding: "36px 20px", textAlign: "center" }}>
+            <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--near-black-ink)", marginBottom: "6px" }}>
+              No Active Incidents Logged Yet
+            </div>
+            <p style={{ fontSize: "13px", color: "var(--mid-warm-gray)", maxWidth: "560px", margin: "0 auto" }}>
+              No active incidents recorded for this workspace. Describe what's wrong in the box above to start a real investigation.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Phase E4: postmortem modal — self-fetching, only mounted "open" once
+          an incident id is set (RESOLVED-gated by the two triggers above). */}
+      <PostmortemView
+        incidentId={postmortemIncidentId || ""}
+        isOpen={postmortemIncidentId !== null}
+        onClose={() => setPostmortemIncidentId(null)}
+      />
     </div>
   );
 }

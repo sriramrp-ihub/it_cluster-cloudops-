@@ -124,6 +124,20 @@ export function isMutatingRemediationTool(toolName: string): boolean {
 export type VerificationStatus = "verified" | "flagged" | "unverified";
 
 /**
+ * A single relevant knowledge_embeddings match (runbook or past incident
+ * resolution) retrieved for a given investigation, filtered to a genuine
+ * relevance threshold — see retrieveCitedRunbooks()'s doc comment. `title`
+ * falls back to the raw sourceId for source types (e.g.
+ * INCIDENT_RESOLUTION) that don't carry a human-authored title in metadata.
+ */
+export interface CitedRunbook {
+  title: string;
+  sourceId: string;
+  distance: number;
+  excerpt: string;
+}
+
+/**
  * [PROPOSED — CloudOps-specific synthesis, not a documented claim that any
  * competitor implements this exact ladder] A short, honest, qualitative
  * label layered on top of the raw confidence score + verification status,
@@ -1113,6 +1127,33 @@ Judge each finding on its own merits — whether it's plausible given the tool(s
       userPrompt: `Synthesize verified swarm findings for incident: ${goal}`
     });
 
+    // ── Retrieval (Phase E3b): one retrieval per investigation, at
+    // synthesis time only — workers stay independent, no per-worker
+    // retrieval. Query combines the incident's alert description with a
+    // summary of the workers' own findings, so retrieval reflects what the
+    // swarm actually found, not just the raw alert. Fails soft, same as the
+    // fixed-script/adaptive tiers, via the same shared retrieveCitedRunbooks().
+    const swarmRetrievalQuery = `${alertDescription} ${workerResults.map((w) => w.domainFinding).join(" ")}`.trim();
+    const citedRunbooks = await this.retrieveCitedRunbooks(session.tenantId, swarmRetrievalQuery);
+    if (citedRunbooks.length > 0) {
+      this.emitEvent(sessionId, {
+        type: "OBSERVATION",
+        sessionId,
+        timestamp: new Date(),
+        data: {
+          step: stepCursor,
+          toolName: "runbook_retrieval",
+          observation: `Retrieved ${citedRunbooks.length} relevant runbook excerpt(s): ${citedRunbooks.map((r) => r.title).join(", ")}`
+        }
+      });
+    }
+    const swarmRunbookSection =
+      citedRunbooks.length > 0
+        ? `\nRelevant Runbook Excerpts (cite by title in your rootCause if you rely on one):\n` +
+          citedRunbooks.map((r) => `--- "${r.title}" ---\n${r.excerpt}`).join("\n\n") +
+          "\n"
+        : "";
+
     let parsed: any;
     try {
       await this.waitForKanbanTaskReady(topology.synthesizer_id, stageTimeoutMs);
@@ -1127,14 +1168,14 @@ Verified worker findings (each worker investigated through its own lens, freely 
 ${workerResults.map((w, i) => `Worker ${i + 1} (lens: "${w.title}", tool(s) used: ${w.toolsUsed.length > 0 ? w.toolsUsed.join(", ") : "none"}): "${w.domainFinding}" (evidence: ${JSON.stringify(w.evidence ?? null)})`).join("\n")}
 
 Verifier assessment: verifiedFindings=${JSON.stringify(verifierParsed.verifiedFindings)}, flaggedInconsistencies=${JSON.stringify(verifierParsed.flaggedInconsistencies)}, overallConfidence=${verifierParsed.overallConfidence}
-
+${swarmRunbookSection}
 Available remediation tools:
 - "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
 - "aws_ecs_update_service_image": Use if a specific image tag needs updating.
 - "aws_ecs_update_service": Use if task counts or service definition need forced update.
 - "aws_ecs_describe_services": Use if no failure is detected (informational only).
 
-Synthesize the root cause and choose the safest remediation action. Respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
+Synthesize the root cause and choose the safest remediation action${citedRunbooks.length > 0 ? ", citing any relevant runbook excerpt above by name if you rely on one" : ""}. A pre-existing configuration detail that is NOT currently causing any functional problem — for example, no health check defined while the service has real traffic flowing with zero errors — is NOT a root cause; do not manufacture one to justify a remediation action. Only report a root cause and propose a mutating remediation when the evidence shows an actual functional problem (errors, failures, degraded performance, tasks not reaching steady state). If the evidence shows the service functioning normally, say so plainly, use "aws_ecs_describe_services" with riskLevel "LOW", and leave requiresApproval false. If any tool call failed, was denied, or returned no data, treat that specific question as UNVERIFIED — never invent a specific fact (an image tag, file name, version, error code, or any other concrete detail) to fill the gap. State plainly what could not be determined and why, rather than presenting a guess as a finding. Respond with ONLY valid JSON (no markdown, no backticks, no other text) conforming to this schema:
 {
   "finding": "<concise 1-2 sentence finding summary>",
   "rootCause": "<detailed technical root cause explanation>",
@@ -1220,7 +1261,7 @@ Synthesize the root cause and choose the safest remediation action. Respond with
       rootCause: rootCauseText,
       confidence,
       evidenceIds: evidenceCollected,
-      citedRunbooks: [],
+      citedRunbooks: citedRunbooks.map((r) => ({ title: r.title, sourceId: r.sourceId, distance: r.distance })),
       affectedResources: [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
       dataSource: `live:${this.adapterType}:swarm`,
       verificationStatus,
@@ -1368,6 +1409,34 @@ Synthesize the root cause and choose the safest remediation action. Respond with
     const effectiveModel = this.activeModel || "agent-runtime";
     const effectiveAgentName = this.agentName || "CloudOps Autonomous SRE Agent";
 
+    // ── Retrieval (Phase E3b): ground the adaptive loop's own synthesis in
+    // any relevant runbook/past-incident-resolution content for this tenant,
+    // the same way the fixed-script tier already does — via the shared
+    // retrieveCitedRunbooks(). Run before the prompt is built (no step
+    // observations exist yet in this tier to enrich the query with, unlike
+    // the fixed-script tier's step3Observation), so the query is the
+    // incident context itself. Fails soft, same as the fixed-script tier.
+    const adaptiveRetrievalQuery = `${incidentContext?.alertDescription || "ECS service health anomaly"} ${targetService} ${targetCluster}`.trim();
+    const citedRunbooks = await this.retrieveCitedRunbooks(session.tenantId, adaptiveRetrievalQuery);
+    if (citedRunbooks.length > 0) {
+      this.emitEvent(sessionId, {
+        type: "OBSERVATION",
+        sessionId,
+        timestamp: new Date(),
+        data: {
+          step: 1,
+          toolName: "runbook_retrieval",
+          observation: `Retrieved ${citedRunbooks.length} relevant runbook excerpt(s): ${citedRunbooks.map((r) => r.title).join(", ")}`
+        }
+      });
+    }
+    const runbookSection =
+      citedRunbooks.length > 0
+        ? `\nRelevant Runbook Excerpts (cite by title in your rootCause if you rely on one):\n` +
+          citedRunbooks.map((r) => `--- "${r.title}" ---\n${r.excerpt}`).join("\n\n") +
+          "\n"
+        : "";
+
     const prompt = `You are ${effectiveAgentName} (${effectiveModel}), investigating a real production incident using the tools available to you.
 
 Incident:
@@ -1375,8 +1444,8 @@ Incident:
 - Cluster: "${targetCluster}"
 - Region: "${targetRegion}"
 - Alert: ${incidentContext?.alertDescription || "ECS service health anomaly"}
-
-Investigate this incident using whatever tools are available to you — there is no fixed checklist or required order. Decide for yourself which tool(s), if any, are relevant (service state, metrics, logs, load balancer/target health, recent task or image failures, or anything else available to you), and call as many or as few as you judge necessary. Once you have enough evidence, synthesize the root cause and choose the safest remediation action.
+${runbookSection}
+Investigate this incident using whatever tools are available to you — there is no fixed checklist or required order. Decide for yourself which tool(s), if any, are relevant (service state, metrics, logs, load balancer/target health, recent task or image failures, or anything else available to you), and call as many or as few as you judge necessary. Once you have enough evidence, synthesize the root cause and choose the safest remediation action${citedRunbooks.length > 0 ? ", citing any relevant runbook excerpt above by name if you rely on one" : ""}. A pre-existing configuration detail that is NOT currently causing any functional problem — for example, no health check defined while the service has real traffic flowing with zero errors — is NOT a root cause; do not manufacture one to justify a remediation action. Only report a root cause and propose a mutating remediation when the evidence shows an actual functional problem (errors, failures, degraded performance, tasks not reaching steady state). If the evidence shows the service functioning normally, say so plainly, use "aws_ecs_describe_services" with riskLevel "LOW", and leave requiresApproval false. If any tool call failed, was denied, or returned no data, treat that specific question as UNVERIFIED — never invent a specific fact (an image tag, file name, version, error code, or any other concrete detail) to fill the gap. State plainly what could not be determined and why, rather than presenting a guess as a finding.
 
 Available remediation tools:
 - "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
@@ -1510,7 +1579,7 @@ Once you are done investigating — this must be your FINAL message, after you'v
       rootCause: rootCauseText,
       confidence,
       evidenceIds: evidenceCollected,
-      citedRunbooks: [],
+      citedRunbooks: citedRunbooks.map((r) => ({ title: r.title, sourceId: r.sourceId, distance: r.distance })),
       affectedResources: [`arn:aws:ecs:${targetRegion}:*:service/${targetCluster}/${targetService}`],
       dataSource: `live:${this.adapterType}:${effectiveModel}:adaptive`,
       verificationStatus,
@@ -1578,6 +1647,41 @@ Once you are done investigating — this must be your FINAL message, after you'v
       rootCause,
       approvalId: session.pendingApprovalId || undefined
     };
+  }
+
+  /**
+   * Phase E3b: shared retrieval used by all three investigation tiers.
+   * Originally inline only in runFixedScriptInvestigation (Phase 2.9) —
+   * extracted here, unchanged in behavior, so runAdaptiveInvestigation() and
+   * runSwarmInvestigation()'s synthesizer stage can ground their synthesis
+   * in the same relevant runbook/past-incident-resolution content instead of
+   * never retrieving at all (their previously-hardcoded `citedRunbooks: []`
+   * was honest — no retrieval ever ran — not a bug in how it was written).
+   *
+   * Fails soft — an empty/missing/unreachable knowledge base must never
+   * block an investigation in any tier. A genuinely empty result (cold
+   * knowledge base, or nothing clears the relevance threshold) returns an
+   * empty array; nothing is ever fabricated to fill it.
+   */
+  private async retrieveCitedRunbooks(tenantId: string, queryText: string): Promise<CitedRunbook[]> {
+    let retrievedChunks: Array<{ sourceId: string; content: string; distance: number; metadata: Record<string, unknown> }> = [];
+    try {
+      const { searchKnowledge } = await import("@cloudops/embeddings");
+      retrievedChunks = await searchKnowledge(tenantId, queryText, 2);
+    } catch (err) {
+      logger.debug({ err }, "Runbook retrieval skipped (no knowledge base reachable for this tenant)");
+    }
+    // A generous relevance ceiling (cosine distance range is [0,2] for
+    // normalized vectors) — filters out results retrieved only because they
+    // were the least-bad match in a mostly-unrelated knowledge base.
+    return retrievedChunks
+      .filter((c) => c.distance < 1.2)
+      .map((c) => ({
+        title: (c.metadata as any)?.runbookTitle || c.sourceId,
+        sourceId: c.sourceId,
+        distance: c.distance,
+        excerpt: c.content
+      }));
   }
 
   /**
@@ -1795,28 +1899,13 @@ Once you are done investigating — this must be your FINAL message, after you'v
 
     await delay(900);
 
-    // ── Retrieval (Phase 2.9): ground the synthesis step in any relevant
-    // runbook/past-incident-resolution content for this tenant. Fails soft —
-    // an empty/missing knowledge base must never block the investigation.
-    let retrievedChunks: Array<{ sourceId: string; content: string; distance: number; metadata: Record<string, unknown> }> = [];
-    try {
-      const { searchKnowledge } = await import("@cloudops/embeddings");
-      const retrievalQuery = `${incidentContext?.alertDescription || ""} ${step3Observation}`.trim();
-      retrievedChunks = await searchKnowledge(session.tenantId, retrievalQuery, 2);
-    } catch (err) {
-      logger.debug({ err }, "Runbook retrieval skipped (no knowledge base reachable for this tenant)");
-    }
-    // A generous relevance ceiling (cosine distance range is [0,2] for
-    // normalized vectors) — filters out results retrieved only because they
-    // were the least-bad match in a mostly-unrelated knowledge base.
-    const citedRunbooks = retrievedChunks
-      .filter((c) => c.distance < 1.2)
-      .map((c) => ({
-        title: (c.metadata as any)?.runbookTitle || c.sourceId,
-        sourceId: c.sourceId,
-        distance: c.distance,
-        excerpt: c.content
-      }));
+    // ── Retrieval (Phase 2.9, extracted to retrieveCitedRunbooks() in Phase
+    // E3b so the adaptive/swarm tiers can share this exact behavior): ground
+    // the synthesis step in any relevant runbook/past-incident-resolution
+    // content for this tenant. Fails soft — an empty/missing knowledge base
+    // must never block the investigation.
+    const retrievalQuery = `${incidentContext?.alertDescription || ""} ${step3Observation}`.trim();
+    const citedRunbooks = await this.retrieveCitedRunbooks(session.tenantId, retrievalQuery);
 
     if (citedRunbooks.length > 0) {
       this.emitEvent(sessionId, {
@@ -1869,7 +1958,7 @@ Telemetry Data:
 - CloudWatch Target Group Metrics: ${step2Observation}
 - Stopped Tasks & Container Exit Diagnostics: ${step3Observation}
 ${runbookSection}
-Based on these observations${citedRunbooks.length > 0 ? " and any relevant runbook excerpts above" : ""}, synthesize the root cause and choose the safest remediation action.
+Based on these observations${citedRunbooks.length > 0 ? " and any relevant runbook excerpts above" : ""}, synthesize the root cause and choose the safest remediation action. A pre-existing configuration detail that is NOT currently causing any functional problem — for example, no health check defined while the service has real traffic flowing with zero errors — is NOT a root cause; do not manufacture one to justify a remediation action. Only report a root cause and propose a mutating remediation when the evidence shows an actual functional problem (errors, failures, degraded performance, tasks not reaching steady state). If the evidence shows the service functioning normally, say so plainly, use "aws_ecs_describe_services" with riskLevel "LOW", and leave requiresApproval false. If any tool call failed, was denied, or returned no data, treat that specific question as UNVERIFIED — never invent a specific fact (an image tag, file name, version, error code, or any other concrete detail) to fill the gap. State plainly what could not be determined and why, rather than presenting a guess as a finding.
 Available remediation tools:
 - "aws_ecs_rollback_service": Use if deployment failed, container crashed on startup, or bad image tag was deployed.
 - "aws_ecs_update_service_image": Use if specific image tag needs updating.
